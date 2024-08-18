@@ -1,0 +1,49 @@
+{
+  "name": "expo-juce",
+  "version": "0.1.0",
+  "description": "Realtime DSP w/C++ & JUCE",
+  "type": "module",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "scripts": {
+    "postinstall": "node src/scripts/bundle-juce.js",
+    "build": "expo-module build",
+    "clean": "expo-module clean",
+    "lint": "expo-module lint",
+    "test": "expo-module test",
+    "prepare": "expo-module prepare",
+    "prepublishOnly": "expo-module prepublishOnly",
+    "expo-module": "expo-module",
+    "open:ios": "xed example/ios",
+    "open:android": "open -a \"Android Studio\" example/android"
+  },
+  "keywords": [
+    "react-native",
+    "expo",
+    "expo-juce",
+    "ExpoJuce"
+  ],
+  "repository": "https://github.com/Beeper-buzz/expo-juce",
+  "bugs": {
+    "url": "https://github.com/Beeper-buzz/expo-juce/issues"
+  },
+  "author": "Beeper <devs@beeper.buzz> (https://github.com/Beeper-buzz)",
+  "license": "MIT",
+  "homepage": "https://github.com/Beeper-buzz/expo-juce#readme",
+  "dependencies": {
+    "adm-zip": "^0.5.15",
+    "node-fetch": "2"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.5",
+    "@types/node-fetch": "^2.6.11",
+    "@types/react": "^18.0.25",
+    "expo-module-scripts": "^3.5.2",
+    "expo-modules-core": "^1.12.20"
+  },
+  "peerDependencies": {
+    "expo": "*",
+    "react": "*",
+    "react-native": "*"
+  }
+}

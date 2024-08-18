@@ -1,0 +1,10 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "expo-juce": ["../src/index"],
+      "expo-juce/*": ["../src/*"]
+    }
+  }
+}
