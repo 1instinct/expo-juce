@@ -28,7 +28,12 @@ Run `npx pod-install` after installing the npm package.
 
 ### Configure for Android
 
+## Running the Example App
 
+1. `cd example`
+1. `cd ios`
+1. `npx pod-install`
+1. 
 
 # Contributing
 
