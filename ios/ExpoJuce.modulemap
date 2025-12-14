@@ -1,0 +1,6 @@
+framework module ExpoJuce {
+  umbrella header "ExpoJuce.h"
+  
+  export *
+  module * { export * }
+}
