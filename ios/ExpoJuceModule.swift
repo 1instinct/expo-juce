@@ -1,14 +1,20 @@
 import ExpoModulesCore
 
 public class ExpoJuceModule: Module {
-  // Each module class must implement the definition function. The definition consists of components
-  // that describes the module's functionality and behavior.
-  // See https://docs.expo.dev/modules/module-api for more details about available components.
   public func definition() -> ModuleDefinition {
     // Sets the name of the module that JavaScript code will use to refer to the module. Takes a string as an argument.
     // Can be inferred from module's class name, but it's recommended to set it explicitly for clarity.
     // The module will be accessible from `requireNativeModule('ExpoJuce')` in JavaScript.
     Name("ExpoJuce")
+    
+    // Initialize tone generator when module is created
+    OnCreate {
+      ExpoJuceBridge.initialize()
+    }
+    
+    OnDestroy {
+      ExpoJuceBridge.shutdown()
+    }
 
     // Sets constant properties on the module. Can take a dictionary or a closure that returns a dictionary.
     Constants([
@@ -25,6 +31,11 @@ public class ExpoJuceModule: Module {
 
     Function("getApiKey") {
       return "api-key"
+    }
+
+    Function("playTone") { (frequency: Double, duration: Double) -> String in
+      ExpoJuceBridge.playTone(withFrequency: frequency, duration: duration)
+      return "Playing tone at \(frequency)Hz for \(duration)s"
     }
 
     // Defines a JavaScript function that always returns a Promise and whose native code

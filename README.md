@@ -2,6 +2,92 @@
 
 Realtime DSP w/C++ & JUCE
 
+## Quick Start
+
+### Installation
+
+```bash
+npm install expo-juce
+```
+
+### iOS Setup
+
+After installing, run:
+
+```bash
+npx pod-install
+```
+
+### Android Setup
+
+No additional setup required.
+
+## Basic Usage
+
+### Playing a Tone
+
+```tsx
+import { Button } from 'react-native';
+import * as ExpoJuce from 'expo-juce';
+
+function App() {
+  const playTone = () => {
+    const frequency = 440; // A4 note (Hz)
+    const duration = 0.5;  // seconds
+    ExpoJuce.playTone(frequency, duration);
+  };
+
+  return <Button title="Play Tone" onPress={playTone} />;
+}
+```
+
+### Available Functions
+
+- `hello()` - Returns a greeting string
+- `getApiKey()` - Returns the API key
+- `playTone(frequency: number, duration: number)` - Plays a sine wave tone at the specified frequency for the given duration
+- `setValueAsync(value: string)` - Async function that emits a change event
+- `PI` - Constant value of π
+
+### Events
+
+Listen to change events:
+
+```tsx
+import { addChangeListener } from 'expo-juce';
+
+const subscription = addChangeListener((event) => {
+  console.log('Value changed:', event.value);
+});
+
+// Clean up
+subscription.remove();
+```
+
+## Low-Latency Audio
+
+The module is configured for low-latency audio playback:
+- 5ms buffer size
+- Real-time audio processing thread
+- AVAudioEngine on iOS
+- Optimized for minimal latency
+
+## Development
+
+### Running the Example App
+
+```bash
+cd example
+yarn install
+yarn ios  # or yarn android
+```
+
+### Building the Module
+
+```bash
+npm run build
+```
+
 # API documentation
 
 - [Documentation for the main branch](https://github.com/expo/expo/blob/main/docs/pages/versions/unversioned/sdk/juce.md)
@@ -33,7 +119,8 @@ Run `npx pod-install` after installing the npm package.
 1. `cd example`
 1. `cd ios`
 1. `npx pod-install`
-1. 
+1. Open workspace in XCode
+1. Update `ENABLE_USER_SCRIPT_SANDBOXING` to NO in Build Settings
 
 # Contributing
 

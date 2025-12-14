@@ -20,8 +20,14 @@ Pod::Spec.new do |s|
   # Swift/Objective-C compatibility
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
-    'SWIFT_COMPILATION_MODE' => 'wholemodule'
+    'SWIFT_COMPILATION_MODE' => 'wholemodule',
+    'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
+    'CLANG_ENABLE_OBJC_ARC' => 'YES',
+    'SWIFT_OBJC_BRIDGING_HEADER' => '$(PODS_TARGET_SRCROOT)/ExpoJuce-Bridging-Header.h'
   }
 
-  s.source_files = "**/*.{h,m,swift}"
+  s.source_files = "**/*.{h,m,mm,swift}"
+  
+  # Add AVFoundation framework for audio
+  s.frameworks = 'AVFoundation'
 end

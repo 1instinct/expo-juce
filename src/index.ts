@@ -17,6 +17,10 @@ export function getApiKey(): string {
   return ExpoJuceModule.getApiKey();
 }
 
+export function playTone(frequency: number, duration: number): string {
+  return ExpoJuceModule.playTone(frequency, duration);
+}
+
 export async function setValueAsync(value: string) {
   return await ExpoJuceModule.setValueAsync(value);
 }
