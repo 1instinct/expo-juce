@@ -7,4 +7,4 @@ FOUNDATION_EXPORT double ExpoJuceVersionNumber;
 FOUNDATION_EXPORT const unsigned char ExpoJuceVersionString[];
 
 // Import all public headers
-#import "JuceToneGenerator.h"
+#import "ExpoJuceBridge.h"

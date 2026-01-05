@@ -88,6 +88,55 @@ yarn ios  # or yarn android
 npm run build
 ```
 
+## Testing & Distribution
+
+### For End Users to Test
+
+Since this is a native module, users cannot test it with Expo Go. You have several options:
+
+#### Option 1: Expo EAS Build (Recommended)
+Create a development build that users can install on their devices:
+
+```bash
+cd example
+eas build --profile development --platform ios
+```
+
+This creates a custom development client with your native module. Share the build URL from EAS.
+
+#### Option 2: TestFlight (iOS)
+1. Create a production build:
+   ```bash
+   cd example
+   eas build --profile production --platform ios
+   ```
+2. Submit to TestFlight:
+   ```bash
+   eas submit --platform ios
+   ```
+3. Invite testers via App Store Connect
+
+#### Option 3: Internal Distribution (iOS)
+1. Build an ad-hoc IPA:
+   ```bash
+   cd example/ios
+   xcodebuild -workspace expojuceexample.xcworkspace \
+              -scheme expojuceexample \
+              -configuration Release \
+              -archivePath build/expojuceexample.xcarchive \
+              archive
+   ```
+2. Export and share the IPA file
+3. Users install via device provisioning profiles
+
+#### Option 4: GitHub Releases
+1. Build APK/IPA files
+2. Create a GitHub Release
+3. Attach builds as release assets
+4. Add installation instructions in release notes
+
+**Note**: Native modules require a custom development build. Users cannot simply scan a QR code like with Expo Go.
+
 # API documentation
 
 - [Documentation for the main branch](https://github.com/expo/expo/blob/main/docs/pages/versions/unversioned/sdk/juce.md)

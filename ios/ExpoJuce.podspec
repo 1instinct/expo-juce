@@ -22,8 +22,7 @@ Pod::Spec.new do |s|
     'DEFINES_MODULE' => 'YES',
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    'CLANG_ENABLE_OBJC_ARC' => 'YES',
-    'SWIFT_OBJC_BRIDGING_HEADER' => '$(PODS_TARGET_SRCROOT)/ExpoJuce-Bridging-Header.h'
+    'CLANG_ENABLE_OBJC_ARC' => 'YES'
   }
 
   s.source_files = "**/*.{h,m,mm,swift}"
