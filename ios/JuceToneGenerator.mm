@@ -1,4 +1,5 @@
 #import "JuceToneGenerator.h"
+#import <AVFoundation/AVFoundation.h>
 #include <atomic>
 #include <cmath>
 
