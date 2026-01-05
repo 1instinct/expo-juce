@@ -95,6 +95,9 @@ npm run build
 Since this is a native module, users cannot test it with Expo Go. You have several options:
 
 #### Option 1: Expo EAS Build (Recommended)
+Install prebuilt version from EAS
+<https://expo.dev/accounts/aaronsmulktis/projects/expo-juce-example/builds/a8f46b6b-60a4-4bfa-98fc-5c5458b45c60>
+
 Create a development build that users can install on their devices:
 
 ```bash
