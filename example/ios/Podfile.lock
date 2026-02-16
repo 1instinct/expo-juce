@@ -11,7 +11,7 @@ PODS:
     - ExpoModulesCore
   - ExpoFont (12.0.9):
     - ExpoModulesCore
-  - ExpoJuce (0.1.0):
+  - ExpoJuce (0.1.1):
     - ExpoModulesCore
   - ExpoKeepAwake (13.0.2):
     - ExpoModulesCore
