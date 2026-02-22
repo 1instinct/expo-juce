@@ -3,8 +3,9 @@
 
 @implementation ExpoJuceBridge
 
-+ (void)initialize {
-    [[JuceToneGenerator sharedInstance] initialize];
++ (void)setup {
+    // Access the singleton — audio engine is initialized in its -init
+    [JuceToneGenerator sharedInstance];
 }
 
 + (void)shutdown {

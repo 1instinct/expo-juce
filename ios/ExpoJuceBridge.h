@@ -4,7 +4,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface ExpoJuceBridge : NSObject
 
-+ (void)initialize;
++ (void)setup;
 + (void)shutdown;
 + (void)playToneWithFrequency:(double)frequency duration:(double)duration;
 + (void)setFrequency:(double)frequency;

@@ -5,7 +5,7 @@ public class ExpoJuceModule: Module {
     Name("ExpoJuce")
 
     OnCreate {
-      ExpoJuceBridge.initialize()
+      ExpoJuceBridge.setup()
     }
 
     OnDestroy {

@@ -136,19 +136,34 @@ private:
 }
 
 - (void)initialize {
+    if (self.audioEngine) {
+        NSLog(@"[ExpoJuce] Audio engine already initialized, skipping");
+        return;
+    }
+
+    NSLog(@"[ExpoJuce] Initializing audio engine...");
     NSError *error = nil;
 
     AVAudioSession *audioSession = [AVAudioSession sharedInstance];
     [audioSession setCategory:AVAudioSessionCategoryPlayback
                   withOptions:AVAudioSessionCategoryOptionMixWithOthers
                         error:&error];
-    if (error) NSLog(@"Error setting audio session category: %@", error);
+    if (error) {
+        NSLog(@"[ExpoJuce] Error setting audio session category: %@", error);
+        error = nil;
+    }
 
     [audioSession setPreferredIOBufferDuration:0.005 error:&error]; // 5ms
-    if (error) NSLog(@"Error setting buffer duration: %@", error);
+    if (error) {
+        NSLog(@"[ExpoJuce] Error setting buffer duration: %@", error);
+        error = nil;
+    }
 
     [audioSession setActive:YES error:&error];
-    if (error) NSLog(@"Error activating audio session: %@", error);
+    if (error) {
+        NSLog(@"[ExpoJuce] Error activating audio session: %@", error);
+        error = nil;
+    }
 
     self.audioEngine = [[AVAudioEngine alloc] init];
     AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:44100.0 channels:2];
@@ -174,7 +189,11 @@ private:
 
     [self.audioEngine prepare];
     [self.audioEngine startAndReturnError:&error];
-    if (error) NSLog(@"Error starting audio engine: %@", error);
+    if (error) {
+        NSLog(@"[ExpoJuce] Error starting audio engine: %@", error);
+    } else {
+        NSLog(@"[ExpoJuce] Audio engine started successfully");
+    }
 }
 
 - (void)shutdown {
@@ -186,6 +205,7 @@ private:
 }
 
 - (void)playToneWithFrequency:(double)frequency duration:(double)duration {
+    NSLog(@"[ExpoJuce] playTone freq=%.1f dur=%.0f engine=%p running=%d", frequency, duration, self.engine, self.audioEngine.isRunning);
     if (!self.engine) return;
 
     self.engine->setFrequency(frequency);
@@ -229,10 +249,12 @@ private:
 }
 
 - (void)noteOn {
+    NSLog(@"[ExpoJuce] noteOn (engine=%p, audioEngine running=%d)", self.engine, self.audioEngine.isRunning);
     if (self.engine) self.engine->noteOn();
 }
 
 - (void)noteOff {
+    NSLog(@"[ExpoJuce] noteOff");
     if (self.engine) self.engine->noteOff();
 }
 
