@@ -17,16 +17,26 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
-  # Swift/Objective-C compatibility
+  # Our own source files (Swift, ObjC, ObjC++, headers)
+  # JuceModules.mm #includes the JUCE .cpp files via amalgamation,
+  # so we do NOT list juce_modules/**/*.cpp as source_files (would cause duplicate symbols).
+  s.source_files = "**/*.{h,m,mm,swift}"
+
+  # JUCE headers need to be discoverable for #include
+  s.preserve_paths = "juce_modules/**"
+
+  # iOS frameworks required by JUCE modules + our AVAudioEngine code
+  s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
+                 'Foundation', 'Accelerate', 'QuartzCore',
+                 'CoreFoundation', 'CoreText', 'Security'
+  s.libraries = 'c++'
+
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    'CLANG_ENABLE_OBJC_ARC' => 'YES'
+    'CLANG_ENABLE_OBJC_ARC' => 'YES',
+    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/ios" "$(PODS_TARGET_SRCROOT)/ios/juce_modules"',
+    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1',
   }
-
-  s.source_files = "**/*.{h,m,mm,swift}"
-  
-  # Audio frameworks
-  s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio'
 end

@@ -1,6 +1,6 @@
 {
   "name": "expo-juce",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Realtime DSP w/C++ & JUCE",
   "type": "module",
   "main": "build/index.js",
@@ -21,6 +21,7 @@
     "prepublishOnly": "expo-module prepublishOnly",
     "expo-module": "expo-module",
     "download-juce": "node src/scripts/bundle-juce.js",
+    "vendor-juce": "node src/scripts/vendor-juce.cjs",
     "open:ios": "xed example/ios",
     "open:android": "open -a \"Android Studio\" example/android"
   },
