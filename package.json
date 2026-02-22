@@ -41,7 +41,7 @@
   "devDependencies": {
     "@types/adm-zip": "^0.5.5",
     "@types/node-fetch": "^2.6.11",
-    "@types/react": "^18.0.25",
+    "@types/react": "19.1.1",
     "adm-zip": "^0.5.15",
     "expo-module-scripts": "^3.5.2",
     "expo-modules-core": "^1.12.20",
