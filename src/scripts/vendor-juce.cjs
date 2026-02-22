@@ -36,7 +36,7 @@ const SKIP_PATTERNS = [
   /[/\\]native[/\\]juce_win/,
   /[/\\]native[/\\]juce_wasm/,
   /demo/i,
-  /test/i,
+  /(^|[/\\])tests?([/\\]|$)/i,  // match "test/" or "tests/" dirs, but not "unit_tests/"
   /\.txt$/i,
   /\.md$/i,
   /CMakeLists\.txt$/,

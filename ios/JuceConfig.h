@@ -27,6 +27,9 @@
 // Not a standalone JUCE app — embedded in React Native
 #define JUCE_STANDALONE_APPLICATION 0
 
+// Disable unit tests
+#define JUCE_UNIT_TESTS 0
+
 // Disable features we don't need
 #define JUCE_USE_CURL 0
 #define JUCE_WEB_BROWSER 0
