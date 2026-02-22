@@ -42,12 +42,13 @@ Pod::Spec.new do |s|
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
     'CLANG_ENABLE_OBJC_ARC' => 'YES',
-    # Only our ios/ dir in HEADER_SEARCH_PATHS — safe for the Clang module map.
+    # PODS_TARGET_SRCROOT already points to ios/ (where this podspec lives).
+    # Only our dir in HEADER_SEARCH_PATHS — safe for the Clang module map.
     # JUCE's juce_modules/ goes in OTHER_CPLUSPLUSFLAGS so it only affects
     # C++/ObjC++ source compilation and can't shadow system headers during
     # module building (JUCE bundles its own zlib.h, etc.).
-    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/ios"',
+    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)"',
     'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1',
-    'OTHER_CPLUSPLUSFLAGS' => '$(inherited) -I"$(PODS_TARGET_SRCROOT)/ios/juce_modules" -include "$(PODS_TARGET_SRCROOT)/ios/JuceConfig.h"',
+    'OTHER_CPLUSPLUSFLAGS' => '$(inherited) -I"$(PODS_TARGET_SRCROOT)/juce_modules" -include "$(PODS_TARGET_SRCROOT)/JuceConfig.h"',
   }
 end
