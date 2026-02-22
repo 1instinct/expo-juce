@@ -2,55 +2,74 @@ import ExpoModulesCore
 
 public class ExpoJuceModule: Module {
   public func definition() -> ModuleDefinition {
-    // Sets the name of the module that JavaScript code will use to refer to the module. Takes a string as an argument.
-    // Can be inferred from module's class name, but it's recommended to set it explicitly for clarity.
-    // The module will be accessible from `requireNativeModule('ExpoJuce')` in JavaScript.
     Name("ExpoJuce")
-    
-    // Initialize tone generator when module is created
+
     OnCreate {
       ExpoJuceBridge.initialize()
     }
-    
+
     OnDestroy {
       ExpoJuceBridge.shutdown()
     }
 
-    // Sets constant properties on the module. Can take a dictionary or a closure that returns a dictionary.
     Constants([
       "PI": Double.pi
     ])
 
-    // Defines event names that the module can send to JavaScript.
     Events("onChange")
 
-    // Defines a JavaScript synchronous function that runs the native code on the JavaScript thread.
     Function("hello") {
-      return "Hello world! 👋"
-    }
-
-    Function("getApiKey") {
-      return "api-key"
+      return "Hello world!"
     }
 
     Function("playTone") { (frequency: Double, duration: Double) -> String in
       ExpoJuceBridge.playTone(withFrequency: frequency, duration: duration)
-      return "Playing tone at \(frequency)Hz for \(duration)s"
+      return "Playing tone at \(frequency)Hz for \(duration)ms"
     }
 
-    // Defines a JavaScript function that always returns a Promise and whose native code
-    // is by default dispatched on the different thread than the JavaScript runtime runs on.
+    Function("setFrequency") { (frequency: Double) in
+      ExpoJuceBridge.setFrequency(frequency)
+    }
+
+    Function("setLevel") { (level: Double) in
+      ExpoJuceBridge.setLevel(level)
+    }
+
+    Function("setWaveform") { (waveform: String) in
+      ExpoJuceBridge.setWaveform(waveform)
+    }
+
+    Function("setHarmonicLevels") { (levels: [Double]) in
+      let nsLevels = levels.map { NSNumber(value: $0) }
+      ExpoJuceBridge.setHarmonicLevels(nsLevels)
+    }
+
+    Function("noteOn") {
+      ExpoJuceBridge.noteOn()
+    }
+
+    Function("noteOff") {
+      ExpoJuceBridge.noteOff()
+    }
+
+    Function("setDSPValue") { (param: String, value: Double) in
+      switch param {
+      case "frequency":
+        ExpoJuceBridge.setFrequency(value)
+      case "level":
+        ExpoJuceBridge.setLevel(value)
+      default:
+        break
+      }
+    }
+
     AsyncFunction("setValueAsync") { (value: String) in
-      // Send an event to JavaScript.
       self.sendEvent("onChange", [
         "value": value
       ])
     }
 
-    // Enables the module to be used as a native view. Definition components that are accepted as part of the
-    // view definition: Prop, Events.
     View(ExpoJuceView.self) {
-      // Defines a setter for the `name` prop.
       Prop("name") { (view: ExpoJuceView, prop: String) in
         print(prop)
       }

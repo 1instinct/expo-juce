@@ -5,8 +5,14 @@
   "type": "module",
   "main": "build/index.js",
   "types": "build/index.d.ts",
+  "files": [
+    "build/",
+    "ios/",
+    "android/build.gradle",
+    "android/src/",
+    "expo-module.config.json"
+  ],
   "scripts": {
-    "postinstall": "node src/scripts/bundle-juce.js",
     "build": "expo-module build",
     "clean": "expo-module clean",
     "lint": "expo-module lint",
@@ -14,6 +20,7 @@
     "prepare": "expo-module prepare",
     "prepublishOnly": "expo-module prepublishOnly",
     "expo-module": "expo-module",
+    "download-juce": "node src/scripts/bundle-juce.js",
     "open:ios": "xed example/ios",
     "open:android": "open -a \"Android Studio\" example/android"
   },
@@ -30,16 +37,14 @@
   "author": "Beeper <devs@beeper.buzz> (https://github.com/Beeper-buzz)",
   "license": "MIT",
   "homepage": "https://github.com/Beeper-buzz/expo-juce#readme",
-  "dependencies": {
-    "adm-zip": "^0.5.15",
-    "node-fetch": "2"
-  },
   "devDependencies": {
     "@types/adm-zip": "^0.5.5",
     "@types/node-fetch": "^2.6.11",
     "@types/react": "^18.0.25",
+    "adm-zip": "^0.5.15",
     "expo-module-scripts": "^3.5.2",
-    "expo-modules-core": "^1.12.20"
+    "expo-modules-core": "^1.12.20",
+    "node-fetch": "2"
   },
   "peerDependencies": {
     "expo": "*",

@@ -27,6 +27,6 @@ Pod::Spec.new do |s|
 
   s.source_files = "**/*.{h,m,mm,swift}"
   
-  # Add AVFoundation framework for audio
-  s.frameworks = 'AVFoundation'
+  # Audio frameworks
+  s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio'
 end

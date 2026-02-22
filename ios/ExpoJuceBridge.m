@@ -15,4 +15,28 @@
     [[JuceToneGenerator sharedInstance] playToneWithFrequency:frequency duration:duration];
 }
 
++ (void)setFrequency:(double)frequency {
+    [[JuceToneGenerator sharedInstance] setFrequency:frequency];
+}
+
++ (void)setLevel:(double)level {
+    [[JuceToneGenerator sharedInstance] setLevel:level];
+}
+
++ (void)setWaveform:(NSString *)waveform {
+    [[JuceToneGenerator sharedInstance] setWaveform:waveform];
+}
+
++ (void)setHarmonicLevels:(NSArray<NSNumber *> *)levels {
+    [[JuceToneGenerator sharedInstance] setHarmonicLevels:levels];
+}
+
++ (void)noteOn {
+    [[JuceToneGenerator sharedInstance] noteOn];
+}
+
++ (void)noteOff {
+    [[JuceToneGenerator sharedInstance] noteOff];
+}
+
 @end
