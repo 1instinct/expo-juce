@@ -1,5 +1,12 @@
 #pragma once
 
+// Xcode 16+ clang no longer implicitly includes these —
+// JUCE uses FLT_MAX, FLT_MIN, INT_MAX, etc. throughout.
+#include <cfloat>
+#include <climits>
+#include <cstdint>
+#include <cmath>
+
 // Tell JUCE that global module settings are configured
 #define JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED 1
 
