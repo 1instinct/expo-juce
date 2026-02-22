@@ -23,6 +23,10 @@ Pod::Spec.new do |s|
   # JuceModules.mm #includes the JUCE .cpp files via amalgamation;
   # JUCE headers are found via HEADER_SEARCH_PATHS.
   s.source_files = "*.{h,m,mm,swift}"
+  # JuceConfig.h is a C++ prefix header (uses <cfloat> etc.) — it must NOT
+  # appear in the Clang module map or Swift/ObjC imports will fail.
+  # It's applied to C++ via OTHER_CPLUSPLUSFLAGS -include instead.
+  s.exclude_files = "JuceConfig.h"
 
   # Keep JUCE sources on disk so the compiler can find them via #include
   s.preserve_paths = "juce_modules/**"
@@ -38,7 +42,12 @@ Pod::Spec.new do |s|
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
     'CLANG_ENABLE_OBJC_ARC' => 'YES',
-    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/ios" "$(PODS_TARGET_SRCROOT)/ios/juce_modules"',
+    # Only our ios/ dir in HEADER_SEARCH_PATHS — safe for the Clang module map.
+    # JUCE's juce_modules/ goes in OTHER_CPLUSPLUSFLAGS so it only affects
+    # C++/ObjC++ source compilation and can't shadow system headers during
+    # module building (JUCE bundles its own zlib.h, etc.).
+    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/ios"',
     'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1',
+    'OTHER_CPLUSPLUSFLAGS' => '$(inherited) -I"$(PODS_TARGET_SRCROOT)/ios/juce_modules" -include "$(PODS_TARGET_SRCROOT)/ios/JuceConfig.h"',
   }
 end
