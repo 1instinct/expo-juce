@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #include <atomic>
 #include <cmath>
+#include <algorithm>
 
 // ── Waveform Types ────────────────────────────────────────────────
 enum class Waveform { Sine, Square, Saw, Triangle };
@@ -326,10 +327,13 @@ private:
     SynthEngine *eng = self.engine;
     TransportEngine *trans = self.transport;
 
-    // Atomics shared between audio thread and beat-poll timer
-    __block std::atomic<bool> beatCrossed{false};
-    __block std::atomic<double> lastCrossedBeat{0.0};
-    __block std::atomic<double> lastCrossedBpm{120.0};
+    // Shared state between audio thread and beat-poll timer (heap-allocated, non-copyable)
+    struct BeatState {
+        std::atomic<bool> crossed{false};
+        std::atomic<double> beat{0.0};
+        std::atomic<double> bpm{120.0};
+    };
+    auto *beatState = new BeatState();
 
     self.sourceNode = [[AVAudioSourceNode alloc] initWithFormat:format renderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData) {
         float *leftChannel = (float *)outputData->mBuffers[0].mData;
@@ -338,9 +342,9 @@ private:
         for (AVAudioFrameCount i = 0; i < frameCount; i++) {
             // Advance transport on audio thread (sample-accurate)
             if (trans->advance(44100.0)) {
-                beatCrossed.store(true);
-                lastCrossedBeat.store(trans->getPosition());
-                lastCrossedBpm.store(trans->getTempo());
+                beatState->crossed.store(true);
+                beatState->beat.store(trans->getPosition());
+                beatState->bpm.store(trans->getTempo());
             }
 
             float sample = eng->getNextSample(44100.0);
@@ -367,8 +371,8 @@ private:
     self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(self.beatTimer, ^{
-        if (beatCrossed.exchange(false) && self.beatCallback) {
-            self.beatCallback(lastCrossedBeat.load(), lastCrossedBpm.load());
+        if (beatState->crossed.exchange(false) && self.beatCallback) {
+            self.beatCallback(beatState->beat.load(), beatState->bpm.load());
         }
     });
     dispatch_resume(self.beatTimer);
