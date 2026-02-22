@@ -17,12 +17,14 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
-  # Our own source files (Swift, ObjC, ObjC++, headers)
-  # JuceModules.mm #includes the JUCE .cpp files via amalgamation,
-  # so we do NOT list juce_modules/**/*.cpp as source_files (would cause duplicate symbols).
-  s.source_files = "**/*.{h,m,mm,swift}"
+  # Only OUR source files — not JUCE subdirectories.
+  # JUCE headers must NOT be in source_files or CocoaPods adds them to the
+  # module map, where they fail to compile standalone (missing FLT_MAX etc).
+  # JuceModules.mm #includes the JUCE .cpp files via amalgamation;
+  # JUCE headers are found via HEADER_SEARCH_PATHS.
+  s.source_files = "*.{h,m,mm,swift}"
 
-  # JUCE headers need to be discoverable for #include
+  # Keep JUCE sources on disk so the compiler can find them via #include
   s.preserve_paths = "juce_modules/**"
 
   # iOS frameworks required by JUCE modules + our AVAudioEngine code
