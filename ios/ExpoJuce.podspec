@@ -17,38 +17,25 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
-  # Only OUR source files — not JUCE subdirectories.
-  # JUCE headers must NOT be in source_files or CocoaPods adds them to the
-  # module map, where they fail to compile standalone (missing FLT_MAX etc).
-  # JuceModules.mm #includes the JUCE .cpp files via amalgamation;
-  # JUCE headers are found via HEADER_SEARCH_PATHS.
+  # Our source files: Swift module, ObjC bridge, C++ tone generator
   s.source_files = "*.{h,m,mm,swift}"
-  # JuceConfig.h is a C++ prefix header (uses <cfloat> etc.) — it must NOT
-  # appear in the Clang module map or Swift/ObjC imports will fail.
-  # It's applied to C++ via OTHER_CPLUSPLUSFLAGS -include instead.
-  s.exclude_files = "JuceConfig.h"
+  s.exclude_files = ["JuceConfig.h", "JuceModules.mm"]
+  s.requires_arc = true
 
-  # Keep JUCE sources on disk so the compiler can find them via #include
-  s.preserve_paths = "juce_modules/**"
+  # JUCE sources preserved on disk for future use but NOT compiled —
+  # current engine uses pure C++ + AVFoundation, no JUCE APIs.
+  # Compiling JUCE modules (especially juce_events) causes launch crashes
+  # due to static initializers conflicting with React Native's app lifecycle.
+  s.preserve_paths = ["juce_modules/**"]
 
-  # iOS frameworks required by JUCE modules + our AVAudioEngine code
   s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
-                 'Foundation', 'Accelerate', 'QuartzCore',
-                 'CoreFoundation', 'CoreText', 'Security'
+                 'Foundation', 'Accelerate'
   s.libraries = 'c++'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    'CLANG_ENABLE_OBJC_ARC' => 'YES',
-    # PODS_TARGET_SRCROOT already points to ios/ (where this podspec lives).
-    # Only our dir in HEADER_SEARCH_PATHS — safe for the Clang module map.
-    # JUCE's juce_modules/ goes in OTHER_CPLUSPLUSFLAGS so it only affects
-    # C++/ObjC++ source compilation and can't shadow system headers during
-    # module building (JUCE bundles its own zlib.h, etc.).
     'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)"',
-    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1',
-    'OTHER_CPLUSPLUSFLAGS' => '$(inherited) -I"$(PODS_TARGET_SRCROOT)/juce_modules" -include "$(PODS_TARGET_SRCROOT)/JuceConfig.h"',
   }
 end

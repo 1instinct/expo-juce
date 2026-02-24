@@ -10,6 +10,11 @@ export function hello(): string {
   return ExpoJuceModule.hello();
 }
 
+/** Initialize the audio engine. Call once before using synth/transport. */
+export function setup(): void {
+  ExpoJuceModule.setup();
+}
+
 // ── Synth ───────────────────────────────────────────────────────────
 
 export function playTone(frequency: number, duration: number): string {

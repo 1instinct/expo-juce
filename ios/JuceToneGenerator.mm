@@ -280,7 +280,7 @@ private:
     if (self) {
         _engine = new SynthEngine();
         _transport = new TransportEngine();
-        [self initialize];
+        // Audio engine initialized lazily via [self initialize] called from setup
     }
     return self;
 }
@@ -298,84 +298,90 @@ private:
     }
 
     NSLog(@"[ExpoJuce] Initializing audio engine...");
-    NSError *error = nil;
 
-    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
-    [audioSession setCategory:AVAudioSessionCategoryPlayback
-                  withOptions:AVAudioSessionCategoryOptionMixWithOthers
-                        error:&error];
-    if (error) {
-        NSLog(@"[ExpoJuce] Error setting audio session category: %@", error);
-        error = nil;
-    }
+    @try {
+        NSError *error = nil;
 
-    [audioSession setPreferredIOBufferDuration:0.005 error:&error]; // 5ms
-    if (error) {
-        NSLog(@"[ExpoJuce] Error setting buffer duration: %@", error);
-        error = nil;
-    }
+        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+        [audioSession setCategory:AVAudioSessionCategoryPlayback
+                      withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                            error:&error];
+        if (error) {
+            NSLog(@"[ExpoJuce] Error setting audio session category: %@", error);
+            error = nil;
+        }
 
-    [audioSession setActive:YES error:&error];
-    if (error) {
-        NSLog(@"[ExpoJuce] Error activating audio session: %@", error);
-        error = nil;
-    }
+        [audioSession setActive:YES error:&error];
+        if (error) {
+            NSLog(@"[ExpoJuce] Error activating audio session: %@", error);
+            error = nil;
+        }
 
-    self.audioEngine = [[AVAudioEngine alloc] init];
-    AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:44100.0 channels:2];
+        self.audioEngine = [[AVAudioEngine alloc] init];
 
-    SynthEngine *eng = self.engine;
-    TransportEngine *trans = self.transport;
+        // Use the hardware sample rate to avoid format mismatches
+        double sampleRate = audioSession.sampleRate > 0 ? audioSession.sampleRate : 44100.0;
+        AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:2];
+        NSLog(@"[ExpoJuce] Using sample rate: %.0f", sampleRate);
 
-    // Shared state between audio thread and beat-poll timer (heap-allocated, non-copyable)
-    struct BeatState {
-        std::atomic<bool> crossed{false};
-        std::atomic<double> beat{0.0};
-        std::atomic<double> bpm{120.0};
-    };
-    auto *beatState = new BeatState();
+        SynthEngine *eng = self.engine;
+        TransportEngine *trans = self.transport;
 
-    self.sourceNode = [[AVAudioSourceNode alloc] initWithFormat:format renderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData) {
-        float *leftChannel = (float *)outputData->mBuffers[0].mData;
-        float *rightChannel = (float *)outputData->mBuffers[1].mData;
+        struct BeatState {
+            std::atomic<bool> crossed{false};
+            std::atomic<double> beat{0.0};
+            std::atomic<double> bpm{120.0};
+        };
+        auto *beatState = new BeatState();
 
-        for (AVAudioFrameCount i = 0; i < frameCount; i++) {
-            // Advance transport on audio thread (sample-accurate)
-            if (trans->advance(44100.0)) {
-                beatState->crossed.store(true);
-                beatState->beat.store(trans->getPosition());
-                beatState->bpm.store(trans->getTempo());
+        self.sourceNode = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData) {
+            double sr = sampleRate;
+            float *leftChannel = (float *)outputData->mBuffers[0].mData;
+            float *rightChannel = (outputData->mNumberBuffers > 1) ? (float *)outputData->mBuffers[1].mData : leftChannel;
+
+            for (AVAudioFrameCount i = 0; i < frameCount; i++) {
+                if (trans->advance(sr)) {
+                    beatState->crossed.store(true);
+                    beatState->beat.store(trans->getPosition());
+                    beatState->bpm.store(trans->getTempo());
+                }
+
+                float sample = eng->getNextSample(sr);
+                leftChannel[i] = sample;
+                rightChannel[i] = sample;
             }
 
-            float sample = eng->getNextSample(44100.0);
-            leftChannel[i] = sample;
-            rightChannel[i] = sample;
+            return noErr;
+        }];
+
+        [self.audioEngine attachNode:self.sourceNode];
+        [self.audioEngine connect:self.sourceNode to:self.audioEngine.mainMixerNode format:format];
+        // Let the system decide the mixer→output format
+        [self.audioEngine connect:self.audioEngine.mainMixerNode to:self.audioEngine.outputNode format:nil];
+
+        [self.audioEngine prepare];
+        [self.audioEngine startAndReturnError:&error];
+        if (error) {
+            NSLog(@"[ExpoJuce] Error starting audio engine: %@", error);
+        } else {
+            NSLog(@"[ExpoJuce] Audio engine started successfully");
         }
 
-        return noErr;
-    }];
+        // Beat callback timer — polls at ~60Hz on main queue
+        self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
+        __weak JuceToneGenerator *weakSelf = self;
+        dispatch_source_set_event_handler(self.beatTimer, ^{
+            BeatCallback cb = weakSelf.beatCallback;
+            if (beatState->crossed.exchange(false) && cb) {
+                cb(beatState->beat.load(), beatState->bpm.load());
+            }
+        });
+        dispatch_resume(self.beatTimer);
 
-    [self.audioEngine attachNode:self.sourceNode];
-    [self.audioEngine connect:self.sourceNode to:self.audioEngine.mainMixerNode format:format];
-    [self.audioEngine connect:self.audioEngine.mainMixerNode to:self.audioEngine.outputNode format:format];
-
-    [self.audioEngine prepare];
-    [self.audioEngine startAndReturnError:&error];
-    if (error) {
-        NSLog(@"[ExpoJuce] Error starting audio engine: %@", error);
-    } else {
-        NSLog(@"[ExpoJuce] Audio engine started successfully");
+    } @catch (NSException *exception) {
+        NSLog(@"[ExpoJuce] CRASH in audio init: %@ — %@", exception.name, exception.reason);
     }
-
-    // Beat callback timer — polls at ~60Hz on main queue
-    self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(self.beatTimer, ^{
-        if (beatState->crossed.exchange(false) && self.beatCallback) {
-            self.beatCallback(beatState->beat.load(), beatState->bpm.load());
-        }
-    });
-    dispatch_resume(self.beatTimer);
 }
 
 - (void)shutdown {

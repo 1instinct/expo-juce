@@ -4,17 +4,8 @@ public class ExpoJuceModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ExpoJuce")
 
-    OnCreate {
-      ExpoJuceBridge.setup()
-
-      // Wire native beat callback → JS "onBeat" event
-      ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
-        self?.sendEvent("onBeat", [
-          "beat": beat,
-          "bpm": bpm,
-        ])
-      }
-    }
+    // Audio engine is initialized lazily on first use, not at module load.
+    // Initializing AVAudioEngine in OnCreate can crash before JS is ready.
 
     OnDestroy {
       ExpoJuceBridge.shutdown()
@@ -31,6 +22,16 @@ public class ExpoJuceModule: Module {
     }
 
     // ── Synth ───────────────────────────────────────────────────────
+
+    Function("setup") {
+      ExpoJuceBridge.setup()
+      ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
+        self?.sendEvent("onBeat", [
+          "beat": beat,
+          "bpm": bpm,
+        ])
+      }
+    }
 
     Function("playTone") { (frequency: Double, duration: Double) -> String in
       ExpoJuceBridge.playTone(withFrequency: frequency, duration: duration)

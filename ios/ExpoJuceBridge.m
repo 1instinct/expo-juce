@@ -4,7 +4,7 @@
 @implementation ExpoJuceBridge
 
 + (void)setup {
-    [JuceToneGenerator sharedInstance];
+    [[JuceToneGenerator sharedInstance] initialize];
 }
 
 + (void)shutdown {
