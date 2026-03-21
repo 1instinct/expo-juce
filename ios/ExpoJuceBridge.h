@@ -8,6 +8,8 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 
 + (void)setup;
 + (void)shutdown;
++ (void)startBeatTimer;
++ (void)stopBeatTimer;
 
 // ── Synth ─────────────────────────────────────────────────────────
 + (void)playToneWithFrequency:(double)frequency duration:(double)duration;

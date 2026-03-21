@@ -255,11 +255,18 @@ private:
 
 // ── Objective-C Wrapper ───────────────────────────────────────────
 
+struct BeatState {
+    std::atomic<bool> crossed{false};
+    std::atomic<double> beat{0.0};
+    std::atomic<double> bpm{120.0};
+};
+
 @interface JuceToneGenerator ()
 @property (nonatomic, strong) AVAudioEngine *audioEngine;
 @property (nonatomic, strong) AVAudioSourceNode *sourceNode;
 @property (nonatomic, assign) SynthEngine *engine;
 @property (nonatomic, assign) TransportEngine *transport;
+@property (nonatomic, assign) BeatState *beatState;
 @property (nonatomic, strong) dispatch_source_t beatTimer;
 @property (nonatomic, copy) BeatCallback beatCallback;
 @end
@@ -289,6 +296,7 @@ private:
     [self shutdown];
     if (_engine) { delete _engine; _engine = nullptr; }
     if (_transport) { delete _transport; _transport = nullptr; }
+    if (_beatState) { delete _beatState; _beatState = nullptr; }
 }
 
 - (void)initialize {
@@ -319,7 +327,6 @@ private:
 
         self.audioEngine = [[AVAudioEngine alloc] init];
 
-        // Use the hardware sample rate to avoid format mismatches
         double sampleRate = audioSession.sampleRate > 0 ? audioSession.sampleRate : 44100.0;
         AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:2];
         NSLog(@"[ExpoJuce] Using sample rate: %.0f", sampleRate);
@@ -327,12 +334,10 @@ private:
         SynthEngine *eng = self.engine;
         TransportEngine *trans = self.transport;
 
-        struct BeatState {
-            std::atomic<bool> crossed{false};
-            std::atomic<double> beat{0.0};
-            std::atomic<double> bpm{120.0};
-        };
-        auto *beatState = new BeatState();
+        if (!self.beatState) {
+            self.beatState = new BeatState();
+        }
+        BeatState *bs = self.beatState;
 
         self.sourceNode = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData) {
             double sr = sampleRate;
@@ -341,9 +346,9 @@ private:
 
             for (AVAudioFrameCount i = 0; i < frameCount; i++) {
                 if (trans->advance(sr)) {
-                    beatState->crossed.store(true);
-                    beatState->beat.store(trans->getPosition());
-                    beatState->bpm.store(trans->getTempo());
+                    bs->crossed.store(true);
+                    bs->beat.store(trans->getPosition());
+                    bs->bpm.store(trans->getTempo());
                 }
 
                 float sample = eng->getNextSample(sr);
@@ -356,7 +361,6 @@ private:
 
         [self.audioEngine attachNode:self.sourceNode];
         [self.audioEngine connect:self.sourceNode to:self.audioEngine.mainMixerNode format:format];
-        // Let the system decide the mixer→output format
         [self.audioEngine connect:self.audioEngine.mainMixerNode to:self.audioEngine.outputNode format:nil];
 
         [self.audioEngine prepare];
@@ -367,28 +371,40 @@ private:
             NSLog(@"[ExpoJuce] Audio engine started successfully");
         }
 
-        // Beat callback timer — polls at ~60Hz on main queue
-        self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-        dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
-        __weak JuceToneGenerator *weakSelf = self;
-        dispatch_source_set_event_handler(self.beatTimer, ^{
-            BeatCallback cb = weakSelf.beatCallback;
-            if (beatState->crossed.exchange(false) && cb) {
-                cb(beatState->beat.load(), beatState->bpm.load());
-            }
-        });
-        dispatch_resume(self.beatTimer);
-
     } @catch (NSException *exception) {
         NSLog(@"[ExpoJuce] CRASH in audio init: %@ — %@", exception.name, exception.reason);
     }
 }
 
-- (void)shutdown {
+- (void)stopBeatTimer {
     if (self.beatTimer) {
         dispatch_source_cancel(self.beatTimer);
         self.beatTimer = nil;
     }
+    self.beatCallback = nil;
+}
+
+- (void)startBeatTimer {
+    if (self.beatTimer) return;
+    if (!self.beatState) return;
+
+    BeatState *bs = self.beatState;
+    self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
+    __weak JuceToneGenerator *weakSelf = self;
+    dispatch_source_set_event_handler(self.beatTimer, ^{
+        JuceToneGenerator *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        BeatCallback cb = strongSelf.beatCallback;
+        if (bs->crossed.exchange(false) && cb) {
+            cb(bs->beat.load(), bs->bpm.load());
+        }
+    });
+    dispatch_resume(self.beatTimer);
+}
+
+- (void)shutdown {
+    [self stopBeatTimer];
     if (self.audioEngine) {
         [self.audioEngine stop];
         self.audioEngine = nil;
@@ -405,8 +421,9 @@ private:
     self.engine->setFrequency(frequency);
     self.engine->noteOn();
 
+    __weak JuceToneGenerator *weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(duration / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        self.engine->noteOff();
+        if (weakSelf.engine) weakSelf.engine->noteOff();
     });
 }
 
@@ -443,12 +460,10 @@ private:
 }
 
 - (void)noteOn {
-    NSLog(@"[ExpoJuce] noteOn");
     if (self.engine) self.engine->noteOn();
 }
 
 - (void)noteOff {
-    NSLog(@"[ExpoJuce] noteOff");
     if (self.engine) self.engine->noteOff();
 }
 

@@ -11,6 +11,14 @@
     [[JuceToneGenerator sharedInstance] shutdown];
 }
 
++ (void)startBeatTimer {
+    [[JuceToneGenerator sharedInstance] startBeatTimer];
+}
+
++ (void)stopBeatTimer {
+    [[JuceToneGenerator sharedInstance] stopBeatTimer];
+}
+
 // ── Synth ─────────────────────────────────────────────────────────
 
 + (void)playToneWithFrequency:(double)frequency duration:(double)duration {

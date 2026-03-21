@@ -7,6 +7,8 @@ typedef void(^BeatCallback)(double beat, double bpm);
 + (instancetype)sharedInstance;
 - (void)initialize;
 - (void)shutdown;
+- (void)startBeatTimer;
+- (void)stopBeatTimer;
 
 // ── Synth ─────────────────────────────────────────────────────────
 - (void)playToneWithFrequency:(double)frequency duration:(double)duration;

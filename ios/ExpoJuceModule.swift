@@ -1,6 +1,8 @@
 import ExpoModulesCore
 
 public class ExpoJuceModule: Module {
+  private var hasListeners = false
+
   public func definition() -> ModuleDefinition {
     Name("ExpoJuce")
 
@@ -8,6 +10,7 @@ public class ExpoJuceModule: Module {
     // Initializing AVAudioEngine in OnCreate can crash before JS is ready.
 
     OnDestroy {
+      ExpoJuceBridge.stopBeatTimer()
       ExpoJuceBridge.shutdown()
     }
 
@@ -17,16 +20,29 @@ public class ExpoJuceModule: Module {
 
     Events("onChange", "onBeat")
 
+    // Beat timer only runs while JS has active listeners.
+    // This prevents sendEvent from firing before listeners are attached (crash).
+    OnStartObserving {
+      self.hasListeners = true
+      ExpoJuceBridge.startBeatTimer()
+    }
+
+    OnStopObserving {
+      self.hasListeners = false
+      ExpoJuceBridge.stopBeatTimer()
+    }
+
     Function("hello") {
       return "Hello world!"
     }
 
     // ── Synth ───────────────────────────────────────────────────────
 
-    Function("setup") {
+    Function("setup") { [weak self] in
       ExpoJuceBridge.setup()
       ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
-        self?.sendEvent("onBeat", [
+        guard let self = self, self.hasListeners else { return }
+        self.sendEvent("onBeat", [
           "beat": beat,
           "bpm": bpm,
         ])
