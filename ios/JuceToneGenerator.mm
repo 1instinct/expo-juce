@@ -300,79 +300,126 @@ struct BeatState {
 }
 
 - (void)initialize {
+    [self initializeWithRetries:3];
+}
+
+- (void)initializeWithRetries:(int)maxRetries {
     if (self.audioEngine) {
         NSLog(@"[ExpoJuce] Audio engine already initialized, skipping");
         return;
     }
 
-    NSLog(@"[ExpoJuce] Initializing audio engine...");
+    // Listen for audio interruptions (phone calls, Siri, etc.)
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:AVAudioSessionInterruptionNotification
+                                                  object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleAudioInterruption:)
+                                                 name:AVAudioSessionInterruptionNotification
+                                               object:[AVAudioSession sharedInstance]];
 
-    @try {
-        NSError *error = nil;
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        NSLog(@"[ExpoJuce] Initializing audio engine (attempt %d/%d)...", attempt, maxRetries);
 
-        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
-        [audioSession setCategory:AVAudioSessionCategoryPlayback
-                      withOptions:AVAudioSessionCategoryOptionMixWithOthers
-                            error:&error];
-        if (error) {
-            NSLog(@"[ExpoJuce] Error setting audio session category: %@", error);
-            error = nil;
-        }
+        @try {
+            NSError *error = nil;
 
-        [audioSession setActive:YES error:&error];
-        if (error) {
-            NSLog(@"[ExpoJuce] Error activating audio session: %@", error);
-            error = nil;
-        }
-
-        self.audioEngine = [[AVAudioEngine alloc] init];
-
-        double sampleRate = audioSession.sampleRate > 0 ? audioSession.sampleRate : 44100.0;
-        AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:2];
-        NSLog(@"[ExpoJuce] Using sample rate: %.0f", sampleRate);
-
-        SynthEngine *eng = self.engine;
-        TransportEngine *trans = self.transport;
-
-        if (!self.beatState) {
-            self.beatState = new BeatState();
-        }
-        BeatState *bs = self.beatState;
-
-        self.sourceNode = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData) {
-            double sr = sampleRate;
-            float *leftChannel = (float *)outputData->mBuffers[0].mData;
-            float *rightChannel = (outputData->mNumberBuffers > 1) ? (float *)outputData->mBuffers[1].mData : leftChannel;
-
-            for (AVAudioFrameCount i = 0; i < frameCount; i++) {
-                if (trans->advance(sr)) {
-                    bs->crossed.store(true);
-                    bs->beat.store(trans->getPosition());
-                    bs->bpm.store(trans->getTempo());
-                }
-
-                float sample = eng->getNextSample(sr);
-                leftChannel[i] = sample;
-                rightChannel[i] = sample;
+            AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+            [audioSession setCategory:AVAudioSessionCategoryPlayback
+                          withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                                error:&error];
+            if (error) {
+                NSLog(@"[ExpoJuce] Error setting audio session category: %@", error);
+                continue;
             }
 
-            return noErr;
-        }];
+            [audioSession setActive:YES error:&error];
+            if (error) {
+                NSLog(@"[ExpoJuce] Error activating audio session: %@", error);
+                continue;
+            }
 
-        [self.audioEngine attachNode:self.sourceNode];
-        [self.audioEngine connect:self.sourceNode to:self.audioEngine.mainMixerNode format:format];
-        [self.audioEngine connect:self.audioEngine.mainMixerNode to:self.audioEngine.outputNode format:nil];
+            self.audioEngine = [[AVAudioEngine alloc] init];
 
-        [self.audioEngine prepare];
+            double sampleRate = audioSession.sampleRate > 0 ? audioSession.sampleRate : 44100.0;
+            AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:2];
+            NSLog(@"[ExpoJuce] Using sample rate: %.0f", sampleRate);
+
+            SynthEngine *eng = self.engine;
+            TransportEngine *trans = self.transport;
+
+            if (!self.beatState) {
+                self.beatState = new BeatState();
+            }
+            BeatState *bs = self.beatState;
+
+            self.sourceNode = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData) {
+                double sr = sampleRate;
+                float *leftChannel = (float *)outputData->mBuffers[0].mData;
+                float *rightChannel = (outputData->mNumberBuffers > 1) ? (float *)outputData->mBuffers[1].mData : leftChannel;
+
+                for (AVAudioFrameCount i = 0; i < frameCount; i++) {
+                    if (trans->advance(sr)) {
+                        bs->crossed.store(true);
+                        bs->beat.store(trans->getPosition());
+                        bs->bpm.store(trans->getTempo());
+                    }
+
+                    float sample = eng->getNextSample(sr);
+                    leftChannel[i] = sample;
+                    rightChannel[i] = sample;
+                }
+
+                return noErr;
+            }];
+
+            [self.audioEngine attachNode:self.sourceNode];
+            [self.audioEngine connect:self.sourceNode to:self.audioEngine.mainMixerNode format:format];
+            [self.audioEngine connect:self.audioEngine.mainMixerNode to:self.audioEngine.outputNode format:nil];
+
+            [self.audioEngine prepare];
+            [self.audioEngine startAndReturnError:&error];
+            if (error) {
+                NSLog(@"[ExpoJuce] Error starting audio engine: %@", error);
+                [self tearDownAudioEngine];
+                continue;
+            }
+
+            NSLog(@"[ExpoJuce] Audio engine started successfully");
+            return;
+
+        } @catch (NSException *exception) {
+            NSLog(@"[ExpoJuce] CRASH in audio init (attempt %d): %@ — %@", attempt, exception.name, exception.reason);
+            [self tearDownAudioEngine];
+        }
+    }
+
+    NSLog(@"[ExpoJuce] Audio engine failed to initialize after %d attempts", maxRetries);
+}
+
+- (void)tearDownAudioEngine {
+    if (self.audioEngine) {
+        [self.audioEngine stop];
+        self.audioEngine = nil;
+    }
+    self.sourceNode = nil;
+}
+
+- (void)handleAudioInterruption:(NSNotification *)notification {
+    NSDictionary *info = notification.userInfo;
+    AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)[info[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+        NSLog(@"[ExpoJuce] Audio interrupted (phone call, Siri, etc.)");
+    } else if (type == AVAudioSessionInterruptionTypeEnded) {
+        NSLog(@"[ExpoJuce] Audio interruption ended, restarting engine...");
+        NSError *error = nil;
         [self.audioEngine startAndReturnError:&error];
         if (error) {
-            NSLog(@"[ExpoJuce] Error starting audio engine: %@", error);
-        } else {
-            NSLog(@"[ExpoJuce] Audio engine started successfully");
+            NSLog(@"[ExpoJuce] Failed to restart after interruption: %@, reinitializing...", error);
+            [self tearDownAudioEngine];
+            [self initializeWithRetries:2];
         }
-
-    } @catch (NSException *exception) {
-        NSLog(@"[ExpoJuce] CRASH in audio init: %@ — %@", exception.name, exception.reason);
     }
 }
 
@@ -404,6 +451,7 @@ struct BeatState {
 }
 
 - (void)shutdown {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self stopBeatTimer];
     if (self.audioEngine) {
         [self.audioEngine stop];
