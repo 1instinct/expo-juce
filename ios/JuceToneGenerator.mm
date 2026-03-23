@@ -4,227 +4,244 @@
 #include <cmath>
 #include <algorithm>
 
+#include "JuceConfig.h"
+#include <juce_core/juce_core.h>
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_dsp/juce_dsp.h>
+
 // ── Waveform Types ────────────────────────────────────────────────
 enum class Waveform { Sine, Square, Saw, Triangle };
 
 static const int MAX_HARMONICS = 8;
 
-// ── Simple one-pole low-pass filter ───────────────────────────────
-class OnePoleLPF {
-public:
-    OnePoleLPF() : y1(0.0), cutoff(20000.0), resonance(0.0), pendingReset(false) {}
-
-    void setCutoff(double hz) { cutoff.store(hz); }
-    void setResonance(double q) { resonance.store(q); }
-
-    float process(float input, double sampleRate) {
-        // Handle reset on audio thread to avoid data race
-        if (pendingReset.exchange(false)) {
-            y1 = 0.0;
-        }
-
-        double fc = cutoff.load();
-
-        // Clamp cutoff to Nyquist
-        if (fc > sampleRate * 0.49) fc = sampleRate * 0.49;
-        if (fc < 20.0) fc = 20.0;
-
-        // Compute coefficient (simple RC low-pass)
-        double w = 2.0 * M_PI * fc / sampleRate;
-        double g = w / (1.0 + w);
-
-        // One-pole filter
-        y1 = y1 + g * (input - y1);
-
-        return (float)y1;
-    }
-
-    // Signal reset from main thread — applied on next audio render
-    void reset() { pendingReset.store(true); }
-
-private:
-    double y1;  // Only touched by audio thread
-    std::atomic<double> cutoff;
-    std::atomic<double> resonance;
-    std::atomic<bool> pendingReset;
-};
-
-// ── ADSR Envelope ─────────────────────────────────────────────────
-class ADSREnvelope {
-public:
-    enum class Stage { Idle, Attack, Sustain, Release };
-
-    ADSREnvelope()
-        : attackMs(10.0), releaseMs(200.0),
-          stage(Stage::Idle), gain(0.0) {}
-
-    void setAttack(double ms) { attackMs.store(std::max(1.0, ms)); }
-    void setRelease(double ms) { releaseMs.store(std::max(1.0, ms)); }
-
-    void noteOn() { stage.store(Stage::Attack); }
-    void noteOff() { stage.store(Stage::Release); }
-    bool isActive() { return stage.load() != Stage::Idle; }
-
-    float process(double sampleRate) {
-        Stage s = stage.load();
-
-        switch (s) {
-            case Stage::Idle:
-                gain = 0.0;
-                break;
-
-            case Stage::Attack: {
-                double rate = 1.0 / (attackMs.load() * 0.001 * sampleRate);
-                gain += rate;
-                if (gain >= 1.0) {
-                    gain = 1.0;
-                    stage.store(Stage::Sustain);
-                }
-                break;
-            }
-
-            case Stage::Sustain:
-                gain = 1.0;
-                break;
-
-            case Stage::Release: {
-                double rate = 1.0 / (releaseMs.load() * 0.001 * sampleRate);
-                gain -= rate;
-                if (gain <= 0.0) {
-                    gain = 0.0;
-                    stage.store(Stage::Idle);
-                }
-                break;
-            }
-        }
-
-        return (float)gain;
-    }
-
-    void reset() {
-        gain = 0.0;
-        stage.store(Stage::Idle);
-    }
-
-private:
-    std::atomic<double> attackMs;
-    std::atomic<double> releaseMs;
-    std::atomic<Stage> stage;
-    double gain;
-};
-
-// ── Synth Engine ──────────────────────────────────────────────────
+// ── Synth Engine (JUCE DSP) ──────────────────────────────────────
+//
+// Thread safety contract:
+//   - Main thread: calls set*() methods (atomic parameter updates)
+//   - Audio thread: calls getNextSample() (reads atomics, mutates DSP state)
+//   - DSP objects (oscillator, filter, adsr) are ONLY touched by the audio thread
+//   - prepare() is called once from main thread BEFORE audio thread starts
+//
 class SynthEngine {
 public:
     SynthEngine()
-        : frequency(440.0), level(0.5), phase(0.0),
-          waveform(Waveform::Sine), detuneCents(0.0)
+        : frequency(440.0), level(0.5),
+          waveform(Waveform::Sine), detuneCents(0.0),
+          pendingNoteOn(false), pendingNoteOff(false),
+          filterCutoff(20000.0), filterResonance(0.0),
+          attackMs(10.0), releaseMs(200.0),
+          pendingParamUpdate(true)
     {
         for (int i = 0; i < MAX_HARMONICS; i++) {
             harmonics[i] = (i == 0) ? 1.0 : 0.0;
         }
     }
 
-    void setFrequency(double freq) { frequency = freq; }
-    void setLevel(double lev) { level = lev; }
+    // Called once from main thread before audio engine starts
+    void prepare(double sampleRate, int blockSize) {
+        juce::dsp::ProcessSpec spec;
+        spec.sampleRate = sampleRate;
+        spec.maximumBlockSize = (juce::uint32)blockSize;
+        spec.numChannels = 1;
+
+        // Pre-initialize all waveform oscillators with lookup tables (no allocation on audio thread)
+        sineOsc.initialise([](float x) { return std::sin(x); }, 2048);
+        sineOsc.prepare(spec);
+
+        squareOsc.initialise([](float x) -> float { return x < 0.0f ? -1.0f : 1.0f; }, 2048);
+        squareOsc.prepare(spec);
+
+        sawOsc.initialise([](float x) -> float { return x / juce::MathConstants<float>::pi; }, 2048);
+        sawOsc.prepare(spec);
+
+        triOsc.initialise([](float x) -> float {
+            return 2.0f * std::abs(x) / juce::MathConstants<float>::pi - 1.0f;
+        }, 2048);
+        triOsc.prepare(spec);
+
+        filter.prepare(spec);
+        filter.setType(juce::dsp::StateVariableTPTFilter<float>::Type::lowpass);
+
+        adsr.setSampleRate(sampleRate);
+        juce::ADSR::Parameters adsrParams { 0.01f, 0.0f, 1.0f, 0.2f };
+        adsr.setParameters(adsrParams);
+
+        cachedSampleRate = sampleRate;
+        prepared = true;
+    }
+
+    // ── Main-thread setters (all atomic or lock-free) ─────────────
+
+    void setFrequency(double freq) { frequency.store(freq); }
+    void setLevel(double lev) { level.store(lev); }
     void setWaveform(Waveform wf) { waveform.store(wf); }
     void setDetune(double cents) { detuneCents.store(cents); }
 
     void setHarmonics(const double *levels, int count) {
         for (int i = 0; i < MAX_HARMONICS; i++) {
-            harmonics[i] = (i < count) ? levels[i] : 0.0;
+            harmonics[i].store((i < count) ? levels[i] : 0.0);
         }
     }
 
     void noteOn() {
         pendingNoteOn.store(true);
-        filter.reset();
-        envelope.noteOn();
     }
 
     void noteOff() {
-        envelope.noteOff();
+        pendingNoteOff.store(true);
     }
 
-    void setAttack(double ms) { envelope.setAttack(ms); }
-    void setRelease(double ms) { envelope.setRelease(ms); }
-    void setFilterCutoff(double hz) { filter.setCutoff(hz); }
-    void setFilterResonance(double q) { filter.setResonance(q); }
+    void setAttack(double ms) {
+        attackMs.store(std::max(1.0, ms));
+        pendingParamUpdate.store(true);
+    }
+
+    void setRelease(double ms) {
+        releaseMs.store(std::max(1.0, ms));
+        pendingParamUpdate.store(true);
+    }
+
+    void setFilterCutoff(double hz) {
+        filterCutoff.store(std::max(20.0, std::min(20000.0, hz)));
+    }
+
+    void setFilterResonance(double q) {
+        filterResonance.store(std::max(0.0, std::min(1.0, q)));
+    }
+
+    // ── Audio-thread render ───────────────────────────────────────
 
     float getNextSample(double sampleRate) {
-        // Handle phase reset on audio thread to avoid data race
+        if (!prepared) return 0.0f;
+
+        // Apply pending note events (main thread -> audio thread)
         if (pendingNoteOn.exchange(false)) {
-            phase = 0.0;
+            sineOsc.reset();
+            squareOsc.reset();
+            sawOsc.reset();
+            triOsc.reset();
+            filter.reset();
+            adsr.noteOn();
+        }
+        if (pendingNoteOff.exchange(false)) {
+            adsr.noteOff();
         }
 
-        float envGain = envelope.process(sampleRate);
-        if (envGain < 0.00001f && !envelope.isActive()) {
+        // Apply pending ADSR parameter changes
+        if (pendingParamUpdate.exchange(false)) {
+            float atkSec = (float)(attackMs.load() * 0.001);
+            float relSec = (float)(releaseMs.load() * 0.001);
+            juce::ADSR::Parameters p { atkSec, 0.0f, 1.0f, relSec };
+            adsr.setParameters(p);
+        }
+
+        // Get envelope value
+        float envGain = adsr.getNextSample();
+        if (envGain < 0.00001f && !adsr.isActive()) {
             return 0.0f;
         }
 
+        // Read atomic parameters
         double freq = frequency.load();
-        double lev = level.load();
+        float lev = (float)level.load();
         Waveform wf = waveform.load();
         double detune = detuneCents.load();
 
-        // Apply detune (cents to frequency ratio)
+        // Apply detune
         if (std::fabs(detune) > 0.01) {
             freq *= std::pow(2.0, detune / 1200.0);
         }
 
-        double sample = 0.0;
+        // Set frequency on all oscillators (they track phase independently)
+        float freqF = (float)freq;
+        sineOsc.setFrequency(freqF, true);
+        squareOsc.setFrequency(freqF, true);
+        sawOsc.setFrequency(freqF, true);
+        triOsc.setFrequency(freqF, true);
+
+        // Update filter parameters (safe — JUCE TPT filter handles per-sample modulation)
+        float cutoff = (float)filterCutoff.load();
+        float resonance = (float)filterResonance.load();
+        float mappedQ = 0.707f + resonance * 9.293f;
+        filter.setCutoffFrequency(cutoff);
+        filter.setResonance(mappedQ);
+
+        // Generate sample from the active waveform's pre-initialized oscillator
+        float sample = 0.0f;
 
         switch (wf) {
-            case Waveform::Sine:
-                for (int h = 0; h < MAX_HARMONICS; h++) {
-                    double hLevel = harmonics[h].load();
-                    if (hLevel > 0.0001) {
-                        sample += std::sin(phase * (h + 1) * 2.0 * M_PI) * hLevel;
+            case Waveform::Sine: {
+                float baseSample = sineOsc.processSample(0.0f);
+                float h0 = (float)harmonics[0].load();
+                sample = baseSample * h0;
+
+                // Additive harmonics (if any higher harmonics are set)
+                for (int h = 1; h < MAX_HARMONICS; h++) {
+                    float hLevel = (float)harmonics[h].load();
+                    if (hLevel > 0.0001f) {
+                        // Approximate higher harmonics from base phase
+                        // This is safe: no allocation, just math
+                        float harmSample = std::sin(std::asin(baseSample) * (float)(h + 1));
+                        sample += harmSample * hLevel;
                     }
                 }
                 break;
-
-            case Waveform::Square: {
-                double p = std::fmod(phase, 1.0);
-                sample = (p < 0.5) ? 0.7 : -0.7;
-                break;
             }
 
-            case Waveform::Saw: {
-                double p = std::fmod(phase, 1.0);
-                sample = (2.0 * p - 1.0) * 0.6;
+            case Waveform::Square:
+                sample = squareOsc.processSample(0.0f) * 0.7f;
                 break;
-            }
 
-            case Waveform::Triangle: {
-                double p = std::fmod(phase, 1.0);
-                sample = (4.0 * std::fabs(p - 0.5) - 1.0) * 0.8;
+            case Waveform::Saw:
+                sample = sawOsc.processSample(0.0f) * 0.6f;
                 break;
-            }
+
+            case Waveform::Triangle:
+                sample = triOsc.processSample(0.0f) * 0.8f;
+                break;
         }
 
-        phase += freq / sampleRate;
-        if (phase >= 1.0) phase -= 1.0;
+        // Advance inactive oscillators to keep phase tracking coherent
+        // (prevents phase discontinuity on waveform switch)
+        if (wf != Waveform::Sine)    sineOsc.processSample(0.0f);
+        if (wf != Waveform::Square)  squareOsc.processSample(0.0f);
+        if (wf != Waveform::Saw)     sawOsc.processSample(0.0f);
+        if (wf != Waveform::Triangle) triOsc.processSample(0.0f);
 
         // Apply filter
-        float filtered = filter.process((float)sample, sampleRate);
+        float filtered = filter.processSample(0, sample);
 
-        return filtered * (float)lev * envGain;
+        return filtered * lev * envGain;
     }
 
 private:
+    // Atomic parameters (written by main thread, read by audio thread)
     std::atomic<double> frequency;
     std::atomic<double> level;
-    double phase;  // Only touched by audio thread
-    std::atomic<bool> pendingNoteOn{false};
     std::atomic<Waveform> waveform;
     std::atomic<double> detuneCents;
     std::atomic<double> harmonics[MAX_HARMONICS];
-    ADSREnvelope envelope;
-    OnePoleLPF filter;
+    std::atomic<bool> pendingNoteOn;
+    std::atomic<bool> pendingNoteOff;
+    std::atomic<double> filterCutoff;
+    std::atomic<double> filterResonance;
+    std::atomic<double> attackMs;
+    std::atomic<double> releaseMs;
+    std::atomic<bool> pendingParamUpdate;
+
+    // DSP objects (ONLY touched by audio thread after prepare())
+    juce::dsp::Oscillator<float> sineOsc;
+    juce::dsp::Oscillator<float> squareOsc;
+    juce::dsp::Oscillator<float> sawOsc;
+    juce::dsp::Oscillator<float> triOsc;
+    juce::dsp::StateVariableTPTFilter<float> filter;
+    juce::ADSR adsr;
+    double cachedSampleRate = 44100.0;
+    bool prepared = false;
 };
 
 // ── Transport Engine ──────────────────────────────────────────────
+// All-atomic transport — safe for cross-thread access.
 class TransportEngine {
 public:
     TransportEngine()
@@ -241,7 +258,7 @@ public:
     void stop() { playing.store(false); }
     bool isPlaying() { return playing.load(); }
 
-    // Returns true if we crossed a new beat boundary
+    // Returns true if we crossed a new beat boundary (audio thread only)
     bool advance(double sampleRate) {
         if (!playing.load()) return false;
 
@@ -266,13 +283,14 @@ private:
     std::atomic<int> lastBeatInt;
 };
 
-// ── Objective-C Wrapper ───────────────────────────────────────────
-
+// ── Beat State (lock-free audio->main thread communication) ──────
 struct BeatState {
     std::atomic<bool> crossed{false};
     std::atomic<double> beat{0.0};
     std::atomic<double> bpm{120.0};
 };
+
+// ── Objective-C Wrapper ───────────────────────────────────────────
 
 @interface JuceToneGenerator ()
 @property (nonatomic, strong) AVAudioEngine *audioEngine;
@@ -300,7 +318,6 @@ struct BeatState {
     if (self) {
         _engine = new SynthEngine();
         _transport = new TransportEngine();
-        // Audio engine initialized lazily via [self initialize] called from setup
     }
     return self;
 }
@@ -358,6 +375,9 @@ struct BeatState {
             AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:2];
             NSLog(@"[ExpoJuce] Using sample rate: %.0f", sampleRate);
 
+            // Prepare JUCE DSP objects on main thread BEFORE audio thread starts
+            self.engine->prepare(sampleRate, 512);
+
             SynthEngine *eng = self.engine;
             TransportEngine *trans = self.transport;
 
@@ -366,19 +386,27 @@ struct BeatState {
             }
             BeatState *bs = self.beatState;
 
-            self.sourceNode = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData) {
-                double sr = sampleRate;
+            self.sourceNode = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(
+                BOOL *isSilence,
+                const AudioTimeStamp *timestamp,
+                AVAudioFrameCount frameCount,
+                AudioBufferList *outputData
+            ) {
                 float *leftChannel = (float *)outputData->mBuffers[0].mData;
-                float *rightChannel = (outputData->mNumberBuffers > 1) ? (float *)outputData->mBuffers[1].mData : leftChannel;
+                float *rightChannel = (outputData->mNumberBuffers > 1)
+                    ? (float *)outputData->mBuffers[1].mData
+                    : leftChannel;
 
                 for (AVAudioFrameCount i = 0; i < frameCount; i++) {
-                    if (trans->advance(sr)) {
+                    // Advance transport
+                    if (trans->advance(sampleRate)) {
                         bs->crossed.store(true);
                         bs->beat.store(trans->getPosition());
                         bs->bpm.store(trans->getTempo());
                     }
 
-                    float sample = eng->getNextSample(sr);
+                    // Render synth sample
+                    float sample = eng->getNextSample(sampleRate);
                     leftChannel[i] = sample;
                     rightChannel[i] = sample;
                 }
@@ -398,7 +426,7 @@ struct BeatState {
                 continue;
             }
 
-            NSLog(@"[ExpoJuce] Audio engine started successfully");
+            NSLog(@"[ExpoJuce] Audio engine started successfully (JUCE DSP active)");
             return;
 
         } @catch (NSException *exception) {
@@ -476,9 +504,7 @@ struct BeatState {
 // ── Synth Methods ─────────────────────────────────────────────────
 
 - (void)playToneWithFrequency:(double)frequency duration:(double)duration {
-    NSLog(@"[ExpoJuce] playTone freq=%.1f dur=%.0f", frequency, duration);
     if (!self.engine) return;
-
     self.engine->setFrequency(frequency);
     self.engine->noteOn();
 
@@ -553,12 +579,10 @@ struct BeatState {
 // ── Transport ─────────────────────────────────────────────────────
 
 - (void)startTransport {
-    NSLog(@"[ExpoJuce] Transport start");
     if (self.transport) self.transport->start();
 }
 
 - (void)stopTransport {
-    NSLog(@"[ExpoJuce] Transport stop");
     if (self.transport) self.transport->stop();
 }
 

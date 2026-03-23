@@ -17,25 +17,26 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
-  # Our source files: Swift module, ObjC bridge, C++ tone generator
+  # Our source files: Swift module, ObjC bridge, C++ tone generator, JUCE compilation unit
   s.source_files = "*.{h,m,mm,swift}"
-  s.exclude_files = ["JuceConfig.h", "JuceModules.mm"]
   s.requires_arc = true
 
-  # JUCE sources preserved on disk for future use but NOT compiled —
-  # current engine uses pure C++ + AVFoundation, no JUCE APIs.
-  # Compiling JUCE modules (especially juce_events) causes launch crashes
-  # due to static initializers conflicting with React Native's app lifecycle.
+  # JUCE modules compiled: juce_core, juce_audio_basics, juce_audio_formats, juce_dsp
+  # NOT compiled: juce_events, juce_data_structures (static initializer conflicts with RN)
+  # JuceModules.mm is a single translation unit that #includes the JUCE .cpp files.
   s.preserve_paths = ["juce_modules/**"]
 
   s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
-                 'Foundation', 'Accelerate'
+                 'Foundation', 'Accelerate', 'CoreMIDI'
   s.libraries = 'c++'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)"',
+    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)" "$(PODS_TARGET_SRCROOT)/juce_modules"',
+    # Suppress JUCE deprecation warnings and implicit conversion warnings in vendored code
+    'GCC_WARN_ABOUT_DEPRECATED_DECLARATIONS' => 'NO',
+    'OTHER_CPLUSPLUSFLAGS' => '-Wno-shorten-64-to-32 -Wno-comma -Wno-deprecated-declarations',
   }
 end
