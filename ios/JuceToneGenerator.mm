@@ -12,12 +12,17 @@ static const int MAX_HARMONICS = 8;
 // ── Simple one-pole low-pass filter ───────────────────────────────
 class OnePoleLPF {
 public:
-    OnePoleLPF() : y1(0.0), cutoff(20000.0), resonance(0.0) {}
+    OnePoleLPF() : y1(0.0), cutoff(20000.0), resonance(0.0), pendingReset(false) {}
 
     void setCutoff(double hz) { cutoff.store(hz); }
     void setResonance(double q) { resonance.store(q); }
 
     float process(float input, double sampleRate) {
+        // Handle reset on audio thread to avoid data race
+        if (pendingReset.exchange(false)) {
+            y1 = 0.0;
+        }
+
         double fc = cutoff.load();
 
         // Clamp cutoff to Nyquist
@@ -34,12 +39,14 @@ public:
         return (float)y1;
     }
 
-    void reset() { y1 = 0.0; }
+    // Signal reset from main thread — applied on next audio render
+    void reset() { pendingReset.store(true); }
 
 private:
-    double y1;
+    double y1;  // Only touched by audio thread
     std::atomic<double> cutoff;
     std::atomic<double> resonance;
+    std::atomic<bool> pendingReset;
 };
 
 // ── ADSR Envelope ─────────────────────────────────────────────────
@@ -130,7 +137,7 @@ public:
     }
 
     void noteOn() {
-        phase = 0.0;
+        pendingNoteOn.store(true);
         filter.reset();
         envelope.noteOn();
     }
@@ -145,6 +152,11 @@ public:
     void setFilterResonance(double q) { filter.setResonance(q); }
 
     float getNextSample(double sampleRate) {
+        // Handle phase reset on audio thread to avoid data race
+        if (pendingNoteOn.exchange(false)) {
+            phase = 0.0;
+        }
+
         float envGain = envelope.process(sampleRate);
         if (envGain < 0.00001f && !envelope.isActive()) {
             return 0.0f;
@@ -203,7 +215,8 @@ public:
 private:
     std::atomic<double> frequency;
     std::atomic<double> level;
-    double phase;
+    double phase;  // Only touched by audio thread
+    std::atomic<bool> pendingNoteOn{false};
     std::atomic<Waveform> waveform;
     std::atomic<double> detuneCents;
     std::atomic<double> harmonics[MAX_HARMONICS];
