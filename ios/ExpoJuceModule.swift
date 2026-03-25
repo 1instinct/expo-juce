@@ -6,9 +6,6 @@ public class ExpoJuceModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ExpoJuce")
 
-    // Audio engine is initialized lazily on first use, not at module load.
-    // Initializing AVAudioEngine in OnCreate can crash before JS is ready.
-
     OnDestroy {
       ExpoJuceBridge.stopBeatTimer()
       ExpoJuceBridge.shutdown()
@@ -20,8 +17,6 @@ public class ExpoJuceModule: Module {
 
     Events("onChange", "onBeat")
 
-    // Beat timer only runs while JS has active listeners.
-    // This prevents sendEvent from firing before listeners are attached (crash).
     OnStartObserving {
       self.hasListeners = true
       ExpoJuceBridge.startBeatTimer()
@@ -37,8 +32,13 @@ public class ExpoJuceModule: Module {
     }
 
     // ── Synth ───────────────────────────────────────────────────────
+    // All audio methods use AsyncFunction dispatched on main queue.
+    // AVAudioEngine and CoreAudio must be accessed from the main thread.
+    // Expo's synchronous Function() runs on the JS/Hermes thread,
+    // which is NOT the main thread in production builds — this causes
+    // native crashes when calling CoreAudio APIs.
 
-    Function("setup") { [weak self] in
+    AsyncFunction("setup") { [weak self] in
       ExpoJuceBridge.setup()
       ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
         guard let self = self, self.hasListeners else { return }
@@ -47,61 +47,61 @@ public class ExpoJuceModule: Module {
           "bpm": bpm,
         ])
       }
-    }
+    }.runOnQueue(.main)
 
-    Function("playTone") { (frequency: Double, duration: Double) -> String in
+    AsyncFunction("playTone") { (frequency: Double, duration: Double) -> String in
       ExpoJuceBridge.playTone(withFrequency: frequency, duration: duration)
       return "Playing tone at \(frequency)Hz for \(duration)ms"
-    }
+    }.runOnQueue(.main)
 
-    Function("setFrequency") { (frequency: Double) in
+    AsyncFunction("setFrequency") { (frequency: Double) in
       ExpoJuceBridge.setFrequency(frequency)
-    }
+    }.runOnQueue(.main)
 
-    Function("setLevel") { (level: Double) in
+    AsyncFunction("setLevel") { (level: Double) in
       ExpoJuceBridge.setLevel(level)
-    }
+    }.runOnQueue(.main)
 
-    Function("setWaveform") { (waveform: String) in
+    AsyncFunction("setWaveform") { (waveform: String) in
       ExpoJuceBridge.setWaveform(waveform)
-    }
+    }.runOnQueue(.main)
 
-    Function("setHarmonicLevels") { (levels: [Double]) in
+    AsyncFunction("setHarmonicLevels") { (levels: [Double]) in
       let nsLevels = levels.map { NSNumber(value: $0) }
       ExpoJuceBridge.setHarmonicLevels(nsLevels)
-    }
+    }.runOnQueue(.main)
 
-    Function("noteOn") {
+    AsyncFunction("noteOn") {
       ExpoJuceBridge.noteOn()
-    }
+    }.runOnQueue(.main)
 
-    Function("noteOff") {
+    AsyncFunction("noteOff") {
       ExpoJuceBridge.noteOff()
-    }
+    }.runOnQueue(.main)
 
     // ── DSP Params ──────────────────────────────────────────────────
 
-    Function("setAttack") { (ms: Double) in
+    AsyncFunction("setAttack") { (ms: Double) in
       ExpoJuceBridge.setAttack(ms)
-    }
+    }.runOnQueue(.main)
 
-    Function("setRelease") { (ms: Double) in
+    AsyncFunction("setRelease") { (ms: Double) in
       ExpoJuceBridge.setRelease(ms)
-    }
+    }.runOnQueue(.main)
 
-    Function("setFilterCutoff") { (hz: Double) in
+    AsyncFunction("setFilterCutoff") { (hz: Double) in
       ExpoJuceBridge.setFilterCutoff(hz)
-    }
+    }.runOnQueue(.main)
 
-    Function("setFilterResonance") { (q: Double) in
+    AsyncFunction("setFilterResonance") { (q: Double) in
       ExpoJuceBridge.setFilterResonance(q)
-    }
+    }.runOnQueue(.main)
 
-    Function("setDetune") { (cents: Double) in
+    AsyncFunction("setDetune") { (cents: Double) in
       ExpoJuceBridge.setDetune(cents)
-    }
+    }.runOnQueue(.main)
 
-    Function("setDSPValue") { (param: String, value: Double) in
+    AsyncFunction("setDSPValue") { (param: String, value: Double) in
       switch param {
       case "frequency":
         ExpoJuceBridge.setFrequency(value)
@@ -120,37 +120,37 @@ public class ExpoJuceModule: Module {
       default:
         break
       }
-    }
+    }.runOnQueue(.main)
 
     // ── Transport ───────────────────────────────────────────────────
 
-    Function("startTransport") {
+    AsyncFunction("startTransport") {
       ExpoJuceBridge.startTransport()
-    }
+    }.runOnQueue(.main)
 
-    Function("stopTransport") {
+    AsyncFunction("stopTransport") {
       ExpoJuceBridge.stopTransport()
-    }
+    }.runOnQueue(.main)
 
-    Function("setTempo") { (bpm: Double) in
+    AsyncFunction("setTempo") { (bpm: Double) in
       ExpoJuceBridge.setTempo(bpm)
-    }
+    }.runOnQueue(.main)
 
-    Function("setTransportPosition") { (beat: Double) in
+    AsyncFunction("setTransportPosition") { (beat: Double) in
       ExpoJuceBridge.setTransportPosition(beat)
-    }
+    }.runOnQueue(.main)
 
-    Function("getTransportPosition") { () -> Double in
+    AsyncFunction("getTransportPosition") { () -> Double in
       return ExpoJuceBridge.getTransportPosition()
-    }
+    }.runOnQueue(.main)
 
-    Function("getTempo") { () -> Double in
+    AsyncFunction("getTempo") { () -> Double in
       return ExpoJuceBridge.getTempo()
-    }
+    }.runOnQueue(.main)
 
-    Function("isTransportPlaying") { () -> Bool in
+    AsyncFunction("isTransportPlaying") { () -> Bool in
       return ExpoJuceBridge.isTransportPlaying()
-    }
+    }.runOnQueue(.main)
 
     // ── Async / View ────────────────────────────────────────────────
 
