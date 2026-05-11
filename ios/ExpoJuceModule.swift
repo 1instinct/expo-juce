@@ -51,11 +51,11 @@ public class ExpoJuceModule: Module {
     // ── Synth (MIDI-style) ─────────────────────────────────────────
 
     AsyncFunction("noteOn") { (note: Int, velocity: Int) in
-      ExpoJuceBridge.noteOn(Int32(note), velocity: Int32(velocity))
+      ExpoJuceBridge.note(on: Int32(note), velocity: Int32(velocity))
     }.runOnQueue(.main)
 
     AsyncFunction("noteOff") { (note: Int) in
-      ExpoJuceBridge.noteOff(Int32(note))
+      ExpoJuceBridge.note(off: Int32(note))
     }.runOnQueue(.main)
 
     AsyncFunction("allNotesOff") {
