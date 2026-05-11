@@ -11,23 +11,23 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 + (void)startBeatTimer;
 + (void)stopBeatTimer;
 
-// ── Synth ─────────────────────────────────────────────────────────
-+ (void)playToneWithFrequency:(double)frequency duration:(double)duration;
-+ (void)setFrequency:(double)frequency;
-+ (void)setLevel:(double)level;
-+ (void)setWaveform:(NSString *)waveform;
-+ (void)setHarmonicLevels:(NSArray<NSNumber *> *)levels;
-+ (void)noteOn;
-+ (void)noteOff;
+// ── Synth (MIDI-style) ───────────────────────────────────────────
++ (void)noteOn:(int)note velocity:(int)velocity;
++ (void)noteOff:(int)note;
++ (void)allNotesOff;
 
-// ── DSP Params ────────────────────────────────────────────────────
-+ (void)setAttack:(double)ms;
-+ (void)setRelease:(double)ms;
+// ── Global Synth Params ──────────────────────────────────────────
++ (void)setWaveform:(NSString *)waveform;
 + (void)setFilterCutoff:(double)hz;
 + (void)setFilterResonance:(double)q;
++ (void)setAttack:(double)ms;
++ (void)setDecay:(double)ms;
++ (void)setSustain:(double)level;
++ (void)setRelease:(double)ms;
 + (void)setDetune:(double)cents;
++ (void)setMasterLevel:(double)level;
 
-// ── Transport ─────────────────────────────────────────────────────
+// ── Transport ────────────────────────────────────────────────────
 + (void)startTransport;
 + (void)stopTransport;
 + (void)setTempo:(double)bpm;
