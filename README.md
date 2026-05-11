@@ -2,6 +2,40 @@
 
 Realtime DSP w/C++ & JUCE
 
+## Roadmap: Full Audio Workstation
+
+expo-juce is being built toward full audio workstation capabilities. The work is decomposed into independent sub-projects, each building on the previous:
+
+### Sub-project 1: Polyphonic Synth Engine (current)
+**Status:** In progress — [spec](docs/superpowers/specs/2026-05-11-polyphonic-synth-engine-design.md)
+
+Replace the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack built on `AudioProcessorGraph`. 8-voice polyphonic synth with per-voice oscillator, SVF filter, and full ADSR envelope. MIDI-style API (`noteOn(note, velocity)` / `noteOff(note)`). JUCE owns device management and output for cross-platform support (iOS, macOS, Windows, Linux).
+
+### Sub-project 2: Effects Chain
+**Status:** Planned
+
+Add `AudioProcessor` nodes for standard effects: reverb, delay, distortion, EQ, compressor. Inserted into the graph after the synth node on a master effects bus. Each effect is an independent processor — can be bypassed, reordered, or removed.
+
+### Sub-project 3: Sample Playback / Drum Machine
+**Status:** Planned
+
+`SamplerProcessor` node that loads audio files and triggers playback via `noteOn`. Supports multi-sample mapping (e.g., different samples per MIDI note). Integrates with the transport for sequenced playback.
+
+### Sub-project 4: Audio Input Processing
+**Status:** Planned
+
+Route mic/line input through the `AudioProcessorGraph` for realtime effects processing (guitar pedal board style). Audio session is already configured as `playAndRecord` from sub-project 1. Add an input node to the graph routed through effects processors.
+
+### Sub-project 5: Modular Routing
+**Status:** Planned
+
+Expose the `AudioProcessorGraph` topology to TypeScript — add, remove, and connect nodes from JS. Enables user-configurable signal chains, parallel processing, send/return buses, and sidechain routing.
+
+### Sub-project 6: Electron / Desktop
+**Status:** Planned
+
+Compile the same C++ engine for macOS, Windows, and Linux. JUCE abstracts platform audio (CoreAudio, WASAPI, ALSA). Package as an Electron native addon. Same graph, same processors, same API — different platform.
+
 ## Quick Start
 
 ### Installation
