@@ -19,8 +19,8 @@ Pod::Spec.new do |s|
 
   s.source_files = "*.{h,m,mm,swift}"
 
-  # Per-file ARC control: JuceModules.mm compiles JUCE source which uses
-  # manual retain/release. All other files use ARC.
+  # Per-file ARC control: JuceModule_*.mm files compile JUCE source which uses
+  # manual retain/release. Only files listed here get ARC enabled.
   s.requires_arc = [
     'ExpoJuceModule.swift',
     'ExpoJuceView.swift',
@@ -43,7 +43,8 @@ Pod::Spec.new do |s|
     "TransportEngine.h",
   ]
 
-  # JUCE modules: all 11 compiled via JuceModules.mm single translation unit
+  # JUCE modules: each compiled as its own translation unit (separate .mm file)
+  # to avoid static symbol collisions between modules.
   s.preserve_paths = ["juce_modules/**"]
 
   s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
