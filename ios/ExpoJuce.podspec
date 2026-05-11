@@ -17,9 +17,20 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
-  # Our source files: Swift module, ObjC bridge, C++ tone generator, JUCE compilation unit
+  # Our source files: Swift module, ObjC bridge, C++ engine, JUCE compilation unit
   s.source_files = "*.{h,m,mm,swift}"
   s.requires_arc = true
+
+  # C++ headers must be private — they include <atomic>, <algorithm>, etc.
+  # which fail when compiled as Objective-C through the module map.
+  # Only ObjC-compatible headers are public.
+  s.private_header_files = [
+    "JuceConfig.h",
+    "Voice.h",
+    "VoiceAllocator.h",
+    "PolySynthProcessor.h",
+    "TransportEngine.h",
+  ]
 
   # JUCE modules compiled: all 11 (core, events, data_structures, graphics, gui_basics,
   # gui_extra, audio_basics, audio_formats, audio_devices, audio_processors, dsp)
