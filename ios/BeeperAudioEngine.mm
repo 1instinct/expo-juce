@@ -6,6 +6,53 @@
 #include "PolySynthProcessor.h"
 #include "TransportEngine.h"
 
+// Lightweight AudioIODeviceCallback that drives an AudioProcessorGraph.
+// Replaces juce::AudioProcessorPlayer (from juce_audio_utils, which we don't use).
+class GraphPlayer : public juce::AudioIODeviceCallback {
+public:
+    void setProcessor(juce::AudioProcessor* p) { processor = p; }
+
+    void audioDeviceIOCallbackWithContext(const float* const* inputChannelData,
+                                          int numInputChannels,
+                                          float* const* outputChannelData,
+                                          int numOutputChannels,
+                                          int numSamples,
+                                          const juce::AudioIODeviceCallbackContext& context) override {
+        juce::ignoreUnused(inputChannelData, numInputChannels, context);
+        if (!processor) {
+            for (int i = 0; i < numOutputChannels; ++i)
+                juce::FloatVectorOperations::clear(outputChannelData[i], numSamples);
+            return;
+        }
+
+        buffer.setSize(numOutputChannels, numSamples, false, false, true);
+        buffer.clear();
+        juce::MidiBuffer midi;
+        processor->processBlock(buffer, midi);
+        for (int i = 0; i < numOutputChannels; ++i)
+            juce::FloatVectorOperations::copy(outputChannelData[i], buffer.getReadPointer(i), numSamples);
+    }
+
+    void audioDeviceAboutToStart(juce::AudioIODevice* device) override {
+        if (processor) {
+            processor->setPlayConfigDetails(0, device->getActiveOutputChannels().countNumberOfSetBits(),
+                                            device->getCurrentSampleRate(),
+                                            device->getCurrentBufferSizeSamples());
+            processor->prepareToPlay(device->getCurrentSampleRate(),
+                                     device->getCurrentBufferSizeSamples());
+        }
+    }
+
+    void audioDeviceStopped() override {
+        if (processor)
+            processor->releaseResources();
+    }
+
+private:
+    juce::AudioProcessor* processor = nullptr;
+    juce::AudioBuffer<float> buffer;
+};
+
 @interface BeeperAudioEngine ()
 @property (nonatomic, assign) bool isReady;
 @property (nonatomic, copy) BeatCallback beatCallback;
@@ -14,7 +61,7 @@
 
 // C++ members stored as raw pointers (ObjC class can't have C++ members inline)
 static juce::AudioDeviceManager* sDeviceManager = nullptr;
-static juce::AudioProcessorPlayer* sPlayer = nullptr;
+static GraphPlayer* sPlayer = nullptr;
 static std::unique_ptr<juce::AudioProcessorGraph> sGraph;
 static PolySynthProcessor* sSynth = nullptr; // owned by graph
 static TransportEngine* sTransport = nullptr;
@@ -115,7 +162,7 @@ static juce::AudioProcessorGraph::Node::Ptr sOutputNode;
     });
 
     // 9. Create player and attach to device
-    sPlayer = new juce::AudioProcessorPlayer();
+    sPlayer = new GraphPlayer();
     sPlayer->setProcessor(sGraph.get());
     sDeviceManager->addAudioCallback(sPlayer);
 
