@@ -2,3 +2,4 @@
 // to avoid static symbol collisions (e.g. getNullVarRef in both juce_core and juce_data_structures).
 #include "JuceConfig.h"
 #include "juce_modules/juce_core/juce_core.cpp"
+#include "juce_modules/juce_core/juce_core_CompilationTime.cpp"
