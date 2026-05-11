@@ -1,4 +1,4 @@
 // HarfBuzz — compiled as its own translation unit (required by JUCE's build design).
-// harfbuzz.cc is a unity file that includes all HarfBuzz source files.
+// Uses JUCE's wrapper which sets up HAVE_CORETEXT and other platform defines.
 #include "JuceConfig.h"
-#include "juce_modules/juce_graphics/fonts/harfbuzz/harfbuzz.cc"
+#include "juce_modules/juce_graphics/juce_graphics_Harfbuzz.cpp"
