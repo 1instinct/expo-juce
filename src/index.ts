@@ -4,104 +4,99 @@ import ExpoJuceModule from './ExpoJuceModule';
 import ExpoJuceView from './ExpoJuceView';
 import { ChangeEventPayload, BeatEventPayload, ExpoJuceViewProps } from './ExpoJuce.types';
 
-export const PI = ExpoJuceModule.PI;
+// ── Lifecycle ────────────────────────────────────────────────────
 
-export function hello(): string {
-  return ExpoJuceModule.hello();
+export async function setup(): Promise<void> {
+  return ExpoJuceModule.setup();
 }
 
-/** Initialize the audio engine. Call once before using synth/transport. */
-export function setup(): void {
-  ExpoJuceModule.setup();
+export async function shutdown(): Promise<void> {
+  return ExpoJuceModule.shutdown();
 }
 
-// ── Synth ───────────────────────────────────────────────────────────
+// ── Polyphonic Synth (MIDI-style) ────────────────────────────────
 
-export function playTone(frequency: number, duration: number): string {
-  return ExpoJuceModule.playTone(frequency, duration);
+export async function noteOn(note: number, velocity: number): Promise<void> {
+  return ExpoJuceModule.noteOn(note, velocity);
 }
 
-export function setFrequency(frequency: number): void {
-  ExpoJuceModule.setFrequency(frequency);
+export async function noteOff(note: number): Promise<void> {
+  return ExpoJuceModule.noteOff(note);
 }
 
-export function setLevel(level: number): void {
-  ExpoJuceModule.setLevel(level);
+export async function allNotesOff(): Promise<void> {
+  return ExpoJuceModule.allNotesOff();
 }
 
-export function setWaveform(waveform: 'sine' | 'square' | 'saw' | 'triangle'): void {
-  ExpoJuceModule.setWaveform(waveform);
+// ── Global Synth Params ──────────────────────────────────────────
+
+export async function setWaveform(waveform: 'sine' | 'square' | 'saw' | 'triangle'): Promise<void> {
+  return ExpoJuceModule.setWaveform(waveform);
 }
 
-export function setHarmonicLevels(levels: number[]): void {
-  ExpoJuceModule.setHarmonicLevels(levels);
+export async function setFilterCutoff(hz: number): Promise<void> {
+  return ExpoJuceModule.setFilterCutoff(hz);
 }
 
-export function noteOn(): void {
-  ExpoJuceModule.noteOn();
+export async function setFilterResonance(q: number): Promise<void> {
+  return ExpoJuceModule.setFilterResonance(q);
 }
 
-export function noteOff(): void {
-  ExpoJuceModule.noteOff();
+export async function setAttack(ms: number): Promise<void> {
+  return ExpoJuceModule.setAttack(ms);
 }
 
-// ── DSP Params ──────────────────────────────────────────────────────
-
-export function setAttack(ms: number): void {
-  ExpoJuceModule.setAttack(ms);
+export async function setDecay(ms: number): Promise<void> {
+  return ExpoJuceModule.setDecay(ms);
 }
 
-export function setRelease(ms: number): void {
-  ExpoJuceModule.setRelease(ms);
+export async function setSustain(level: number): Promise<void> {
+  return ExpoJuceModule.setSustain(level);
 }
 
-export function setFilterCutoff(hz: number): void {
-  ExpoJuceModule.setFilterCutoff(hz);
+export async function setRelease(ms: number): Promise<void> {
+  return ExpoJuceModule.setRelease(ms);
 }
 
-export function setFilterResonance(q: number): void {
-  ExpoJuceModule.setFilterResonance(q);
+export async function setDetune(cents: number): Promise<void> {
+  return ExpoJuceModule.setDetune(cents);
 }
 
-export function setDetune(cents: number): void {
-  ExpoJuceModule.setDetune(cents);
+export async function setMasterLevel(level: number): Promise<void> {
+  return ExpoJuceModule.setMasterLevel(level);
 }
 
-export function setDSPValue(param: string, value: number): void {
-  ExpoJuceModule.setDSPValue(param, value);
+// ── Transport ────────────────────────────────────────────────────
+
+export async function startTransport(): Promise<void> {
+  return ExpoJuceModule.startTransport();
 }
 
-// ── Transport ───────────────────────────────────────────────────────
-
-export function startTransport(): void {
-  ExpoJuceModule.startTransport();
+export async function stopTransport(): Promise<void> {
+  return ExpoJuceModule.stopTransport();
 }
 
-export function stopTransport(): void {
-  ExpoJuceModule.stopTransport();
+export async function setTempo(bpm: number): Promise<void> {
+  return ExpoJuceModule.setTempo(bpm);
 }
 
-export function setTempo(bpm: number): void {
-  ExpoJuceModule.setTempo(bpm);
+export async function setTransportPosition(beat: number): Promise<void> {
+  return ExpoJuceModule.setTransportPosition(beat);
 }
 
-export function setTransportPosition(beat: number): void {
-  ExpoJuceModule.setTransportPosition(beat);
-}
-
-export function getTransportPosition(): number {
+export async function getTransportPosition(): Promise<number> {
   return ExpoJuceModule.getTransportPosition();
 }
 
-export function getTempo(): number {
+export async function getTempo(): Promise<number> {
   return ExpoJuceModule.getTempo();
 }
 
-export function isTransportPlaying(): boolean {
+export async function isTransportPlaying(): Promise<boolean> {
   return ExpoJuceModule.isTransportPlaying();
 }
 
-// ── Events ──────────────────────────────────────────────────────────
+// ── Events ───────────────────────────────────────────────────────
 
 export async function setValueAsync(value: string) {
   return await ExpoJuceModule.setValueAsync(value);
