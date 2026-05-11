@@ -56,5 +56,5 @@ yarn-error.log
 # Expo
 .expo/*
 .anima/
-JUCE/
+/JUCE/
 ios/juce_modules/
