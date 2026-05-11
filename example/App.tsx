@@ -1,5 +1,5 @@
 import { StyleSheet, Text, View, Pressable, ScrollView } from 'react-native';
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 
 import * as ExpoJuce from 'expo-juce';
 
@@ -16,12 +16,13 @@ const NOTES = [
 
 const WAVEFORMS = ['sine', 'square', 'saw', 'triangle'] as const;
 
+type ParamPreset = { label: string; action: () => Promise<void> };
+
 export default function App() {
   const [ready, setReady] = useState(false);
   const [waveform, setWaveform] = useState<typeof WAVEFORMS[number]>('sine');
   const [activeNotes, setActiveNotes] = useState<Set<number>>(new Set());
-  const activeNotesRef = useRef(activeNotes);
-  activeNotesRef.current = activeNotes;
+  const [activePreset, setActivePreset] = useState('Default');
 
   useEffect(() => {
     ExpoJuce.setup().then(() => setReady(true));
@@ -53,6 +54,74 @@ export default function App() {
     await ExpoJuce.allNotesOff();
     setActiveNotes(new Set());
   };
+
+  const applyPreset = useCallback(async (name: string, fn: () => Promise<void>) => {
+    await fn();
+    setActivePreset(name);
+  }, []);
+
+  const presets: ParamPreset[] = [
+    {
+      label: 'Default',
+      action: async () => {
+        await ExpoJuce.setFilterCutoff(20000);
+        await ExpoJuce.setFilterResonance(0);
+        await ExpoJuce.setAttack(10);
+        await ExpoJuce.setDecay(1);
+        await ExpoJuce.setSustain(1);
+        await ExpoJuce.setRelease(200);
+        await ExpoJuce.setMasterLevel(0.5);
+      },
+    },
+    {
+      label: 'Pad',
+      action: async () => {
+        await ExpoJuce.setFilterCutoff(2000);
+        await ExpoJuce.setFilterResonance(0.3);
+        await ExpoJuce.setAttack(500);
+        await ExpoJuce.setDecay(300);
+        await ExpoJuce.setSustain(0.6);
+        await ExpoJuce.setRelease(1000);
+        await ExpoJuce.setMasterLevel(0.4);
+      },
+    },
+    {
+      label: 'Pluck',
+      action: async () => {
+        await ExpoJuce.setFilterCutoff(5000);
+        await ExpoJuce.setFilterResonance(0.5);
+        await ExpoJuce.setAttack(1);
+        await ExpoJuce.setDecay(200);
+        await ExpoJuce.setSustain(0.0);
+        await ExpoJuce.setRelease(100);
+        await ExpoJuce.setMasterLevel(0.6);
+      },
+    },
+    {
+      label: 'Resonant',
+      action: async () => {
+        await ExpoJuce.setFilterCutoff(800);
+        await ExpoJuce.setFilterResonance(0.9);
+        await ExpoJuce.setAttack(10);
+        await ExpoJuce.setDecay(100);
+        await ExpoJuce.setSustain(0.8);
+        await ExpoJuce.setRelease(300);
+        await ExpoJuce.setMasterLevel(0.3);
+      },
+    },
+    {
+      label: 'Organ',
+      action: async () => {
+        await ExpoJuce.setFilterCutoff(20000);
+        await ExpoJuce.setFilterResonance(0);
+        await ExpoJuce.setAttack(1);
+        await ExpoJuce.setDecay(1);
+        await ExpoJuce.setSustain(1);
+        await ExpoJuce.setRelease(50);
+        await ExpoJuce.setMasterLevel(0.5);
+      },
+    },
+  ];
 
   if (!ready) {
     return (
@@ -104,6 +173,24 @@ export default function App() {
         </View>
       </View>
 
+      {/* Presets */}
+      <View style={styles.section}>
+        <Text style={styles.label}>Presets (Filter + ADSR + Level)</Text>
+        <View style={styles.row}>
+          {presets.map(({ label, action }) => (
+            <Pressable
+              key={label}
+              style={[styles.chip, activePreset === label && styles.chipActive]}
+              onPress={() => applyPreset(label, action)}
+            >
+              <Text style={[styles.chipText, activePreset === label && styles.chipTextActive]}>
+                {label}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      </View>
+
       {/* Panic button */}
       <Pressable style={styles.panic} onPress={handlePanic}>
         <Text style={styles.panicText}>ALL NOTES OFF</Text>
@@ -120,6 +207,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 20,
     paddingTop: 60,
+    paddingBottom: 40,
   },
   title: {
     fontSize: 28,
@@ -145,6 +233,7 @@ const styles = StyleSheet.create({
   },
   row: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
   },
   chip: {

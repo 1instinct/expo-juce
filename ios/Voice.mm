@@ -66,6 +66,11 @@ void Voice::captureAndRelease(Waveform waveform, double frequency,
     fadeOutTailPos = 0;
     std::memset(fadeOutTail, 0, sizeof(fadeOutTail));
 
+    // Apply current filter params before rendering fade-out
+    float mappedQ = 0.707f + filterResonance * 9.293f;
+    filter.setCutoffFrequency(filterCutoff);
+    filter.setResonance(mappedQ);
+
     for (int i = 0; i < FADE_OUT_SAMPLES; i++) {
         float envGain = adsr.getNextSample();
 
@@ -142,11 +147,6 @@ void Voice::renderBlock(float* buffer, int numSamples,
                 sample = triOsc.processSample(0.0f) * 0.8f;
                 break;
         }
-
-        if (waveform != Waveform::Sine)     sineOsc.processSample(0.0f);
-        if (waveform != Waveform::Square)   squareOsc.processSample(0.0f);
-        if (waveform != Waveform::Saw)      sawOsc.processSample(0.0f);
-        if (waveform != Waveform::Triangle) triOsc.processSample(0.0f);
 
         float filtered = filter.processSample(0, sample);
         float out = filtered * envGain * velocityGain * masterLevel;

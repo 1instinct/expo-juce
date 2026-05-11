@@ -2,8 +2,8 @@
 #include <algorithm>
 
 TransportEngine::TransportEngine()
-    : bpm(120.0), playing(false), pendingPosition(-1.0),
-      hasPendingPosition(false), positionSnapshot(0.0) {}
+    : bpm(120.0), playing(false),
+      pendingPosition(std::nan("")), positionSnapshot(0.0) {}
 
 void TransportEngine::setTempo(double newBpm) {
     bpm.store(std::clamp(newBpm, 20.0, 400.0));
@@ -13,7 +13,6 @@ double TransportEngine::getTempo() { return bpm.load(); }
 
 void TransportEngine::setPosition(double beat) {
     pendingPosition.store(beat);
-    hasPendingPosition.store(true);
 }
 
 double TransportEngine::getPosition() { return positionSnapshot.load(); }
@@ -23,8 +22,9 @@ void TransportEngine::stop() { playing.store(false); }
 bool TransportEngine::isPlaying() { return playing.load(); }
 
 bool TransportEngine::advanceBlock(int numSamples, double sampleRate) {
-    if (hasPendingPosition.exchange(false)) {
-        beatPosition = pendingPosition.load();
+    double pending = pendingPosition.exchange(std::nan(""));
+    if (!std::isnan(pending)) {
+        beatPosition = pending;
         lastBeatInt = (int)beatPosition;
     }
 

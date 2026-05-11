@@ -2,7 +2,7 @@
 
 #include "Voice.h"
 
-static const int MAX_VOICES = 8;
+inline constexpr int MAX_VOICES = 8;
 
 class VoiceAllocator {
 public:

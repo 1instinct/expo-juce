@@ -12,6 +12,14 @@ struct BeatState {
     std::atomic<double> bpm{120.0};
 };
 
+// Lock-free SPSC note event queue
+struct NoteEvent {
+    enum Type : uint8_t { NoteOn, NoteOff, AllNotesOff };
+    Type type;
+    int note;
+    int velocity;
+};
+
 class PolySynthProcessor : public juce::AudioProcessor {
 public:
     PolySynthProcessor();
@@ -36,6 +44,7 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
+    // Thread-safe: called from main thread, queued for audio thread
     void noteOn(int note, int velocity);
     void noteOff(int note);
     void allNotesOff();
@@ -54,6 +63,8 @@ public:
     BeatState beatState;
 
 private:
+    void processNoteEvent(const NoteEvent& event);
+
     Voice voices[MAX_VOICES];
     VoiceAllocator allocator;
     TransportEngine* transport = nullptr;
@@ -63,4 +74,10 @@ private:
     std::atomic<float> filterResonance{0.0f};
     std::atomic<float> detuneCents{0.0f};
     std::atomic<float> masterLevel{0.5f};
+
+    // SPSC ring buffer for note events (main thread → audio thread)
+    static constexpr int EVENT_QUEUE_SIZE = 256;
+    NoteEvent eventQueue[EVENT_QUEUE_SIZE];
+    std::atomic<int> eventWritePos{0};
+    std::atomic<int> eventReadPos{0};
 };

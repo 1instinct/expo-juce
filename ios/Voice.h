@@ -7,7 +7,7 @@
 
 enum class Waveform { Sine, Square, Saw, Triangle };
 
-static const int FADE_OUT_SAMPLES = 96;
+inline constexpr int FADE_OUT_SAMPLES = 96;
 
 class Voice {
 public:
@@ -37,7 +37,7 @@ public:
     bool hasFadeOutTail() const { return fadeOutTailPos < fadeOutTailLength; }
 
     std::atomic<float> attackMs{10.0f};
-    std::atomic<float> decayMs{0.0f};
+    std::atomic<float> decayMs{1.0f};
     std::atomic<float> sustainLevel{1.0f};
     std::atomic<float> releaseMs{200.0f};
 

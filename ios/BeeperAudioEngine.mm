@@ -60,6 +60,7 @@ static juce::AudioProcessorGraph::Node::Ptr sOutputNode;
     if (sessionError) {
         NSLog(@"[BeeperAudioEngine] AVAudioSession category error: %@", sessionError);
     }
+    sessionError = nil;
     [session setActive:YES error:&sessionError];
     if (sessionError) {
         NSLog(@"[BeeperAudioEngine] AVAudioSession activation error: %@", sessionError);

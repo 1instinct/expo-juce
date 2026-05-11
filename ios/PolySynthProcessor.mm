@@ -19,6 +19,15 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                        juce::MidiBuffer& /*midiMessages*/) {
     buffer.clear();
 
+    // Drain note event FIFO (audio thread side)
+    int rp = eventReadPos.load(std::memory_order_relaxed);
+    int wp = eventWritePos.load(std::memory_order_acquire);
+    while (rp != wp) {
+        processNoteEvent(eventQueue[rp]);
+        rp = (rp + 1) % EVENT_QUEUE_SIZE;
+    }
+    eventReadPos.store(rp, std::memory_order_release);
+
     int numSamples = buffer.getNumSamples();
     double sr = getSampleRate();
 
@@ -67,23 +76,53 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
 }
 
+// Called on audio thread from processBlock
+void PolySynthProcessor::processNoteEvent(const NoteEvent& event) {
+    switch (event.type) {
+        case NoteEvent::NoteOn: {
+            int clampedNote = std::clamp(event.note, 0, 127);
+            int clampedVel = std::clamp(event.velocity, 0, 127);
+            allocator.noteOn(clampedNote, (float)clampedVel, voices,
+                             static_cast<Waveform>(waveform.load()),
+                             (double)detuneCents.load(),
+                             filterCutoff.load(), filterResonance.load(),
+                             masterLevel.load());
+            break;
+        }
+        case NoteEvent::NoteOff: {
+            int clampedNote = std::clamp(event.note, 0, 127);
+            allocator.noteOff(clampedNote, voices);
+            break;
+        }
+        case NoteEvent::AllNotesOff:
+            allocator.allNotesOff(voices);
+            break;
+    }
+}
+
+// Called from main thread — pushes event to lock-free FIFO
 void PolySynthProcessor::noteOn(int note, int velocity) {
-    int clampedNote = std::clamp(note, 0, 127);
-    int clampedVel = std::clamp(velocity, 0, 127);
-    allocator.noteOn(clampedNote, (float)clampedVel, voices,
-                     static_cast<Waveform>(waveform.load()),
-                     (double)detuneCents.load(),
-                     filterCutoff.load(), filterResonance.load(),
-                     masterLevel.load());
+    int wp = eventWritePos.load(std::memory_order_relaxed);
+    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
+    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return; // full, drop event
+    eventQueue[wp] = { NoteEvent::NoteOn, note, velocity };
+    eventWritePos.store(nextWp, std::memory_order_release);
 }
 
 void PolySynthProcessor::noteOff(int note) {
-    int clampedNote = std::clamp(note, 0, 127);
-    allocator.noteOff(clampedNote, voices);
+    int wp = eventWritePos.load(std::memory_order_relaxed);
+    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
+    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
+    eventQueue[wp] = { NoteEvent::NoteOff, note, 0 };
+    eventWritePos.store(nextWp, std::memory_order_release);
 }
 
 void PolySynthProcessor::allNotesOff() {
-    allocator.allNotesOff(voices);
+    int wp = eventWritePos.load(std::memory_order_relaxed);
+    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
+    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
+    eventQueue[wp] = { NoteEvent::AllNotesOff, 0, 0 };
+    eventWritePos.store(nextWp, std::memory_order_release);
 }
 
 void PolySynthProcessor::setWaveform(Waveform wf) { waveform.store(static_cast<int>(wf)); }
