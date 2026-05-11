@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <cmath>
 
 class TransportEngine {
 public:

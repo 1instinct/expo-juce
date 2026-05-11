@@ -1,5 +1,6 @@
 #include "TransportEngine.h"
 #include <algorithm>
+#include <cmath>
 
 TransportEngine::TransportEngine()
     : bpm(120.0), playing(false),
