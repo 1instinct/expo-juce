@@ -21,13 +21,16 @@ Pod::Spec.new do |s|
   s.source_files = "*.{h,m,mm,swift}"
   s.requires_arc = true
 
-  # JUCE modules compiled: juce_core, juce_audio_basics, juce_audio_formats, juce_dsp
-  # NOT compiled: juce_events, juce_data_structures (static initializer conflicts with RN)
+  # JUCE modules compiled: all 11 (core, events, data_structures, graphics, gui_basics,
+  # gui_extra, audio_basics, audio_formats, audio_devices, audio_processors, dsp)
   # JuceModules.mm is a single translation unit that #includes the JUCE .cpp files.
   s.preserve_paths = ["juce_modules/**"]
 
   s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
-                 'Foundation', 'Accelerate', 'CoreMIDI'
+                 'Foundation', 'Accelerate', 'CoreMIDI',
+                 'CoreGraphics', 'CoreImage', 'CoreText',
+                 'QuartzCore', 'UIKit', 'WebKit', 'Metal', 'MetalKit'
+  s.weak_frameworks = 'UserNotifications'
   s.libraries = 'c++'
 
   s.pod_target_xcconfig = {
