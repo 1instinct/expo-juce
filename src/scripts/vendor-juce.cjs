@@ -26,6 +26,12 @@ const MODULES_TO_VENDOR = [
   'juce_audio_basics',
   'juce_audio_formats',
   'juce_dsp',
+  // New modules for AudioProcessorGraph + AudioDeviceManager
+  'juce_graphics',
+  'juce_gui_basics',
+  'juce_gui_extra',
+  'juce_audio_processors',
+  'juce_audio_devices',
 ];
 
 // Patterns to skip (relative to each module directory)
