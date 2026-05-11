@@ -55,7 +55,7 @@ public class ExpoJuceModule: Module {
     }.runOnQueue(.main)
 
     AsyncFunction("noteOff") { (note: Int) in
-      ExpoJuceBridge.note(off: Int32(note))
+      ExpoJuceBridge.noteOff(Int32(note))
     }.runOnQueue(.main)
 
     AsyncFunction("allNotesOff") {
