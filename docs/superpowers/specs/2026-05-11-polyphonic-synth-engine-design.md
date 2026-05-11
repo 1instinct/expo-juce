@@ -107,6 +107,8 @@ shutdown(): void    // Tear down audio
 5. Engine returns to `uninitialized` state
 6. `setup()` can be called again to re-initialize
 
+Both `setup()` and `shutdown()` must be called from the main thread (asserted).
+
 ### Polyphonic Synth (MIDI-style)
 
 ```typescript
@@ -291,8 +293,8 @@ When all 8 voices are active and a new `noteOn` arrives:
 
 1. **Select victim:** Scan all voices, pick the one with the lowest `currentLevel` (envelope gain x velocity). Ties broken by oldest note.
 2. **Trigger fade-out:** Call `victim.startFadeOut(88)` — 88 samples at 44100Hz = ~2ms linear ramp to zero. The fade-out counter is stored per voice.
-3. **Render overlap:** During the current `processBlock`, the victim continues rendering with its fade-out applied. The new note starts its attack simultaneously. Both voices produce output in the same block — they are summed together.
-4. **Reclaim:** Once the fade-out counter reaches zero, the victim voice is marked free and stops rendering. The new voice is already playing.
+3. **Render overlap:** Each voice has a small pre-allocated fade-out tail buffer (96 samples). When stolen, the victim's remaining fade-out is copied into this tail buffer and the voice slot is immediately reassigned to the new note. The tail buffer is mixed into the output alongside the new voice's attack — both are summed in the same block.
+4. **Reclaim:** The voice slot is available immediately for the new note. The fade-out tail buffer plays out independently (no voice slot needed).
 
 At 48kHz with a 512-sample block (~10.7ms), a 2ms fade-out is ~96 samples — always completes within one block.
 
