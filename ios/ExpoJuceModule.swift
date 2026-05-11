@@ -17,6 +17,10 @@ public class ExpoJuceModule: Module {
 
     Events("onChange", "onBeat")
 
+    Function("hello") {
+      return "Hello world!"
+    }
+
     OnStartObserving {
       self.hasListeners = true
       ExpoJuceBridge.startBeatTimer()
@@ -27,16 +31,7 @@ public class ExpoJuceModule: Module {
       ExpoJuceBridge.stopBeatTimer()
     }
 
-    Function("hello") {
-      return "Hello world!"
-    }
-
-    // ── Synth ───────────────────────────────────────────────────────
-    // All audio methods use AsyncFunction dispatched on main queue.
-    // AVAudioEngine and CoreAudio must be accessed from the main thread.
-    // Expo's synchronous Function() runs on the JS/Hermes thread,
-    // which is NOT the main thread in production builds — this causes
-    // native crashes when calling CoreAudio APIs.
+    // ── Lifecycle ──────────────────────────────────────────────────
 
     AsyncFunction("setup") { [weak self] in
       ExpoJuceBridge.setup()
@@ -49,44 +44,28 @@ public class ExpoJuceModule: Module {
       }
     }.runOnQueue(.main)
 
-    AsyncFunction("playTone") { (frequency: Double, duration: Double) -> String in
-      ExpoJuceBridge.playTone(withFrequency: frequency, duration: duration)
-      return "Playing tone at \(frequency)Hz for \(duration)ms"
+    AsyncFunction("shutdown") {
+      ExpoJuceBridge.shutdown()
     }.runOnQueue(.main)
 
-    AsyncFunction("setFrequency") { (frequency: Double) in
-      ExpoJuceBridge.setFrequency(frequency)
+    // ── Synth (MIDI-style) ─────────────────────────────────────────
+
+    AsyncFunction("noteOn") { (note: Int, velocity: Int) in
+      ExpoJuceBridge.noteOn(Int32(note), velocity: Int32(velocity))
     }.runOnQueue(.main)
 
-    AsyncFunction("setLevel") { (level: Double) in
-      ExpoJuceBridge.setLevel(level)
+    AsyncFunction("noteOff") { (note: Int) in
+      ExpoJuceBridge.noteOff(Int32(note))
     }.runOnQueue(.main)
+
+    AsyncFunction("allNotesOff") {
+      ExpoJuceBridge.allNotesOff()
+    }.runOnQueue(.main)
+
+    // ── Global Synth Params ────────────────────────────────────────
 
     AsyncFunction("setWaveform") { (waveform: String) in
       ExpoJuceBridge.setWaveform(waveform)
-    }.runOnQueue(.main)
-
-    AsyncFunction("setHarmonicLevels") { (levels: [Double]) in
-      let nsLevels = levels.map { NSNumber(value: $0) }
-      ExpoJuceBridge.setHarmonicLevels(nsLevels)
-    }.runOnQueue(.main)
-
-    AsyncFunction("noteOn") {
-      ExpoJuceBridge.noteOn()
-    }.runOnQueue(.main)
-
-    AsyncFunction("noteOff") {
-      ExpoJuceBridge.noteOff()
-    }.runOnQueue(.main)
-
-    // ── DSP Params ──────────────────────────────────────────────────
-
-    AsyncFunction("setAttack") { (ms: Double) in
-      ExpoJuceBridge.setAttack(ms)
-    }.runOnQueue(.main)
-
-    AsyncFunction("setRelease") { (ms: Double) in
-      ExpoJuceBridge.setRelease(ms)
     }.runOnQueue(.main)
 
     AsyncFunction("setFilterCutoff") { (hz: Double) in
@@ -97,32 +76,31 @@ public class ExpoJuceModule: Module {
       ExpoJuceBridge.setFilterResonance(q)
     }.runOnQueue(.main)
 
+    AsyncFunction("setAttack") { (ms: Double) in
+      ExpoJuceBridge.setAttack(ms)
+    }.runOnQueue(.main)
+
+    AsyncFunction("setDecay") { (ms: Double) in
+      ExpoJuceBridge.setDecay(ms)
+    }.runOnQueue(.main)
+
+    AsyncFunction("setSustain") { (level: Double) in
+      ExpoJuceBridge.setSustain(level)
+    }.runOnQueue(.main)
+
+    AsyncFunction("setRelease") { (ms: Double) in
+      ExpoJuceBridge.setRelease(ms)
+    }.runOnQueue(.main)
+
     AsyncFunction("setDetune") { (cents: Double) in
       ExpoJuceBridge.setDetune(cents)
     }.runOnQueue(.main)
 
-    AsyncFunction("setDSPValue") { (param: String, value: Double) in
-      switch param {
-      case "frequency":
-        ExpoJuceBridge.setFrequency(value)
-      case "level":
-        ExpoJuceBridge.setLevel(value)
-      case "attack":
-        ExpoJuceBridge.setAttack(value)
-      case "release":
-        ExpoJuceBridge.setRelease(value)
-      case "filterCutoff":
-        ExpoJuceBridge.setFilterCutoff(value)
-      case "filterResonance":
-        ExpoJuceBridge.setFilterResonance(value)
-      case "detune":
-        ExpoJuceBridge.setDetune(value)
-      default:
-        break
-      }
+    AsyncFunction("setMasterLevel") { (level: Double) in
+      ExpoJuceBridge.setMasterLevel(level)
     }.runOnQueue(.main)
 
-    // ── Transport ───────────────────────────────────────────────────
+    // ── Transport ──────────────────────────────────────────────────
 
     AsyncFunction("startTransport") {
       ExpoJuceBridge.startTransport()
@@ -152,7 +130,7 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.isTransportPlaying()
     }.runOnQueue(.main)
 
-    // ── Async / View ────────────────────────────────────────────────
+    // ── Async / View ───────────────────────────────────────────────
 
     AsyncFunction("setValueAsync") { (value: String) in
       self.sendEvent("onChange", [
