@@ -50,7 +50,12 @@
 
   #import <UIKit/UIKit.h>
   #import <CoreData/CoreData.h>
-  #import <MobileCoreServices/MobileCoreServices.h>
+  // Xcode 16+ / iOS 18 SDK: MobileCoreServices.h now just redirects to
+  // CoreServices.h, which can pull in MacTypes.h a second time (via a
+  // different include path) causing "redefinition of 'Point'" etc.
+  // Import only the specific UTType headers JUCE actually needs.
+  #import <CoreServices/UTCoreTypes.h>
+  #import <CoreServices/UTType.h>
   #include <sys/fcntl.h>
  #else
   #if JUCE_MODULE_AVAILABLE_juce_opengl

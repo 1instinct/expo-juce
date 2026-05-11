@@ -9,13 +9,6 @@
 #include <stdint.h>
 #include <math.h>
 
-// Xcode 16+ / iOS 18 SDK: MobileCoreServices was deprecated and now redirects
-// to CoreServices, which pulls in MacTypes.h containing legacy Carbon type
-// definitions (Point, Rect, FixedPoint, etc.) that conflict with JUCE types.
-// Suppress these legacy definitions before any system headers are included.
-#define __MACERRORS__ 1
-#define __MACTYPES__ 1
-
 // Tell JUCE that global module settings are configured
 #define JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED 1
 
