@@ -57,4 +57,5 @@ yarn-error.log
 .expo/*
 .anima/
 /JUCE/
-# ios/juce_modules/ — tracked in git for EAS builds
+# ios/juce_modules/ — tracked in git for EAS buildsexpo-juce-*.tgz
+app.json
