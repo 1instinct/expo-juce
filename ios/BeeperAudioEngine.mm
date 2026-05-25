@@ -1,10 +1,20 @@
 #import "BeeperAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
 #include "JuceConfig.h"
+#include <juce_core/juce_core.h>
+#include <juce_events/juce_events.h>
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PolySynthProcessor.h"
 #include "TransportEngine.h"
+
+// Initialize JUCE at dylib load time — BEFORE any static C++ objects run.
+// This is critical: without MessageManager, JUCE statics crash.
+__attribute__((constructor))
+static void initJuceEarly() {
+    juce::MessageManager::getInstance();
+    juce::initialiseJuce_GUI();
+}
 
 // Lightweight AudioIODeviceCallback that drives an AudioProcessorGraph.
 // Replaces juce::AudioProcessorPlayer (from juce_audio_utils, which we don't use).
@@ -59,14 +69,14 @@ private:
 @property (nonatomic, strong) dispatch_source_t beatTimer;
 @end
 
-// C++ members stored as raw pointers (ObjC class can't have C++ members inline)
+// C++ members stored as raw pointers (ObjC class can't have C++ members inline).
+// IMPORTANT: No JUCE smart pointers or std::unique_ptr at file scope —
+// their constructors/destructors engage JUCE internals before MessageManager is ready.
 static juce::AudioDeviceManager* sDeviceManager = nullptr;
 static GraphPlayer* sPlayer = nullptr;
-static std::unique_ptr<juce::AudioProcessorGraph> sGraph;
+static juce::AudioProcessorGraph* sGraph = nullptr;
 static PolySynthProcessor* sSynth = nullptr; // owned by graph
 static TransportEngine* sTransport = nullptr;
-static juce::AudioProcessorGraph::Node::Ptr sSynthNode;
-static juce::AudioProcessorGraph::Node::Ptr sOutputNode;
 
 @implementation BeeperAudioEngine
 
@@ -134,7 +144,7 @@ static juce::AudioProcessorGraph::Node::Ptr sOutputNode;
     }
 
     // 5. Create AudioProcessorGraph
-    sGraph = std::make_unique<juce::AudioProcessorGraph>();
+    sGraph = new juce::AudioProcessorGraph();
     sGraph->setPlayConfigDetails(0, 2, sDeviceManager->getAudioDeviceSetup().sampleRate,
                                   sDeviceManager->getAudioDeviceSetup().bufferSize);
     sGraph->prepareToPlay(sDeviceManager->getAudioDeviceSetup().sampleRate,
@@ -144,21 +154,21 @@ static juce::AudioProcessorGraph::Node::Ptr sOutputNode;
     auto synthProcessor = std::make_unique<PolySynthProcessor>();
     sSynth = synthProcessor.get();
     sSynth->setTransport(sTransport);
-    sSynthNode = sGraph->addNode(std::move(synthProcessor));
+    auto synthNode = sGraph->addNode(std::move(synthProcessor));
 
     // 7. Add output node
-    sOutputNode = sGraph->addNode(
+    auto outputNode = sGraph->addNode(
         std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
             juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
 
     // 8. Connect synth → output (stereo: channels 0 and 1)
     sGraph->addConnection({
-        {sSynthNode->nodeID, 0},
-        {sOutputNode->nodeID, 0}
+        {synthNode->nodeID, 0},
+        {outputNode->nodeID, 0}
     });
     sGraph->addConnection({
-        {sSynthNode->nodeID, 1},
-        {sOutputNode->nodeID, 1}
+        {synthNode->nodeID, 1},
+        {outputNode->nodeID, 1}
     });
 
     // 9. Create player and attach to device
@@ -195,10 +205,9 @@ static juce::AudioProcessorGraph::Node::Ptr sOutputNode;
         sPlayer = nullptr;
     }
 
-    sSynthNode = nullptr;
-    sOutputNode = nullptr;
-    sSynth = nullptr;
-    sGraph.reset();
+    sSynth = nullptr; // owned by graph, don't delete
+    delete sGraph;
+    sGraph = nullptr;
 
     if (sDeviceManager) {
         sDeviceManager->closeAudioDevice();

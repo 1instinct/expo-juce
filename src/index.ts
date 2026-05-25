@@ -15,84 +15,86 @@ export async function shutdown(): Promise<void> {
 }
 
 // ── Polyphonic Synth (MIDI-style) ────────────────────────────────
+// Synchronous — uses lock-free SPSC queue, no main thread required
 
-export async function noteOn(note: number, velocity: number): Promise<void> {
-  return ExpoJuceModule.noteOn(note, velocity);
+export function noteOn(note: number, velocity: number): void {
+  ExpoJuceModule.noteOn(note, velocity);
 }
 
-export async function noteOff(note: number): Promise<void> {
-  return ExpoJuceModule.noteOff(note);
+export function noteOff(note: number): void {
+  ExpoJuceModule.noteOff(note);
 }
 
-export async function allNotesOff(): Promise<void> {
-  return ExpoJuceModule.allNotesOff();
+export function allNotesOff(): void {
+  ExpoJuceModule.allNotesOff();
 }
 
 // ── Global Synth Params ──────────────────────────────────────────
+// Synchronous — all params are std::atomic
 
-export async function setWaveform(waveform: 'sine' | 'square' | 'saw' | 'triangle'): Promise<void> {
-  return ExpoJuceModule.setWaveform(waveform);
+export function setWaveform(waveform: 'sine' | 'square' | 'saw' | 'triangle'): void {
+  ExpoJuceModule.setWaveform(waveform);
 }
 
-export async function setFilterCutoff(hz: number): Promise<void> {
-  return ExpoJuceModule.setFilterCutoff(hz);
+export function setFilterCutoff(hz: number): void {
+  ExpoJuceModule.setFilterCutoff(hz);
 }
 
-export async function setFilterResonance(q: number): Promise<void> {
-  return ExpoJuceModule.setFilterResonance(q);
+export function setFilterResonance(q: number): void {
+  ExpoJuceModule.setFilterResonance(q);
 }
 
-export async function setAttack(ms: number): Promise<void> {
-  return ExpoJuceModule.setAttack(ms);
+export function setAttack(ms: number): void {
+  ExpoJuceModule.setAttack(ms);
 }
 
-export async function setDecay(ms: number): Promise<void> {
-  return ExpoJuceModule.setDecay(ms);
+export function setDecay(ms: number): void {
+  ExpoJuceModule.setDecay(ms);
 }
 
-export async function setSustain(level: number): Promise<void> {
-  return ExpoJuceModule.setSustain(level);
+export function setSustain(level: number): void {
+  ExpoJuceModule.setSustain(level);
 }
 
-export async function setRelease(ms: number): Promise<void> {
-  return ExpoJuceModule.setRelease(ms);
+export function setRelease(ms: number): void {
+  ExpoJuceModule.setRelease(ms);
 }
 
-export async function setDetune(cents: number): Promise<void> {
-  return ExpoJuceModule.setDetune(cents);
+export function setDetune(cents: number): void {
+  ExpoJuceModule.setDetune(cents);
 }
 
-export async function setMasterLevel(level: number): Promise<void> {
-  return ExpoJuceModule.setMasterLevel(level);
+export function setMasterLevel(level: number): void {
+  ExpoJuceModule.setMasterLevel(level);
 }
 
 // ── Transport ────────────────────────────────────────────────────
 
-export async function startTransport(): Promise<void> {
-  return ExpoJuceModule.startTransport();
+export function startTransport(): void {
+  ExpoJuceModule.startTransport();
 }
 
-export async function stopTransport(): Promise<void> {
-  return ExpoJuceModule.stopTransport();
+export function stopTransport(): void {
+  ExpoJuceModule.stopTransport();
 }
 
-export async function setTempo(bpm: number): Promise<void> {
-  return ExpoJuceModule.setTempo(bpm);
+export function setTempo(bpm: number): void {
+  ExpoJuceModule.setTempo(bpm);
 }
 
-export async function setTransportPosition(beat: number): Promise<void> {
-  return ExpoJuceModule.setTransportPosition(beat);
+export function setTransportPosition(beat: number): void {
+  ExpoJuceModule.setTransportPosition(beat);
 }
 
-export async function getTransportPosition(): Promise<number> {
+export function getTransportPosition(): number {
   return ExpoJuceModule.getTransportPosition();
 }
 
-export async function getTempo(): Promise<number> {
+export function getTempo(): number {
   return ExpoJuceModule.getTempo();
 }
 
-export async function isTransportPlaying(): Promise<boolean> {
+export function isTransportPlaying(): boolean {
   return ExpoJuceModule.isTransportPlaying();
 }
 

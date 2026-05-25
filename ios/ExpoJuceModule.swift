@@ -33,102 +33,107 @@ public class ExpoJuceModule: Module {
 
     // ── Lifecycle ──────────────────────────────────────────────────
 
-    AsyncFunction("setup") { [weak self] in
-      ExpoJuceBridge.setup()
-      ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
-        guard let self = self, self.hasListeners else { return }
-        self.sendEvent("onBeat", [
-          "beat": beat,
-          "bpm": bpm,
-        ])
+    AsyncFunction("setup") { [weak self] (promise: Promise) in
+      DispatchQueue.main.async {
+        ExpoJuceBridge.setup()
+        ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
+          guard let self = self, self.hasListeners else { return }
+          self.sendEvent("onBeat", [
+            "beat": beat,
+            "bpm": bpm,
+          ])
+        }
+        promise.resolve(NSNull())
       }
-    }.runOnQueue(.main)
+    }
 
     AsyncFunction("shutdown") {
       ExpoJuceBridge.shutdown()
     }.runOnQueue(.main)
 
     // ── Synth (MIDI-style) ─────────────────────────────────────────
+    // Thread-safe: PolySynthProcessor uses a lock-free SPSC queue
 
-    AsyncFunction("noteOn") { (note: Int, velocity: Int) in
+    Function("noteOn") { (note: Int, velocity: Int) in
       ExpoJuceBridge.note(on: Int32(note), velocity: Int32(velocity))
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("noteOff") { (note: Int) in
+    Function("noteOff") { (note: Int) in
       ExpoJuceBridge.noteOff(Int32(note))
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("allNotesOff") {
+    Function("allNotesOff") {
       ExpoJuceBridge.allNotesOff()
-    }.runOnQueue(.main)
+    }
 
     // ── Global Synth Params ────────────────────────────────────────
+    // Thread-safe: all params are std::atomic
 
-    AsyncFunction("setWaveform") { (waveform: String) in
+    Function("setWaveform") { (waveform: String) in
       ExpoJuceBridge.setWaveform(waveform)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setFilterCutoff") { (hz: Double) in
+    Function("setFilterCutoff") { (hz: Double) in
       ExpoJuceBridge.setFilterCutoff(hz)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setFilterResonance") { (q: Double) in
+    Function("setFilterResonance") { (q: Double) in
       ExpoJuceBridge.setFilterResonance(q)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setAttack") { (ms: Double) in
+    Function("setAttack") { (ms: Double) in
       ExpoJuceBridge.setAttack(ms)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setDecay") { (ms: Double) in
+    Function("setDecay") { (ms: Double) in
       ExpoJuceBridge.setDecay(ms)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setSustain") { (level: Double) in
+    Function("setSustain") { (level: Double) in
       ExpoJuceBridge.setSustain(level)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setRelease") { (ms: Double) in
+    Function("setRelease") { (ms: Double) in
       ExpoJuceBridge.setRelease(ms)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setDetune") { (cents: Double) in
+    Function("setDetune") { (cents: Double) in
       ExpoJuceBridge.setDetune(cents)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setMasterLevel") { (level: Double) in
+    Function("setMasterLevel") { (level: Double) in
       ExpoJuceBridge.setMasterLevel(level)
-    }.runOnQueue(.main)
+    }
 
     // ── Transport ──────────────────────────────────────────────────
 
-    AsyncFunction("startTransport") {
+    Function("startTransport") {
       ExpoJuceBridge.startTransport()
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("stopTransport") {
+    Function("stopTransport") {
       ExpoJuceBridge.stopTransport()
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setTempo") { (bpm: Double) in
+    Function("setTempo") { (bpm: Double) in
       ExpoJuceBridge.setTempo(bpm)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("setTransportPosition") { (beat: Double) in
+    Function("setTransportPosition") { (beat: Double) in
       ExpoJuceBridge.setTransportPosition(beat)
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("getTransportPosition") { () -> Double in
+    Function("getTransportPosition") { () -> Double in
       return ExpoJuceBridge.getTransportPosition()
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("getTempo") { () -> Double in
+    Function("getTempo") { () -> Double in
       return ExpoJuceBridge.getTempo()
-    }.runOnQueue(.main)
+    }
 
-    AsyncFunction("isTransportPlaying") { () -> Bool in
+    Function("isTransportPlaying") { () -> Bool in
       return ExpoJuceBridge.isTransportPlaying()
-    }.runOnQueue(.main)
+    }
 
     // ── Async / View ───────────────────────────────────────────────
 

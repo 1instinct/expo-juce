@@ -1,10 +1,11 @@
 #include "TransportEngine.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 TransportEngine::TransportEngine()
     : bpm(120.0), playing(false),
-      pendingPosition(std::nan("")), positionSnapshot(0.0) {}
+      pendingPosition(std::numeric_limits<double>::quiet_NaN()), positionSnapshot(0.0) {}
 
 void TransportEngine::setTempo(double newBpm) {
     bpm.store(std::clamp(newBpm, 20.0, 400.0));
@@ -23,7 +24,7 @@ void TransportEngine::stop() { playing.store(false); }
 bool TransportEngine::isPlaying() { return playing.load(); }
 
 bool TransportEngine::advanceBlock(int numSamples, double sampleRate) {
-    double pending = pendingPosition.exchange(std::nan(""));
+    double pending = pendingPosition.exchange(std::numeric_limits<double>::quiet_NaN());
     if (!std::isnan(pending)) {
         beatPosition = pending;
         lastBeatInt = (int)beatPosition;
