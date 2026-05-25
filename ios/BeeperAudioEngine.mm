@@ -173,7 +173,7 @@ static TransportEngine* sTransport = nullptr;
 
     // 9. Create player and attach to device
     sPlayer = new GraphPlayer();
-    sPlayer->setProcessor(sGraph.get());
+    sPlayer->setProcessor(sGraph);
     sDeviceManager->addAudioCallback(sPlayer);
 
     self.isReady = true;
