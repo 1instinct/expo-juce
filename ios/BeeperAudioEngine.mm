@@ -8,13 +8,9 @@
 #include "PolySynthProcessor.h"
 #include "TransportEngine.h"
 
-// Initialize JUCE at dylib load time — BEFORE any static C++ objects run.
-// This is critical: without MessageManager, JUCE statics crash.
-__attribute__((constructor))
-static void initJuceEarly() {
-    juce::MessageManager::getInstance();
-    juce::initialiseJuce_GUI();
-}
+// JUCE init moved to setup() — raw pointers at file scope eliminate
+// the static init problem, and constructor doesn't guarantee main thread.
+static bool sJuceInitialized = false;
 
 // Lightweight AudioIODeviceCallback that drives an AudioProcessorGraph.
 // Replaces juce::AudioProcessorPlayer (from juce_audio_utils, which we don't use).
@@ -107,12 +103,19 @@ static TransportEngine* sTransport = nullptr;
 
     NSLog(@"[BeeperAudioEngine] Initializing JUCE audio stack...");
 
-    // 0. Configure AVAudioSession before JUCE takes over
+    // 0. Initialize JUCE on main thread (must happen before any JUCE API use)
+    if (!sJuceInitialized) {
+        NSLog(@"[BeeperAudioEngine] Initializing JUCE MessageManager on main thread...");
+        juce::MessageManager::getInstance();
+        juce::initialiseJuce_GUI();
+        sJuceInitialized = true;
+    }
+
+    // 1. Configure AVAudioSession — Playback only (no microphone needed)
     NSError *sessionError = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayAndRecord
-             withOptions:(AVAudioSessionCategoryOptionMixWithOthers |
-                          AVAudioSessionCategoryOptionDefaultToSpeaker)
+    [session setCategory:AVAudioSessionCategoryPlayback
+             withOptions:AVAudioSessionCategoryOptionMixWithOthers
                    error:&sessionError];
     if (sessionError) {
         NSLog(@"[BeeperAudioEngine] AVAudioSession category error: %@", sessionError);
@@ -122,9 +125,6 @@ static TransportEngine* sTransport = nullptr;
     if (sessionError) {
         NSLog(@"[BeeperAudioEngine] AVAudioSession activation error: %@", sessionError);
     }
-
-    // 1. Initialize MessageManager (attaches to existing CFRunLoop)
-    juce::MessageManager::getInstance();
 
     // 2. Create transport
     sTransport = new TransportEngine();
@@ -143,12 +143,12 @@ static TransportEngine* sTransport = nullptr;
         return;
     }
 
-    // 5. Create AudioProcessorGraph
+    // 5. Create AudioProcessorGraph and add nodes BEFORE preparing
+    double sr = sDeviceManager->getAudioDeviceSetup().sampleRate;
+    int bufSize = sDeviceManager->getAudioDeviceSetup().bufferSize;
+
     sGraph = new juce::AudioProcessorGraph();
-    sGraph->setPlayConfigDetails(0, 2, sDeviceManager->getAudioDeviceSetup().sampleRate,
-                                  sDeviceManager->getAudioDeviceSetup().bufferSize);
-    sGraph->prepareToPlay(sDeviceManager->getAudioDeviceSetup().sampleRate,
-                           sDeviceManager->getAudioDeviceSetup().bufferSize);
+    sGraph->setPlayConfigDetails(0, 2, sr, bufSize);
 
     // 6. Add PolySynthProcessor node
     auto synthProcessor = std::make_unique<PolySynthProcessor>();
@@ -171,7 +171,10 @@ static TransportEngine* sTransport = nullptr;
         {outputNode->nodeID, 1}
     });
 
-    // 9. Create player and attach to device
+    // 9. Prepare graph AFTER all nodes/connections are set up
+    sGraph->prepareToPlay(sr, bufSize);
+
+    // 10. Create player and attach to device
     sPlayer = new GraphPlayer();
     sPlayer->setProcessor(sGraph);
     sDeviceManager->addAudioCallback(sPlayer);
