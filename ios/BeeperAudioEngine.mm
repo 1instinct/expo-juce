@@ -8,12 +8,15 @@
 #include "PolySynthProcessor.h"
 #include "TransportEngine.h"
 
-// JUCE init moved to setup() — raw pointers at file scope eliminate
-// the static init problem, and constructor doesn't guarantee main thread.
-static bool sJuceInitialized = false;
+// Ensure MessageManager exists before any JUCE static initializers.
+// On iOS, __attribute__((constructor)) runs on the main thread for
+// statically-linked frameworks (which Expo modules are).
+__attribute__((constructor))
+static void initJuceMessageManager() {
+    juce::MessageManager::getInstance();
+}
 
 // Lightweight AudioIODeviceCallback that drives an AudioProcessorGraph.
-// Replaces juce::AudioProcessorPlayer (from juce_audio_utils, which we don't use).
 class GraphPlayer : public juce::AudioIODeviceCallback {
 public:
     void setProcessor(juce::AudioProcessor* p) { processor = p; }
@@ -65,13 +68,11 @@ private:
 @property (nonatomic, strong) dispatch_source_t beatTimer;
 @end
 
-// C++ members stored as raw pointers (ObjC class can't have C++ members inline).
-// IMPORTANT: No JUCE smart pointers or std::unique_ptr at file scope —
-// their constructors/destructors engage JUCE internals before MessageManager is ready.
+// Raw pointers — no JUCE smart pointers at file scope.
 static juce::AudioDeviceManager* sDeviceManager = nullptr;
 static GraphPlayer* sPlayer = nullptr;
 static juce::AudioProcessorGraph* sGraph = nullptr;
-static PolySynthProcessor* sSynth = nullptr; // owned by graph
+static PolySynthProcessor* sSynth = nullptr;
 static TransportEngine* sTransport = nullptr;
 
 @implementation BeeperAudioEngine
@@ -94,24 +95,30 @@ static TransportEngine* sTransport = nullptr;
 }
 
 - (void)setup {
-    NSAssert([NSThread isMainThread], @"setup() must be called on main thread");
+    if (![NSThread isMainThread]) {
+        NSLog(@"[BeeperAudioEngine] ERROR: setup() called off main thread, dispatching to main");
+        dispatch_sync(dispatch_get_main_queue(), ^{ [self setup]; });
+        return;
+    }
 
     if (self.isReady) {
         NSLog(@"[BeeperAudioEngine] Already initialized, skipping");
         return;
     }
 
-    NSLog(@"[BeeperAudioEngine] Initializing JUCE audio stack...");
-
-    // 0. Initialize JUCE on main thread (must happen before any JUCE API use)
-    if (!sJuceInitialized) {
-        NSLog(@"[BeeperAudioEngine] Initializing JUCE MessageManager on main thread...");
-        juce::MessageManager::getInstance();
-        juce::initialiseJuce_GUI();
-        sJuceInitialized = true;
+    @try {
+        [self doSetup];
+    } @catch (NSException *exception) {
+        NSLog(@"[BeeperAudioEngine] EXCEPTION in setup: %@ — %@", exception.name, exception.reason);
+        [self cleanup];
     }
+}
 
-    // 1. Configure AVAudioSession — Playback only (no microphone needed)
+- (void)doSetup {
+    NSLog(@"[BeeperAudioEngine] Step 0: initialiseJuce_GUI");
+    juce::initialiseJuce_GUI();
+
+    NSLog(@"[BeeperAudioEngine] Step 1: AVAudioSession (Playback)");
     NSError *sessionError = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryPlayback
@@ -120,128 +127,92 @@ static TransportEngine* sTransport = nullptr;
     if (sessionError) {
         NSLog(@"[BeeperAudioEngine] AVAudioSession category error: %@", sessionError);
     }
-    sessionError = nil;
     [session setActive:YES error:&sessionError];
     if (sessionError) {
         NSLog(@"[BeeperAudioEngine] AVAudioSession activation error: %@", sessionError);
     }
 
-    // 2. Create transport
+    NSLog(@"[BeeperAudioEngine] Step 2: TransportEngine");
     sTransport = new TransportEngine();
 
-    // 3. Create AudioDeviceManager
+    NSLog(@"[BeeperAudioEngine] Step 3: AudioDeviceManager");
     sDeviceManager = new juce::AudioDeviceManager();
 
-    // 4. Initialize device: 0 inputs, 2 outputs (stereo)
+    NSLog(@"[BeeperAudioEngine] Step 4: initialise(0, 2)");
     juce::String error = sDeviceManager->initialise(0, 2, nullptr, true);
     if (error.isNotEmpty()) {
         NSLog(@"[BeeperAudioEngine] AudioDeviceManager init failed: %s", error.toRawUTF8());
-        delete sDeviceManager;
-        sDeviceManager = nullptr;
-        delete sTransport;
-        sTransport = nullptr;
+        [self cleanup];
         return;
     }
 
-    // 5. Create AudioProcessorGraph and add nodes BEFORE preparing
     double sr = sDeviceManager->getAudioDeviceSetup().sampleRate;
     int bufSize = sDeviceManager->getAudioDeviceSetup().bufferSize;
+    NSLog(@"[BeeperAudioEngine] Step 5: AudioProcessorGraph (sr=%.0f, buf=%d)", sr, bufSize);
 
     sGraph = new juce::AudioProcessorGraph();
     sGraph->setPlayConfigDetails(0, 2, sr, bufSize);
 
-    // 6. Add PolySynthProcessor node
+    NSLog(@"[BeeperAudioEngine] Step 6: PolySynthProcessor");
     auto synthProcessor = std::make_unique<PolySynthProcessor>();
     sSynth = synthProcessor.get();
     sSynth->setTransport(sTransport);
+
+    NSLog(@"[BeeperAudioEngine] Step 7: addNode (synth)");
     auto synthNode = sGraph->addNode(std::move(synthProcessor));
 
-    // 7. Add output node
+    NSLog(@"[BeeperAudioEngine] Step 8: addNode (output)");
     auto outputNode = sGraph->addNode(
         std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
             juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
 
-    // 8. Connect synth → output (stereo: channels 0 and 1)
-    sGraph->addConnection({
-        {synthNode->nodeID, 0},
-        {outputNode->nodeID, 0}
-    });
-    sGraph->addConnection({
-        {synthNode->nodeID, 1},
-        {outputNode->nodeID, 1}
-    });
+    NSLog(@"[BeeperAudioEngine] Step 9: connections");
+    sGraph->addConnection({{synthNode->nodeID, 0}, {outputNode->nodeID, 0}});
+    sGraph->addConnection({{synthNode->nodeID, 1}, {outputNode->nodeID, 1}});
 
-    // 9. Prepare graph AFTER all nodes/connections are set up
+    NSLog(@"[BeeperAudioEngine] Step 10: prepareToPlay");
     sGraph->prepareToPlay(sr, bufSize);
 
-    // 10. Create player and attach to device
+    NSLog(@"[BeeperAudioEngine] Step 11: GraphPlayer + addAudioCallback");
     sPlayer = new GraphPlayer();
     sPlayer->setProcessor(sGraph);
     sDeviceManager->addAudioCallback(sPlayer);
 
     self.isReady = true;
-    NSLog(@"[BeeperAudioEngine] JUCE audio stack initialized (sr=%.0f, buf=%d)",
-          sDeviceManager->getAudioDeviceSetup().sampleRate,
-          sDeviceManager->getAudioDeviceSetup().bufferSize);
+    NSLog(@"[BeeperAudioEngine] DONE — audio stack initialized (sr=%.0f, buf=%d)", sr, bufSize);
+}
+
+- (void)cleanup {
+    NSLog(@"[BeeperAudioEngine] Cleaning up after failure...");
+    if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
+    delete sPlayer; sPlayer = nullptr;
+    sSynth = nullptr;
+    delete sGraph; sGraph = nullptr;
+    if (sDeviceManager) { sDeviceManager->closeAudioDevice(); delete sDeviceManager; sDeviceManager = nullptr; }
+    delete sTransport; sTransport = nullptr;
+    self.isReady = false;
 }
 
 - (void)shutdown {
-    NSAssert([NSThread isMainThread], @"shutdown() must be called on main thread");
-
+    if (![NSThread isMainThread]) return;
     if (!self.isReady) return;
 
     NSLog(@"[BeeperAudioEngine] Shutting down...");
-
     [self stopBeatTimer];
-
-    if (sSynth) {
-        sSynth->allNotesOff();
-    }
-
-    if (sDeviceManager && sPlayer) {
-        sDeviceManager->removeAudioCallback(sPlayer);
-    }
-
-    if (sPlayer) {
-        sPlayer->setProcessor(nullptr);
-        delete sPlayer;
-        sPlayer = nullptr;
-    }
-
-    sSynth = nullptr; // owned by graph, don't delete
-    delete sGraph;
-    sGraph = nullptr;
-
-    if (sDeviceManager) {
-        sDeviceManager->closeAudioDevice();
-        delete sDeviceManager;
-        sDeviceManager = nullptr;
-    }
-
-    if (sTransport) {
-        delete sTransport;
-        sTransport = nullptr;
-    }
-
-    self.isReady = false;
+    if (sSynth) sSynth->allNotesOff();
+    [self cleanup];
     NSLog(@"[BeeperAudioEngine] Shutdown complete");
 }
 
 // ── Synth forwarding ──
 
 - (void)noteOn:(int)note velocity:(int)velocity {
-    if (!self.isReady || !sSynth) {
-        NSLog(@"[BeeperAudioEngine] noteOn ignored — engine not initialized. Call setup() first.");
-        return;
-    }
+    if (!self.isReady || !sSynth) return;
     sSynth->noteOn(note, velocity);
 }
 
 - (void)noteOff:(int)note {
-    if (!self.isReady || !sSynth) {
-        NSLog(@"[BeeperAudioEngine] noteOff ignored — engine not initialized.");
-        return;
-    }
+    if (!self.isReady || !sSynth) return;
     sSynth->noteOff(note);
 }
 
@@ -252,84 +223,34 @@ static TransportEngine* sTransport = nullptr;
 
 - (void)setWaveform:(NSString *)waveform {
     if (!self.isReady || !sSynth) return;
-    if ([waveform isEqualToString:@"square"]) {
-        sSynth->setWaveform(Waveform::Square);
-    } else if ([waveform isEqualToString:@"saw"]) {
-        sSynth->setWaveform(Waveform::Saw);
-    } else if ([waveform isEqualToString:@"triangle"]) {
-        sSynth->setWaveform(Waveform::Triangle);
-    } else {
-        sSynth->setWaveform(Waveform::Sine);
-    }
+    if ([waveform isEqualToString:@"square"]) sSynth->setWaveform(Waveform::Square);
+    else if ([waveform isEqualToString:@"saw"]) sSynth->setWaveform(Waveform::Saw);
+    else if ([waveform isEqualToString:@"triangle"]) sSynth->setWaveform(Waveform::Triangle);
+    else sSynth->setWaveform(Waveform::Sine);
 }
 
-- (void)setFilterCutoff:(double)hz {
-    if (self.isReady && sSynth) sSynth->setFilterCutoff(hz);
-}
-
-- (void)setFilterResonance:(double)q {
-    if (self.isReady && sSynth) sSynth->setFilterResonance(q);
-}
-
-- (void)setAttack:(double)ms {
-    if (self.isReady && sSynth) sSynth->setAttack(ms);
-}
-
-- (void)setDecay:(double)ms {
-    if (self.isReady && sSynth) sSynth->setDecay(ms);
-}
-
-- (void)setSustain:(double)level {
-    if (self.isReady && sSynth) sSynth->setSustain(level);
-}
-
-- (void)setRelease:(double)ms {
-    if (self.isReady && sSynth) sSynth->setRelease(ms);
-}
-
-- (void)setDetune:(double)cents {
-    if (self.isReady && sSynth) sSynth->setDetune(cents);
-}
-
-- (void)setMasterLevel:(double)level {
-    if (self.isReady && sSynth) sSynth->setMasterLevel(level);
-}
+- (void)setFilterCutoff:(double)hz { if (self.isReady && sSynth) sSynth->setFilterCutoff(hz); }
+- (void)setFilterResonance:(double)q { if (self.isReady && sSynth) sSynth->setFilterResonance(q); }
+- (void)setAttack:(double)ms { if (self.isReady && sSynth) sSynth->setAttack(ms); }
+- (void)setDecay:(double)ms { if (self.isReady && sSynth) sSynth->setDecay(ms); }
+- (void)setSustain:(double)level { if (self.isReady && sSynth) sSynth->setSustain(level); }
+- (void)setRelease:(double)ms { if (self.isReady && sSynth) sSynth->setRelease(ms); }
+- (void)setDetune:(double)cents { if (self.isReady && sSynth) sSynth->setDetune(cents); }
+- (void)setMasterLevel:(double)level { if (self.isReady && sSynth) sSynth->setMasterLevel(level); }
 
 // ── Transport ──
 
-- (void)startTransport {
-    if (self.isReady && sTransport) sTransport->start();
-}
-
-- (void)stopTransport {
-    if (self.isReady && sTransport) sTransport->stop();
-}
-
-- (void)setTempo:(double)bpm {
-    if (self.isReady && sTransport) sTransport->setTempo(bpm);
-}
-
-- (void)setTransportPosition:(double)beat {
-    if (self.isReady && sTransport) sTransport->setPosition(beat);
-}
-
-- (double)getTransportPosition {
-    return (self.isReady && sTransport) ? sTransport->getPosition() : 0.0;
-}
-
-- (double)getTempo {
-    return (self.isReady && sTransport) ? sTransport->getTempo() : 120.0;
-}
-
-- (BOOL)isTransportPlaying {
-    return (self.isReady && sTransport) ? sTransport->isPlaying() : NO;
-}
+- (void)startTransport { if (self.isReady && sTransport) sTransport->start(); }
+- (void)stopTransport { if (self.isReady && sTransport) sTransport->stop(); }
+- (void)setTempo:(double)bpm { if (self.isReady && sTransport) sTransport->setTempo(bpm); }
+- (void)setTransportPosition:(double)beat { if (self.isReady && sTransport) sTransport->setPosition(beat); }
+- (double)getTransportPosition { return (self.isReady && sTransport) ? sTransport->getPosition() : 0.0; }
+- (double)getTempo { return (self.isReady && sTransport) ? sTransport->getTempo() : 120.0; }
+- (BOOL)isTransportPlaying { return (self.isReady && sTransport) ? sTransport->isPlaying() : NO; }
 
 // ── Beat events ──
 
-- (void)setBeatCallback:(BeatCallback)callback {
-    self.beatCallback = callback;
-}
+- (void)setBeatCallback:(BeatCallback)callback { self.beatCallback = callback; }
 
 - (void)startBeatTimer {
     if (self.beatTimer) return;
@@ -357,8 +278,6 @@ static TransportEngine* sTransport = nullptr;
     self.beatCallback = nil;
 }
 
-- (void)dealloc {
-    [self shutdown];
-}
+- (void)dealloc { [self shutdown]; }
 
 @end
