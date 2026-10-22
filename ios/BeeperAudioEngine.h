@@ -9,8 +9,16 @@ typedef void(^BeatCallback)(double beat, double bpm);
 + (instancetype)sharedInstance;
 
 // Lifecycle
-- (void)setup;
+// Returns YES on success (or if already initialized). On failure, setupStep
+// holds the step that failed and lastError a description.
+- (BOOL)setup;
 - (void)shutdown;
+
+// Diagnostics
+@property (nonatomic, readonly) int setupStep;       // -1 = setup never run
+@property (nonatomic, readonly, copy) NSString *lastError; // nil = no error
+- (NSDictionary<NSString *, id> *)diagnostics;
+- (void)playTestTone:(double)durationMs;
 
 // Synth — MIDI-style
 - (void)noteOn:(int)note velocity:(int)velocity;

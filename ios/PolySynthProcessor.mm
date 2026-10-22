@@ -23,7 +23,16 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     int rp = eventReadPos.load(std::memory_order_relaxed);
     int wp = eventWritePos.load(std::memory_order_acquire);
     while (rp != wp) {
-        processNoteEvent(eventQueue[rp]);
+        const NoteEvent& event = eventQueue[rp];
+        processNoteEvent(event);
+        if (event.type == NoteEvent::NoteOn) {
+            diag.notesConsumed.fetch_add(1, std::memory_order_relaxed);
+            if (event.stampTicks != 0) {
+                const juce::int64 elapsed = juce::Time::getHighResolutionTicks() - event.stampTicks;
+                diag.lastNoteToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
+                                              std::memory_order_relaxed);
+            }
+        }
         rp = (rp + 1) % EVENT_QUEUE_SIZE;
     }
     eventReadPos.store(rp, std::memory_order_release);
@@ -67,6 +76,18 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
     }
 
+    // ── Diagnostics (relaxed atomics only; no locks/allocation) ──
+    {
+        const float blockPeak = numSamples > 0 ? buffer.getMagnitude(0, 0, numSamples) : 0.0f;
+        const float held = diag.peak.load(std::memory_order_relaxed) * diagPeakDecay(numSamples, sr);
+        diag.peak.store(std::max(blockPeak, held), std::memory_order_relaxed);
+        int active = 0;
+        for (int v = 0; v < MAX_VOICES; v++)
+            if (voices[v].isActive()) ++active;
+        diag.activeVoices.store(active, std::memory_order_relaxed);
+        diag.processCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (transport) {
         if (transport->advanceBlock(numSamples, sr)) {
             beatState.crossed.store(true);
@@ -105,15 +126,16 @@ void PolySynthProcessor::noteOn(int note, int velocity) {
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) return; // full, drop event
-    eventQueue[wp] = { NoteEvent::NoteOn, note, velocity };
+    eventQueue[wp] = { NoteEvent::NoteOn, note, velocity, juce::Time::getHighResolutionTicks() };
     eventWritePos.store(nextWp, std::memory_order_release);
+    diag.notesQueued.fetch_add(1, std::memory_order_relaxed);
 }
 
 void PolySynthProcessor::noteOff(int note) {
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::NoteOff, note, 0 };
+    eventQueue[wp] = { NoteEvent::NoteOff, note, 0, 0 };
     eventWritePos.store(nextWp, std::memory_order_release);
 }
 
@@ -121,7 +143,7 @@ void PolySynthProcessor::allNotesOff() {
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::AllNotesOff, 0, 0 };
+    eventQueue[wp] = { NoteEvent::AllNotesOff, 0, 0, 0 };
     eventWritePos.store(nextWp, std::memory_order_release);
 }
 

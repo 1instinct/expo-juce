@@ -2,16 +2,34 @@ import { NativeModulesProxy, EventEmitter, Subscription } from 'expo-modules-cor
 
 import ExpoJuceModule from './ExpoJuceModule';
 import ExpoJuceView from './ExpoJuceView';
-import { ChangeEventPayload, BeatEventPayload, ExpoJuceViewProps } from './ExpoJuce.types';
+import {
+  ChangeEventPayload,
+  BeatEventPayload,
+  ExpoJuceViewProps,
+  AudioDiagnostics,
+} from './ExpoJuce.types';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
+// Rejects with code 'ERR_AUDIO_SETUP' and message "step N: <error>" if native setup fails.
 export async function setup(): Promise<void> {
   return ExpoJuceModule.setup();
 }
 
 export async function shutdown(): Promise<void> {
   return ExpoJuceModule.shutdown();
+}
+
+// ── Diagnostics ──────────────────────────────────────────────────
+
+export function getDiagnostics(): AudioDiagnostics {
+  return ExpoJuceModule.getDiagnostics();
+}
+
+// Mixes a 440 Hz sine directly into the device output (bypassing graph + synth).
+// No-op if the audio device is not running.
+export function playTestTone(durationMs: number): void {
+  ExpoJuceModule.playTestTone(durationMs);
 }
 
 // ── Polyphonic Synth (MIDI-style) ────────────────────────────────
@@ -114,4 +132,4 @@ export function addBeatListener(listener: (event: BeatEventPayload) => void): Su
   return emitter.addListener<BeatEventPayload>('onBeat', listener);
 }
 
-export { ExpoJuceView, ExpoJuceViewProps, ChangeEventPayload, BeatEventPayload };
+export { ExpoJuceView, ExpoJuceViewProps, ChangeEventPayload, BeatEventPayload, AudioDiagnostics };

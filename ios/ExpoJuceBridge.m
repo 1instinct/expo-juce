@@ -3,8 +3,17 @@
 
 @implementation ExpoJuceBridge
 
-+ (void)setup { [[BeeperAudioEngine sharedInstance] setup]; }
++ (BOOL)setup { return [[BeeperAudioEngine sharedInstance] setup]; }
++ (NSString *)setupErrorMessage {
+    BeeperAudioEngine *engine = [BeeperAudioEngine sharedInstance];
+    NSString *error = engine.lastError ?: @"unknown error";
+    return [NSString stringWithFormat:@"step %d: %@", engine.setupStep, error];
+}
 + (void)shutdown { [[BeeperAudioEngine sharedInstance] shutdown]; }
+
+// ── Diagnostics ──
++ (NSDictionary<NSString *, id> *)getDiagnostics { return [[BeeperAudioEngine sharedInstance] diagnostics]; }
++ (void)playTestTone:(double)durationMs { [[BeeperAudioEngine sharedInstance] playTestTone:durationMs]; }
 + (void)startBeatTimer { [[BeeperAudioEngine sharedInstance] startBeatTimer]; }
 + (void)stopBeatTimer { [[BeeperAudioEngine sharedInstance] stopBeatTimer]; }
 

@@ -5,6 +5,9 @@
 #include "Voice.h"
 #include "VoiceAllocator.h"
 #include "TransportEngine.h"
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 
 struct BeatState {
     std::atomic<bool> crossed{false};
@@ -12,12 +15,31 @@ struct BeatState {
     std::atomic<double> bpm{120.0};
 };
 
+// Diagnostics counters. Written on the audio thread (except notesQueued,
+// which the noteOn producer writes), read from any thread. Relaxed ordering only.
+struct SynthDiagnostics {
+    std::atomic<uint64_t> processCount{0};
+    std::atomic<float> peak{0.0f};                // decaying hold of block max |x|
+    std::atomic<uint32_t> notesQueued{0};
+    std::atomic<uint32_t> notesConsumed{0};
+    std::atomic<int> activeVoices{0};
+    std::atomic<double> lastNoteToRenderMs{-1.0}; // -1 = no NoteOn consumed yet
+};
+
+// Per-block decay factor for peak holds: halves roughly every 300 ms
+// regardless of block size. Real-time safe (no allocation, no locks).
+inline float diagPeakDecay(int numSamples, double sampleRate) {
+    if (sampleRate <= 0.0) return 0.0f;
+    return (float)std::exp(-(double)numSamples / (0.43 * sampleRate));
+}
+
 // Lock-free SPSC note event queue
 struct NoteEvent {
     enum Type : uint8_t { NoteOn, NoteOff, AllNotesOff };
     Type type;
     int note;
     int velocity;
+    juce::int64 stampTicks; // juce::Time::getHighResolutionTicks() at enqueue (0 if unused)
 };
 
 class PolySynthProcessor : public juce::AudioProcessor {
@@ -61,6 +83,7 @@ public:
 
     void setTransport(TransportEngine* t) { transport = t; }
     BeatState beatState;
+    SynthDiagnostics diag;
 
 private:
     void processNoteEvent(const NoteEvent& event);

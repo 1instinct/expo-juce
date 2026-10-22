@@ -35,7 +35,10 @@ public class ExpoJuceModule: Module {
 
     AsyncFunction("setup") { [weak self] (promise: Promise) in
       DispatchQueue.main.async {
-        ExpoJuceBridge.setup()
+        guard ExpoJuceBridge.setup() else {
+          promise.reject("ERR_AUDIO_SETUP", ExpoJuceBridge.setupErrorMessage())
+          return
+        }
         ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
           guard let self = self, self.hasListeners else { return }
           self.sendEvent("onBeat", [
@@ -50,6 +53,16 @@ public class ExpoJuceModule: Module {
     AsyncFunction("shutdown") {
       ExpoJuceBridge.shutdown()
     }.runOnQueue(.main)
+
+    // ── Diagnostics ────────────────────────────────────────────────
+
+    Function("getDiagnostics") { () -> [String: Any] in
+      return ExpoJuceBridge.getDiagnostics()
+    }
+
+    Function("playTestTone") { (durationMs: Double) in
+      ExpoJuceBridge.playTestTone(durationMs: durationMs)
+    }
 
     // ── Synth (MIDI-style) ─────────────────────────────────────────
     // Thread-safe: PolySynthProcessor uses a lock-free SPSC queue

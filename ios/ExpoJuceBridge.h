@@ -6,8 +6,15 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 
 @interface ExpoJuceBridge : NSObject
 
-+ (void)setup;
+// Returns YES on success (or if already initialized). Swift: `setup() -> Bool`.
++ (BOOL)setup;
+// "step N: <error>" describing the last setup failure. Swift: `setupErrorMessage() -> String`.
++ (NSString *)setupErrorMessage NS_SWIFT_NAME(setupErrorMessage());
 + (void)shutdown;
+
+// ── Diagnostics ──────────────────────────────────────────────────
++ (NSDictionary<NSString *, id> *)getDiagnostics NS_SWIFT_NAME(getDiagnostics());
++ (void)playTestTone:(double)durationMs NS_SWIFT_NAME(playTestTone(durationMs:));
 + (void)startBeatTimer;
 + (void)stopBeatTimer;
 
