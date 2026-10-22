@@ -119,6 +119,9 @@ function main() {
     console.log(`  ${mod} → ${size} MB`);
   }
 
+  console.log('\nApplying local JUCE patches (src/scripts/juce-patches.cjs)...');
+  require('./juce-patches.cjs').applyPatches(DEST);
+
   const totalSize = (getDirectorySize(DEST) / (1024 * 1024)).toFixed(1);
   console.log(`\nTotal vendored size: ${totalSize} MB`);
   console.log(`Output: ${DEST}`);

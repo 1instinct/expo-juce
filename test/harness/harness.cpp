@@ -19,6 +19,39 @@
 #include <vector>
 
 //==============================================================================
+// Allocation counter for the render path. glibc's malloc family is interposed (operator new and
+// JUCE's HeapBlock both end up here); while tCountAllocs is set on a thread, every allocation it
+// makes is counted. The fake device sets it around each GraphPlayer IO callback, so any
+// allocation anywhere inside the render (GraphPlayer, AudioProcessorGraph, synth) shows up.
+extern "C" {
+void* __libc_malloc(size_t);
+void* __libc_calloc(size_t, size_t);
+void* __libc_realloc(void*, size_t);
+void* __libc_memalign(size_t, size_t);
+void __libc_free(void*);
+}
+static thread_local bool tCountAllocs = false;
+static std::atomic<uint64_t> gRenderAllocs{0};
+static inline void countAlloc() {
+    if (tCountAllocs) gRenderAllocs.fetch_add(1, std::memory_order_relaxed);
+}
+extern "C" {
+void* malloc(size_t n) { countAlloc(); return __libc_malloc(n); }
+void* calloc(size_t c, size_t n) { countAlloc(); return __libc_calloc(c, n); }
+void* realloc(void* p, size_t n) { countAlloc(); return __libc_realloc(p, n); }
+void* memalign(size_t a, size_t n) { countAlloc(); return __libc_memalign(a, n); }
+void* aligned_alloc(size_t a, size_t n) { countAlloc(); return __libc_memalign(a, n); }
+int posix_memalign(void** out, size_t a, size_t n) {
+    countAlloc();
+    void* p = __libc_memalign(a, n);
+    if (p == nullptr) return 12; // ENOMEM
+    *out = p;
+    return 0;
+}
+void free(void* p) { __libc_free(p); }
+}
+
+//==============================================================================
 // GraphPlayer — the shipped class, from ios/GraphPlayer.h at the same git ref as the engine.
 #include "GraphPlayer.h"
 
@@ -84,6 +117,7 @@ struct Result {
     int zeroTailBlocks = 0;            // note-held blocks whose last quarter is silent (chunking bug)
     uint64_t graphCalls = 0, expectedGraphCalls = 0; // GraphPlayer chunking: ceil(n / capacity) per block
     int capacity = 0, capacityAfter = 0;             // preallocated samples before/after the run
+    uint64_t renderAllocs = 0;                       // heap allocations inside IO callbacks (must be 0)
     bool pass = false;
 };
 
@@ -111,6 +145,8 @@ static Result runCase(const Case& c) {
 
     FakeDevice device(c.devSr, c.devBuf);
 
+    gRenderAllocs.store(0);
+
     // ── device thread: already running when addAudioCallback is called (initialise() opened
     //    and started the device). Until the callback is attached, AudioDeviceManager writes zeros. ──
     std::atomic<bool> attached{false}, paused{false}, stop{false};
@@ -130,7 +166,9 @@ static Result runCase(const Case& c) {
             if (paused.load()) continue;   // audio unit disposed during restart: no callbacks
             out.clear();
             if (attached.load()) {
+                tCountAllocs = true;
                 player->audioDeviceIOCallbackWithContext(nullptr, 0, out.getArrayOfWritePointers(), 2, n, ctx);
+                tCountAllocs = false;
                 const int cap = capacityForThread.load();
                 if (cap > 0) expectedGraphCalls.fetch_add((uint64_t)((n + cap - 1) / cap));
             }
@@ -203,6 +241,7 @@ static Result runCase(const Case& c) {
     res.expectedGraphCalls = expectedGraphCalls.load();
     res.capacity = capacityBefore;
     res.capacityAfter = player->getCapacitySamples();
+    res.renderAllocs = gRenderAllocs.load();
     // A held note must sound in every block after the first (allow 1 block for event latency),
     // including the end of every block (a chunked render must fill the whole block), and the
     // callback must render ceil(n / capacity) chunks per block without growing its buffer
@@ -210,7 +249,8 @@ static Result runCase(const Case& c) {
     res.pass = res.peakNote > 1e-3f && res.nans == 0 && res.zeroNoteBlocks <= 1
             && res.zeroTailBlocks <= 1
             && res.graphCalls == res.expectedGraphCalls
-            && res.capacity >= 1024 && res.capacityAfter == res.capacity;
+            && res.capacity >= 1024 && res.capacityAfter == res.capacity
+            && res.renderAllocs == 0;
 
     delete player;
     delete graph;      // owns synth
@@ -404,15 +444,16 @@ int main() {
         {"k2", "dev 48k/128 (cap 1024), deliver 1500/128 (chunked)", 48000, 128, 48000, 128, {1500, 128}},
     };
 
-    std::printf("\n%-5s %-52s %-4s %8s %5s %11s %10s %7s %9s %5s %13s\n",
+    std::printf("\n%-5s %-52s %-4s %8s %5s %11s %10s %7s %9s %5s %13s %6s\n",
                 "case", "description", "res", "peak", "nan", "zero/blocks", "1st-sound", "synth#", "synthPk",
-                "cap", "graph#/expect");
-    std::printf("%s\n", std::string(138, '-').c_str());
+                "cap", "graph#/expect", "allocs");
+    std::printf("%s\n", std::string(145, '-').c_str());
     auto row = [](const std::string& id, const std::string& d, const Result& r) {
-        std::printf("%-5s %-52s %-4s %8.4f %5d %5d/%-5d %10d %7d %9.4f %5d %6llu/%-6llu\n", id.c_str(), d.c_str(),
+        std::printf("%-5s %-52s %-4s %8.4f %5d %5d/%-5d %10d %7d %9.4f %5d %6llu/%-6llu %6llu\n", id.c_str(), d.c_str(),
                     r.pass ? "PASS" : "FAIL", r.peakNote, r.nans, r.zeroNoteBlocks, r.noteBlocks,
                     r.firstSoundBlock, r.synthCalls, r.synthPeak, r.capacity,
-                    (unsigned long long)r.graphCalls, (unsigned long long)r.expectedGraphCalls);
+                    (unsigned long long)r.graphCalls, (unsigned long long)r.expectedGraphCalls,
+                    (unsigned long long)r.renderAllocs);
         std::fflush(stdout);
     };
     int unexpected = 0;
@@ -424,6 +465,8 @@ int main() {
     for (auto& c : cases) {
         auto r = runCase(c);
         unexpected += (r.pass == c.expectSilence) ? 1 : 0;
+        // Allocation-free rendering is required in every case, the negative control included.
+        if (c.expectSilence && r.renderAllocs > 0) ++unexpected;
         row(c.id, c.desc, r);
     }
     {

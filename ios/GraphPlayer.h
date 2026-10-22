@@ -17,6 +17,10 @@
 // No allocation on the audio thread: the render buffer is sized in
 // audioDeviceAboutToStart (>= 2x the device buffer, >= 1024 samples). A device block
 // larger than that is rendered in chunks of at most the preallocated capacity.
+// The graph's own render is allocation-free only with the vendored JUCE patch
+// graph-output-buffer-no-realloc (src/scripts/juce-patches.cjs): unpatched,
+// AudioProcessorGraph reallocates its output buffer whenever the block length changes.
+// The harness counts allocations inside this callback and fails on any.
 class GraphPlayer : public juce::AudioIODeviceCallback {
 public:
     static constexpr int minCapacitySamples = 1024;

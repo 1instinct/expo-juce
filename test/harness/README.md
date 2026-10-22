@@ -17,6 +17,11 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
 - `GraphPlayer` is the shipped class from `ios/GraphPlayer.h` (same git ref). Cases `k`/`k2` deliver
   blocks larger than its preallocated capacity and check the chunked render (graph calls = ceil(n/cap)
   per block, no silent block tails, no buffer growth).
+- Every IO callback runs with an allocation counter on (the glibc malloc family is interposed,
+  which covers `operator new` and JUCE's `HeapBlock`); the `allocs` column must be 0 in every
+  case. The vendored JUCE needs the `graph-output-buffer-no-realloc` patch
+  (`src/scripts/juce-patches.cjs`) for that: unpatched, cases `d` and `k2` allocate on almost every
+  block and all cases on their first.
 - Needs no root: missing X11/freetype dev headers (only needed because
   `juce_audio_processors` includes the gui modules) are fetched into `build/sysroot` by
   `fetch_deps.sh` via `apt-get download` + `dpkg -x`.

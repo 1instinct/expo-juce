@@ -551,7 +551,7 @@ struct GraphRenderSequence
             return;
         }
 
-        currentAudioOutputBuffer.setSize (jmax (1, buffer.getNumChannels()), numSamples);
+        currentAudioOutputBuffer.setSize (jmax (1, buffer.getNumChannels()), numSamples, false, false, true); // expo-juce patch: graph-output-buffer-no-realloc
         currentAudioOutputBuffer.clear();
         currentMidiOutputBuffer.clear();
 
@@ -798,7 +798,7 @@ struct GraphRenderSequence
     {
         renderingBuffer.setSize (numBuffersNeeded + 1, blockSize);
         renderingBuffer.clear();
-        currentAudioOutputBuffer.setSize (numBuffersNeeded + 1, blockSize);
+        currentAudioOutputBuffer.setSize (jmax (numBuffersNeeded + 1, 8), blockSize); // expo-juce patch: graph-output-buffer-no-realloc
         currentAudioOutputBuffer.clear();
 
         currentMidiOutputBuffer.clear();
