@@ -290,10 +290,14 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
         [self teardownEngineLocked];
         return;
     }
-    if (sDeviceManager->getCurrentAudioDevice() == nullptr) {
-        [self noteNonFatal:@"step 4 (non-fatal): initialise returned no error but no device is open"];
-    } else {
+    if (sDeviceManager->getCurrentAudioDevice() != nullptr) {
         [self applyPreferredDeviceSetupWithBufferSize:preferredBuffer sampleRate:preferredRate];
+    }
+    juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice();
+    if (device == nullptr || !device->isPlaying()) {
+        [self noteFatal:@"no running audio device after applying/restoring device setup"];
+        [self teardownEngineLocked];
+        return;
     }
 
     double sr = sDeviceManager->getAudioDeviceSetup().sampleRate;
