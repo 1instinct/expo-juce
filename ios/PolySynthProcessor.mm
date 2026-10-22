@@ -1,21 +1,6 @@
 #include "PolySynthProcessor.h"
 #include <cmath>
 #include <algorithm>
-#include <thread>
-
-namespace {
-// Spinlock guard for the note queue's producer side (test_and_set acquire / clear release).
-// Critical sections are a few stores; yield in case the holder was preempted.
-struct ProducerSpinGuard {
-    std::atomic_flag& flag;
-    explicit ProducerSpinGuard(std::atomic_flag& f) : flag(f) {
-        while (flag.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
-    }
-    ~ProducerSpinGuard() { flag.clear(std::memory_order_release); }
-    ProducerSpinGuard(const ProducerSpinGuard&) = delete;
-    ProducerSpinGuard& operator=(const ProducerSpinGuard&) = delete;
-};
-}
 
 PolySynthProcessor::PolySynthProcessor()
     : AudioProcessor(BusesProperties()
@@ -34,29 +19,14 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                        juce::MidiBuffer& /*midiMessages*/) {
     buffer.clear();
 
-    // Drain note event FIFO (audio thread side)
-    int rp = eventReadPos.load(std::memory_order_relaxed);
-    int wp = eventWritePos.load(std::memory_order_acquire);
-    while (rp != wp) {
-        const NoteEvent& event = eventQueue[rp];
-        processNoteEvent(event);
-        if (event.type == NoteEvent::NoteOn) {
-            diag.notesConsumed.fetch_add(1, std::memory_order_relaxed);
-            const juce::int64 nowTicks = juce::Time::getHighResolutionTicks();
-            if (event.stampTicks != 0) {
-                const juce::int64 elapsed = nowTicks - event.stampTicks;
-                diag.lastNoteToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
-                                              std::memory_order_relaxed);
-            }
-            if (event.touchTicks != 0 && nowTicks >= event.touchTicks) {
-                const juce::int64 elapsed = nowTicks - event.touchTicks;
-                diag.lastTouchToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
-                                               std::memory_order_relaxed);
-            }
-        }
-        rp = (rp + 1) % EVENT_QUEUE_SIZE;
+    // Note-ons waiting in the queue, then releases: every held voice whose note-on is at or
+    // below its release mark stops (see NoteEventQueue). Applied every block, so a release sent
+    // while the device was stopped or reopening takes effect on the first block after it.
+    queue->drainNoteOns([this](const NoteEvent& event) { startQueuedNote(event); });
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (voices[v].isHeld() && queue->isReleased(voices[v].getNoteNumber(), voices[v].startSeq))
+            voices[v].stopNote();
     }
-    eventReadPos.store(rp, std::memory_order_release);
 
     int numSamples = buffer.getNumSamples();
     double sr = getSampleRate();
@@ -118,62 +88,27 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
 }
 
-// Called on audio thread from processBlock
-void PolySynthProcessor::processNoteEvent(const NoteEvent& event) {
-    switch (event.type) {
-        case NoteEvent::NoteOn: {
-            int clampedNote = std::clamp(event.note, 0, 127);
-            int clampedVel = std::clamp(event.velocity, 0, 127);
-            allocator.noteOn(clampedNote, (float)clampedVel, voices,
-                             static_cast<Waveform>(waveform.load()),
-                             (double)detuneCents.load(),
-                             filterCutoff.load(), filterResonance.load(),
-                             masterLevel.load());
-            break;
-        }
-        case NoteEvent::NoteOff: {
-            int clampedNote = std::clamp(event.note, 0, 127);
-            allocator.noteOff(clampedNote, voices);
-            break;
-        }
-        case NoteEvent::AllNotesOff:
-            allocator.allNotesOff(voices);
-            break;
+// Audio thread (processBlock): start a queued note-on and record its latency.
+void PolySynthProcessor::startQueuedNote(const NoteEvent& event) {
+    const int clampedNote = std::clamp(event.note, 0, 127);
+    const int clampedVel = std::clamp(event.velocity, 0, 127);
+    allocator.noteOn(clampedNote, (float)clampedVel, voices,
+                     static_cast<Waveform>(waveform.load()),
+                     (double)detuneCents.load(),
+                     filterCutoff.load(), filterResonance.load(),
+                     masterLevel.load(), event.seq);
+
+    const juce::int64 nowTicks = juce::Time::getHighResolutionTicks();
+    if (event.stampTicks != 0) {
+        const juce::int64 elapsed = nowTicks - event.stampTicks;
+        diag.lastNoteToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
+                                      std::memory_order_relaxed);
     }
-}
-
-// Producers (main thread, JS thread): push an event to the FIFO under producerLock.
-void PolySynthProcessor::noteOn(int note, int velocity, juce::int64 touchTicks) {
-    ProducerSpinGuard guard(producerLock);
-    int wp = eventWritePos.load(std::memory_order_relaxed);
-    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
-    if (nextWp == eventReadPos.load(std::memory_order_acquire)) { // full, drop event
-        diag.notesDropped.fetch_add(1, std::memory_order_relaxed);
-        return;
+    if (event.touchTicks != 0 && nowTicks >= event.touchTicks) {
+        const juce::int64 elapsed = nowTicks - event.touchTicks;
+        diag.lastTouchToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
+                                       std::memory_order_relaxed);
     }
-    eventQueue[wp] = { NoteEvent::NoteOn, note, velocity, juce::Time::getHighResolutionTicks(), touchTicks };
-    // Count before publishing: the release-store below orders this increment
-    // ahead of the consumer's notesConsumed increment for the same event.
-    diag.notesQueued.fetch_add(1, std::memory_order_relaxed);
-    eventWritePos.store(nextWp, std::memory_order_release);
-}
-
-void PolySynthProcessor::noteOff(int note) {
-    ProducerSpinGuard guard(producerLock);
-    int wp = eventWritePos.load(std::memory_order_relaxed);
-    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
-    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::NoteOff, note, 0, 0, 0 };
-    eventWritePos.store(nextWp, std::memory_order_release);
-}
-
-void PolySynthProcessor::allNotesOff() {
-    ProducerSpinGuard guard(producerLock);
-    int wp = eventWritePos.load(std::memory_order_relaxed);
-    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
-    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::AllNotesOff, 0, 0, 0, 0 };
-    eventWritePos.store(nextWp, std::memory_order_release);
 }
 
 void PolySynthProcessor::setWaveform(Waveform wf) { waveform.store(static_cast<int>(wf)); }

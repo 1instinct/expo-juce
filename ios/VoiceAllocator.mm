@@ -28,7 +28,7 @@ int VoiceAllocator::findVoice(Voice* voices) {
 int VoiceAllocator::noteOn(int note, float velocity, Voice* voices,
                            Waveform waveform, double detuneCents,
                            float filterCutoff, float filterResonance,
-                           float masterLevel) {
+                           float masterLevel, uint64_t seq) {
     if (note >= 0 && note < 128 && noteMap[note] >= 0) {
         int existing = noteMap[note];
         if (existing < MAX_VOICES && voices[existing].getNoteNumber() == note) {
@@ -58,6 +58,7 @@ int VoiceAllocator::noteOn(int note, float velocity, Voice* voices,
     }
 
     voice.startNote(note, velocity);
+    voice.startSeq = seq;
 
     if (note >= 0 && note < 128) {
         noteMap[note] = voiceIdx;

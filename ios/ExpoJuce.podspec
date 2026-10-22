@@ -42,6 +42,7 @@ Pod::Spec.new do |s|
     "PolySynthProcessor.h",
     "TransportEngine.h",
     "GraphPlayer.h",
+    "NoteEventQueue.h",
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)

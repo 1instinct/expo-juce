@@ -341,7 +341,7 @@ static MultiProducerResult runMultiProducer() {
 
     // Let the audio thread drain what is left, then silence everything.
     auto drained = [&] {
-        return synth.diag.notesConsumed.load() == synth.diag.notesQueued.load();
+        return synth.noteQueue().notesConsumed.load() == synth.noteQueue().notesQueued.load();
     };
     for (int i = 0; i < 2000 && !drained(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     synth.allNotesOff();
@@ -358,12 +358,87 @@ static MultiProducerResult runMultiProducer() {
 
     MultiProducerResult r;
     r.attempted = 2u * kPerProducer;
-    r.queued = synth.diag.notesQueued.load();
-    r.consumed = synth.diag.notesConsumed.load();
-    r.dropped = synth.diag.notesDropped.load();
+    r.queued = synth.noteQueue().notesQueued.load();
+    r.consumed = synth.noteQueue().notesConsumed.load();
+    r.dropped = synth.noteQueue().notesDropped.load();
     r.activeAfter = synth.diag.activeVoices.load();
     r.nans = nans.load();
     r.pass = r.attempted == r.queued + r.dropped && r.queued == r.consumed && r.activeAfter == 0 && r.nans == 0;
+    return r;
+}
+
+// Note releases (NoteEventQueue marks). Single-threaded and block by block, so each step is
+// deterministic. Scenarios:
+//  stopped: a release sent while no block renders (device stopped / being reopened) takes effect
+//           on the first block after, and the voice dies out.
+//  full:    a release sent while the note-on ring is full (old design: the NoteOff event was
+//           dropped and the note sustained forever) still releases the held note.
+//  early:   note-off before the note-on was consumed: the note never sustains.
+//  order:   note-off / all-notes-off followed by a new note-on of the same note before the next
+//           block: the release must not cut the newer note.
+struct ReleaseResult {
+    int stoppedActive = -1, fullActive = -1, earlyActive = -1, orderActive = -1;
+    uint32_t fullDropped = 0;
+    bool pass = false;
+};
+
+static ReleaseResult runReleases() {
+    constexpr int kBlock = 128;
+    auto prepare = [](PolySynthProcessor& synth, TransportEngine& transport) {
+        synth.setTransport(&transport);
+        synth.setRateAndBufferSizeDetails(48000, kBlock);
+        synth.prepareToPlay(48000, kBlock);
+        synth.setRelease(10.0);
+    };
+    auto render = [](PolySynthProcessor& synth, double ms) {
+        juce::AudioBuffer<float> buf(2, kBlock);
+        juce::MidiBuffer midi;
+        const int blocks = std::max(1, (int)(ms * 48.0 / kBlock));
+        for (int b = 0; b < blocks; ++b) synth.processBlock(buf, midi);
+        return synth.diag.activeVoices.load();
+    };
+    ReleaseResult r;
+    {
+        TransportEngine t; PolySynthProcessor s; prepare(s, t);
+        s.noteOn(60, 127);
+        render(s, 20);
+        s.noteOff(60);              // no block renders here
+        r.stoppedActive = render(s, 200);
+    }
+    {
+        TransportEngine t; PolySynthProcessor s; prepare(s, t);
+        s.noteOn(60, 127);
+        render(s, 20);
+        for (int i = 0; i < NoteEventQueue::kSize + 20; ++i) s.noteOn(61, 127); // ring full
+        r.fullDropped = s.noteQueue().notesDropped.load();
+        s.noteOff(60);
+        s.noteOff(61);
+        r.fullActive = render(s, 300);
+    }
+    {
+        TransportEngine t; PolySynthProcessor s; prepare(s, t);
+        s.noteOn(62, 127);
+        s.noteOff(62);
+        r.earlyActive = render(s, 200);
+    }
+    {
+        TransportEngine t; PolySynthProcessor s; prepare(s, t);
+        s.noteOn(63, 127);
+        s.noteOn(64, 127);
+        render(s, 20);
+        s.allNotesOff();            // releases 63 and 64 ...
+        s.noteOn(64, 127);          // ... but not this newer note-on of 64
+        s.noteOff(63);
+        s.noteOn(63, 127);          // newer note-on of the released note
+        r.orderActive = render(s, 200); // both newer notes still held
+    }
+    r.pass = r.stoppedActive == 0 && r.fullDropped > 0 && r.fullActive == 0 && r.earlyActive == 0
+          && r.orderActive == 2;
+    std::printf("rl    note releases (stopped device, full ring, early off, ordering)  %-4s active after: stopped %d,"
+                " full %d (ring drops %u), early %d; order %d (want 2)\n",
+                r.pass ? "PASS" : "FAIL", r.stoppedActive, r.fullActive, r.fullDropped, r.earlyActive,
+                r.orderActive);
+    std::fflush(stdout);
     return r;
 }
 
@@ -479,6 +554,7 @@ int main() {
         std::fflush(stdout);
     }
     unexpected += runRebuildState() ? 0 : 1;
+    unexpected += runReleases().pass ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

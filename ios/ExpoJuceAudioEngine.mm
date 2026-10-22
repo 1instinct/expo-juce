@@ -72,7 +72,8 @@ static TransportEngine* sTransport = nullptr;
 // ── Engine lifecycle lock ──
 // Guards the pointers above (and isReady) between the lifecycle code, which runs only on the
 // main thread and takes the lock blocking (setup / teardown / rebuild / device restart), and the
-// users that dereference them (JS thread, and JucePadView on the main thread).
+// users that dereference them (JS thread, and JucePadView on the main thread). Note input
+// (noteOn / noteOff / allNotesOff) does not use it: it goes through sNoteQueue below.
 // Rules that keep it deadlock-free:
 //  - Lifecycle sections take it at exactly one level (setupWithBufferSize, shutdown, dead-device reopen,
 //    rebuild, device restart); everything they call under it is a *Locked helper that never
@@ -83,12 +84,22 @@ static TransportEngine* sTransport = nullptr;
 //    section at the same time, so the only other holder is a short user section). Users on
 //    other threads use try_lock: if the lifecycle holds it, the call is dropped (safe default
 //    returned) and counted in lockBusyDrops. A short user section on another thread is waited
-//    out with a bounded retry so a note-off is not dropped for a microsecond of contention.
+//    out with a bounded retry so a parameter change is not dropped for a microsecond of contention.
 // The audio thread never takes this lock.
 static std::mutex sEngineLock;
 static std::atomic<bool> sLifecycleBusy{false};       // true while a lifecycle section holds sEngineLock
 static std::atomic<uint64_t> sLockBusyDrops{0};
 static std::atomic<uint64_t> sDeadDeviceRestarts{0};
+
+// ── Note input ──
+// One queue for the life of the process (never deleted, unlike the synth), so producers need
+// no lock: note-ons go into its ring, releases are marks the synth applies every block (see
+// NoteEventQueue.h). A release can therefore not be dropped by lock contention, a full ring, or
+// a device reopen (the synth applies it on the first block after the device restarts).
+// Note-ons are accepted only while the engine is ready (sAcceptingNotes); setup discards
+// note-ons left in the ring before the new synth is attached, so nothing stale plays.
+static NoteEventQueue sNoteQueue;
+static std::atomic<bool> sAcceptingNotes{false};
 
 // RAII: holds sEngineLock for a lifecycle section (main thread, blocking) and flags it busy.
 struct LifecycleLock {
@@ -185,7 +196,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
         LifecycleLock lifecycle;
         ok = [self setupEngineLocked];
         // Setup after a failed rebuild (retry pending or given up) continues that recovery.
-        if (ok) [self restoreRecoveryStateLocked];
+        // Note-ons are accepted only once the restored settings are in place.
+        if (ok) {
+            [self restoreRecoveryStateLocked];
+            sAcceptingNotes.store(true, std::memory_order_release);
+        }
     }
     if (ok) {
         [self registerSessionObservers];
@@ -320,6 +335,10 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     auto synthProcessor = std::make_unique<PolySynthProcessor>();
     sSynth = synthProcessor.get();
     sSynth->setTransport(sTransport);
+    // Nothing drains sNoteQueue until the player is attached (step 11), so this thread may act
+    // as its consumer here: note-ons left from before (a failed or replaced engine) are dropped.
+    sNoteQueue.discardPending();
+    sSynth->setNoteQueue(&sNoteQueue);
 
     self.setupStep = 7;
     NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth)");
@@ -402,6 +421,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 // Main thread, caller holds sEngineLock. Deletes everything doSetup built (any subset).
 - (void)teardownEngineLocked {
     NSLog(@"[ExpoJuceAudioEngine] Tearing down engine...");
+    sAcceptingNotes.store(false, std::memory_order_release);
     self.isReady = false;
     if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
     delete sPlayer; sPlayer = nullptr;
@@ -444,7 +464,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     [self stopBeatTimer];
     {
         LifecycleLock lifecycle;
-        if (sSynth) sSynth->allNotesOff();
+        sNoteQueue.pushAllNotesOff();
         [self teardownEngineLocked];
     }
     NSLog(@"[ExpoJuceAudioEngine] Shutdown complete");
@@ -701,10 +721,13 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     BOOL ok = NO;
     {
         LifecycleLock lifecycle;
-        if (sSynth) sSynth->allNotesOff();
+        sNoteQueue.pushAllNotesOff();
         [self teardownEngineLocked];
         ok = [self setupEngineLocked];
-        if (ok) [self restoreRecoveryStateLocked];
+        if (ok) {
+            [self restoreRecoveryStateLocked];
+            sAcceptingNotes.store(true, std::memory_order_release);
+        }
     }
 
     if (ok) {
@@ -794,15 +817,16 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
             if (synth) {
                 synthProcessCount = (double)synth->diag.processCount.load(relaxed);
                 synthPeak = (double)synth->diag.peak.load(relaxed);
-                notesQueued = (double)synth->diag.notesQueued.load(relaxed);
-                notesConsumed = (double)synth->diag.notesConsumed.load(relaxed);
-                notesDropped = (double)synth->diag.notesDropped.load(relaxed);
                 activeVoices = synth->diag.activeVoices.load(relaxed);
                 lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
                 lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
             }
         }
     }
+    // Note counters: cumulative since launch, read from the process-lifetime queue (no lock).
+    notesQueued = (double)sNoteQueue.notesQueued.load(std::memory_order_relaxed);
+    notesConsumed = (double)sNoteQueue.notesConsumed.load(std::memory_order_relaxed);
+    notesDropped = (double)sNoteQueue.notesDropped.load(std::memory_order_relaxed);
 
     d[@"isReady"] = @(ready);
     d[@"setupStep"] = @(self.setupStep);
@@ -877,14 +901,13 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 }
 
 // ── Synth forwarding ──
-// Each call holds sEngineLock (acquireUserLock) while it dereferences sSynth / sTransport; if
-// the lifecycle holds it, the call is dropped and the safe default returned.
+// Notes go through sNoteQueue without the lock (see "Note input"). Every other call holds
+// sEngineLock (acquireUserLock) while it dereferences sSynth / sTransport; if the lifecycle
+// holds it, the call is dropped and the safe default returned.
 
 - (void)noteOn:(int)note velocity:(int)velocity {
-    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
-    if (!acquireUserLock(lock)) return;
-    if (!self.isReady || !sSynth) return;
-    sSynth->noteOn(note, velocity);
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
+    sNoteQueue.pushNoteOn(note, velocity);
 }
 
 - (void)noteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
@@ -893,25 +916,14 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     const juce::int64 touchTicks = (touchTimestamp > 0.0)
         ? juce::Time::secondsToHighResolutionTicks(touchTimestamp)
         : (juce::int64)0;
-    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
-    if (!acquireUserLock(lock)) return;
-    if (!self.isReady || !sSynth) return;
-    sSynth->noteOn(note, velocity, touchTicks);
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
+    sNoteQueue.pushNoteOn(note, velocity, touchTicks);
 }
 
-- (void)noteOff:(int)note {
-    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
-    if (!acquireUserLock(lock)) return;
-    if (!self.isReady || !sSynth) return;
-    sSynth->noteOff(note);
-}
-
-- (void)allNotesOff {
-    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
-    if (!acquireUserLock(lock)) return;
-    if (!self.isReady || !sSynth) return;
-    sSynth->allNotesOff();
-}
+// Releases are always recorded, ready or not: a release must reach a voice that is still
+// sounding whatever the engine is doing (a mark with nothing to release is harmless).
+- (void)noteOff:(int)note { sNoteQueue.pushNoteOff(note); }
+- (void)allNotesOff { sNoteQueue.pushAllNotesOff(); }
 
 - (void)setWaveform:(NSString *)waveform {
     Waveform wf = Waveform::Sine;

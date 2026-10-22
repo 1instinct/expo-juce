@@ -40,7 +40,7 @@ that covers it, if any.
 | 1 | **Digitizer scan and touch delivery.** The touch controller scans the glass (120 Hz class on recent iPhones), the system builds a `UITouch` and delivers it to the app's main thread. | ≈ 8–16 ms | nothing in-app; slow-motion only. `UITouch.timestamp` marks the start of in-app time **(0.5.2+)**. |
 | 2a | **React Native path.** `Pressable` → the touch is dispatched as a Fabric event to the JS thread → Pressability → `onPressIn` → the app's handler → `ExpoJuce.noteOn` (synchronous JSI call). Waits for the JS thread, which also runs React renders, animation work and timers. | ≈ 2–16 ms, plus jitter when the JS thread is busy (tens of ms during heavy renders) | the dispatch wait is invisible; an app-side timestamp in `onPressIn` covers only handler → `noteOn` (≈ 0.04 ms) |
 | 2b | **Native path — `JucePadView` (0.5.2+).** `touchesBegan` on the main thread calls the engine's `noteOn` directly; JS is notified afterwards (`onNoteOn`) for visuals and haptics only. | < 0.1 ms after delivery | `lastTouchToRenderMs` (0.5.2+) |
-| 3 | **SPSC queue → next audio block.** `noteOn` pushes a `NoteEvent` into a 256-slot lock-free ring; `PolySynthProcessor::processBlock` drains it at the *start* of the next block. Wait is 0 … 1 buffer, half a buffer on average. | 0–5.4 ms @ 257 samples; 0–2.7 ms @ 128 | `lastNoteToRenderMs` |
+| 3 | **SPSC queue → next audio block.** `noteOn` pushes a `NoteEvent` into the 256-slot ring of the engine's `NoteEventQueue` (no engine lock; releases are separate marks, see `ios/NoteEventQueue.h`); `PolySynthProcessor::processBlock` drains it at the *start* of the next block. Wait is 0 … 1 buffer, half a buffer on average. | 0–5.4 ms @ 257 samples; 0–2.7 ms @ 128 | `lastNoteToRenderMs` |
 | 4 | **I/O buffer.** The rendered block is handed to Core Audio and played out over one buffer period. | 5.35 ms @ 257 / 48 kHz; 2.67 ms @ 128 | `sessionIOBufferMs` |
 | 5 | **Output latency of the route.** Converter, system output processing and the transducer path, as reported by `AVAudioSession.outputLatency`. Depends entirely on the route: | | `sessionOutputLatencyMs`, `routeOutputs` |
 | | — built-in speaker (`Speaker`) | ≈ 15 ms (includes the system's speaker processing) | |
@@ -124,7 +124,7 @@ reports).
 | 3 | Audio session | `sessionCategory`, `sessionSampleRate`, `sessionIOBufferMs`, `sessionOutputLatencyMs`, `routeOutputs`, `otherAudioPlaying` | Category must be Playback (or PlayAndRecord); Ambient fails because the silent switch mutes it. Route tells you which output-latency row of section 2 applies. |
 | 4 | Device callbacks | `callbackCount` rate, device name/type, `sampleRate`, `bufferSize` | Rate ≈ sampleRate / bufferSize per second (≈ 187/s at 257, 375/s at 128). Not moving = device/session layer is stopped. |
 | 5 | Graph processing | `graphProcessCount` | Should move with stage 4. |
-| 6 | Synth processing | `synthProcessCount`, notes queued/consumed/dropped, `activeVoices` | Dropped > 0 means the 256-slot queue overflowed. |
+| 6 | Synth processing | `synthProcessCount`, notes queued/consumed/dropped, `activeVoices` | Dropped > 0 means note-ons overflowed the 256-slot ring (releases are never dropped). Counters are cumulative since launch. |
 | 7 | Synth signal | `synthPeak` now / max | Passes once a note produced signal inside the synth. |
 | 8 | Output signal | `outputPeak`, `nanCount`, `toneSamplesMixed` | Graph output before the test tone; any NaN block fails. |
 | 9 | Latency | see below | Pass when the estimate ≤ 40 ms. |

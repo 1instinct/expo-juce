@@ -24,7 +24,7 @@ iOS only for now; the Android and web modules are scaffolds.
  juce::AudioDeviceManager ─► GraphPlayer (AudioIODeviceCallback: graph, peaks, NaNs, test tone)
         │
  juce::AudioProcessorGraph  PolySynthProcessor ─► audio output node
-                            ├─ SPSC note queue (256) drained at block start
+                            ├─ NoteEventQueue: note-on ring (256) drained at block start; releases as marks
                             ├─ 8 × Voice: dsp::Oscillator → StateVariableTPTFilter (LP) → ADSR
                             └─ TransportEngine (tempo / position / beat crossings)
 ```
@@ -92,7 +92,8 @@ await ExpoJuce.setup();
 // 0.5.2+: optional device request (defaults 128 samples / 48 kHz; actual values may differ)
 // await ExpoJuce.setup({ bufferSize: 128, sampleRate: 48000 });
 
-// Notes — synchronous; pushed onto a lock-free single-producer queue read by the audio thread
+// Notes — synchronous, never wait on a lock; the audio thread picks them up at the next block
+// (note-offs and allNotesOff are never dropped, even mid-recovery)
 ExpoJuce.noteOn(60, 127);   // note 0–127, velocity 0–127
 ExpoJuce.noteOff(60);
 ExpoJuce.allNotesOff();

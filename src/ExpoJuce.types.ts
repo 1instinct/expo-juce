@@ -77,9 +77,11 @@ export type AudioDiagnostics = {
   nanCount: number;
   /** Cumulative test-tone samples actually mixed into the device output (audio thread). */
   toneSamplesMixed: number;
+  /** Note-ons accepted into the note queue (cumulative since launch, across engine rebuilds). */
   notesQueued: number;
+  /** Note-ons the synth has started (cumulative since launch). */
   notesConsumed: number;
-  /** noteOn events dropped because the event queue was full. */
+  /** Note-ons dropped because the note queue was full. Note releases are never dropped. */
   notesDropped: number;
   activeVoices: number;
   /** ms from noteOn enqueue to the synth consuming it; -1 if none yet. */

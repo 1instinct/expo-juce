@@ -22,6 +22,11 @@ public:
     void startNote(int note, float velocity);
     void stopNote();
 
+    // Held: between startNote and stopNote (a voice in its release stage is not held).
+    bool isHeld() const { return held && noteNumber >= 0; }
+    // NoteEventQueue sequence number of the note-on that started this voice (0 = none).
+    uint64_t startSeq = 0;
+
     void captureAndRelease(Waveform waveform, double frequency,
                            float filterCutoff, float filterResonance,
                            float masterLevel);
@@ -52,6 +57,7 @@ private:
     juce::ADSR adsr;
 
     int noteNumber = -1;
+    bool held = false;
     float velocityGain = 0.0f;
     float currentLevel = 0.0f;
     double cachedSampleRate = 44100.0;

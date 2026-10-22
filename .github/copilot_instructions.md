@@ -75,7 +75,7 @@ Voice[8] + VoiceAllocator + TransportEngine
 ### 2. PolySynthProcessor (`PolySynthProcessor.mm`)
 - **Purpose**: 8-voice polyphonic AudioProcessor node in the graph
 - **Features**:
-  - Lock-free SPSC FIFO for note events (main thread → audio thread)
+  - Note input via `NoteEventQueue` (ios/NoteEventQueue.h): note-on ring (multi-producer, audio-thread consumer) plus release marks that cannot be dropped; owned by the engine for the life of the process
   - Global params as atomics (waveform, filter, detune, master level)
   - processBlock: drains FIFO, renders voices, mixes fade-out tails, duplicates mono→stereo
 
