@@ -1,13 +1,15 @@
 # Offline audio-path harness
 
 Reproduces the iOS native audio path on Linux/WSL without a device: the `doSetup` call order
-from `ios/BeeperAudioEngine.mm`, `AudioDeviceManager::addAudioCallback` (which calls
+from `ios/ExpoJuceAudioEngine.mm`, `AudioDeviceManager::addAudioCallback` (which calls
 `GraphPlayer::audioDeviceAboutToStart` → second `prepareToPlay`), and a fake device thread
 calling `audioDeviceIOCallbackWithContext` with iOS-like block sizes. Each case sends
 `noteOn(60,127)`, holds it 0.5 s and reports PASS/FAIL (non-silent, finite output).
 
+From this directory, in WSL or any Linux shell:
+
 ```sh
-wsl -e bash -lc "cd /mnt/c/Users/aaron/Internal/Beeper/code/expo-juce/test/harness && cmake -S . -B build && cmake --build build -j16 && ./build/harness"
+cmake -S . -B build && cmake --build build -j16 && ./build/harness
 ```
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`) are

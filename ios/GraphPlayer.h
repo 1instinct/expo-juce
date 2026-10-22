@@ -1,6 +1,6 @@
 #pragma once
 
-// Pure C++ (no Objective-C): included by BeeperAudioEngine.mm and by the offline harness
+// Pure C++ (no Objective-C): included by ExpoJuceAudioEngine.mm and by the offline harness
 // (test/harness), so the harness exercises exactly the shipped device callback.
 
 #include "JuceConfig.h"

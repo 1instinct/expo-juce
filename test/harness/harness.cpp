@@ -1,4 +1,4 @@
-// Offline reproduction of the iOS native audio path (ios/BeeperAudioEngine.mm doSetup +
+// Offline reproduction of the iOS native audio path (ios/ExpoJuceAudioEngine.mm doSetup +
 // AudioDeviceManager::addAudioCallback + the device's audio thread), driven by a fake
 // AudioIODevice. See README.md.
 #include "JuceConfig.h"
@@ -93,7 +93,7 @@ static void pump(bool loop, int ms) {
 }
 
 static Result runCase(const Case& c) {
-    // ── doSetup replica (ios/BeeperAudioEngine.mm, HEAD), steps 2 and 5–11 ──
+    // ── doSetup replica (ios/ExpoJuceAudioEngine.mm, HEAD), steps 2 and 5–11 ──
     auto* transport = new TransportEngine();
     auto* graph = new juce::AudioProcessorGraph();
     graph->setPlayConfigDetails(0, 2, c.setupSr, c.setupBuf);

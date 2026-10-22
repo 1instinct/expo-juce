@@ -1,22 +1,17 @@
 # Latency guide
 
-How long it takes from a finger touching a pad in the Beeper app to sound leaving the
-phone, where that time goes, what expo-juce does about it, how to read the numbers the
-app reports, and how to measure the real figure with a slow-motion camera. Written for
-the latency-margin work of 2026-10-22;
-behaviour that arrives with that work is marked **(0.5.2+)** and should be re-checked
-against the code and a device once it ships.
-
-Terms used here (I/O buffer, output latency, SPSC queue, route, ADSR …) are defined in the
-[BeeperNative glossary](https://github.com/Beeper-Buzz/BeeperNative/blob/@aaron.smulktis/develop/GLOSSARY.md)
-(lands on that branch when `debug/audio-diagnostics` is merged).
+How long it takes from a finger touching an on-screen pad in an app using expo-juce to
+sound leaving the phone, where that time goes, what expo-juce does about it, how to read
+the numbers it reports, and how to measure the real figure with a slow-motion camera.
+Written for the latency-margin work of 2026-10-22; behaviour that arrives with that work is
+marked **(0.5.2+)** and should be re-checked against the code and a device once it ships.
 
 Contents
 1. [Budget and targets](#1-budget-and-targets)
 2. [The signal path, finger to speaker](#2-the-signal-path-finger-to-speaker)
 3. [Baseline (2026-10-22)](#3-baseline-2026-10-22)
 4. [Changes and why](#4-changes-and-why)
-5. [Reading the diagnostics panel](#5-reading-the-diagnostics-panel)
+5. [A diagnostics panel](#5-a-diagnostics-panel)
 6. [Slow-motion measurement procedure](#6-slow-motion-measurement-procedure)
 7. [Results](#7-results)
 8. [Troubleshooting](#8-troubleshooting)
@@ -43,7 +38,7 @@ that covers it, if any.
 | # | Segment | Typical | Seen by |
 |---|---|---|---|
 | 1 | **Digitizer scan and touch delivery.** The touch controller scans the glass (120 Hz class on recent iPhones), the system builds a `UITouch` and delivers it to the app's main thread. | ≈ 8–16 ms | nothing in-app; slow-motion only. `UITouch.timestamp` marks the start of in-app time **(0.5.2+)**. |
-| 2a | **React Native path (current).** `Pressable` → the touch is dispatched as a Fabric event to the JS thread → Pressability → `onPressIn` → `markPress()` → `useDSP.playNote` → `ExpoJuce.noteOn` (synchronous JSI call). Waits for the JS thread, which also runs React renders, Reanimated/R3F work and timers. | ≈ 2–16 ms, plus jitter when the JS thread is busy (tens of ms during heavy renders) | the dispatch wait is invisible; `lastPressToNoteOnMs` covers only handler → `noteOn` (≈ 0.04 ms) |
+| 2a | **React Native path.** `Pressable` → the touch is dispatched as a Fabric event to the JS thread → Pressability → `onPressIn` → the app's handler → `ExpoJuce.noteOn` (synchronous JSI call). Waits for the JS thread, which also runs React renders, animation work and timers. | ≈ 2–16 ms, plus jitter when the JS thread is busy (tens of ms during heavy renders) | the dispatch wait is invisible; an app-side timestamp in `onPressIn` covers only handler → `noteOn` (≈ 0.04 ms) |
 | 2b | **Native path — `JucePadView` (0.5.2+).** `touchesBegan` on the main thread calls the engine's `noteOn` directly; JS is notified afterwards (`onNoteOn`) for visuals and haptics only. | < 0.1 ms after delivery | `lastTouchToRenderMs` (0.5.2+) |
 | 3 | **SPSC queue → next audio block.** `noteOn` pushes a `NoteEvent` into a 256-slot lock-free ring; `PolySynthProcessor::processBlock` drains it at the *start* of the next block. Wait is 0 … 1 buffer, half a buffer on average. | 0–5.4 ms @ 257 samples; 0–2.7 ms @ 128 | `lastNoteToRenderMs` |
 | 4 | **I/O buffer.** The rendered block is handed to Core Audio and played out over one buffer period. | 5.35 ms @ 257 / 48 kHz; 2.67 ms @ 128 | `sessionIOBufferMs` |
@@ -60,8 +55,9 @@ pads in time. Out of scope: Android, sample-accurate event timing within a block
 
 ## 3. Baseline (2026-10-22)
 
-iPhone17,1 (iPhone 16 Pro), iOS 26.6.2, built-in speaker, dev build, expo-juce
-`0.5.2-diag.1`, read from the diagnostics panel:
+iPhone17,1 (iPhone 16 Pro), iOS 26.6.2, built-in speaker, dev build of the test app,
+expo-juce `0.5.2-diag.1`, read from its diagnostics panel (section 5;
+`lastPressToNoteOnMs` is that app's own `onPressIn` → `noteOn` timer, not an expo-juce field):
 
 | Field | Value |
 |---|---|
@@ -88,10 +84,10 @@ them with measured ones in section 7.
 | 2 | **No allocation on the audio thread (0.5.2+).** `GraphPlayer` sizes its scratch buffer in `audioDeviceAboutToStart` (≥ 2× device buffer, ≥ 1024 samples) and renders oversize blocks in chunks instead of growing it. | Before, `buffer.setSize` ran inside the device callback and could allocate when iOS delivered a larger block — a dropout risk that gets worse at small buffers. | none on average; removes glitches |
 | 3 | **`JucePadView` native touch path (0.5.2+).** Expo native view; `touchesBegan/Ended/Cancelled` on the main thread call `noteOn/noteOff` directly. Props `note`, `velocity`, `enabled`; events `onNoteOn`, `onNoteOff` (visuals/haptics only). Multi-touch safe: note off only when the last touch on that view lifts. Stamps `UITouch.timestamp` into the note event. | Takes the JS thread (and its jitter) out of the trigger path. | ≈ 2–16 ms typical, much more under JS load; also removes jitter |
 | 4 | **Diagnostics (0.5.2+):** `lastTouchToRenderMs`, `preferredBufferSize`, `preferredSampleRate`, `sessionReassertCount`. Existing fields unchanged. | Measure the new path from the hardware touch time; show requested vs granted buffer. | — |
-| 5 | **Session safeguard and recovery (0.5.2+).** On `AVAudioSessionRouteChangeNotification` with reason `CategoryChange`, if the category is not Playback/PlayAndRecord, re-assert Playback + MixWithOthers (re-entrancy guarded, counted). On interruption end, reactivate the session and restart the device if stopped. On media-services reset, tear down and set up again with the last options. Ports the behaviour of `f1632c7`. Fields `interruptionCount`, `mediaResetCount`, `lastRecoveryError`. | expo-av once switched the shared session to Ambient (muted by the silent switch); calls and Siri left the engine silent. | none; keeps sound coming |
+| 5 | **Session safeguard and recovery (0.5.2+).** On `AVAudioSessionRouteChangeNotification` with reason `CategoryChange`, if the category is not Playback/PlayAndRecord, re-assert Playback + MixWithOthers (re-entrancy guarded, counted). On interruption end, reactivate the session and restart the device if stopped. On media-services reset (or a device whose callback has stalled), tear down and set up again with the last options, keeping synth settings and transport state. Fields `interruptionCount`, `mediaResetCount`, `lastRecoveryError`, `engineState`. | expo-av once switched the shared session to Ambient (muted by the silent switch); calls and Siri left the engine silent. | none; keeps sound coming |
 | 6 | **Attack default 10 → 2 ms (0.5.2+).** App can override with `setAttack`. | Percussive onset; 2 ms is still click-free. | up to ≈ 8 ms to full level (perceived) |
 | 7 | App: `setup({ bufferSize: 128, sampleRate: 48000 })` (0.5.2+). | Uses change 1. | — |
-| 8 | App: Thumbboard pads and Keyboard keys trigger through `JucePadView` when the binary has it, falling back to `Pressable` on older binaries (0.5.2+). | Uses change 3. | — |
+| 8 | App: pads and keyboard keys trigger through `JucePadView` when `isJucePadViewAvailable()` is true, falling back to `Pressable` on older binaries (0.5.2+). | Uses change 3. | — |
 | 9 | App: panel shows `lastTouchToRenderMs` and actual vs preferred buffer; the latency stage uses touch→render + I/O + output when available (0.5.2+). | Honest estimate for the native path. | — |
 
 Expected panel estimate after the work on the same device and speaker:
@@ -110,14 +106,16 @@ Of the `JucePadView` touch path (change 3):
 - **Pads tapped before `setup()` completes are silent** on the native path (the engine drops
   notes until it is ready; nothing is queued for later).
 
-## 5. Reading the diagnostics panel
+## 5. A diagnostics panel
 
-Open it by **long-pressing the "BEEPER STUDIO" title** on the Dashboard (600 ms; works in
-release builds). It polls `getDiagnostics()` four times a second and shows a nine-stage
-ladder; each stage is `pass`, `FAIL` or `?` (not enough data yet). Buttons: **Test tone**
-(440 Hz for 500 ms mixed straight into the device output, bypassing graph and synth),
-**Play C4**, **Re-run setup**, **Copy JSON** (opens the share sheet with the full snapshot —
-attach it to bug reports).
+expo-juce supplies the data (`getDiagnostics()`, `playTestTone()`); the panel itself lives in
+the app. The layout below is the one the measurements in this guide were taken with, and a
+good template: a debug screen, reachable in release builds (e.g. a hidden long-press), that
+polls `getDiagnostics()` four times a second and shows a nine-stage ladder; each stage is
+`pass`, `FAIL` or `?` (not enough data yet). Buttons: **Test tone** (`playTestTone(500)`:
+440 Hz mixed straight into the device output, bypassing graph and synth), **Play C4**,
+**Re-run setup**, **Copy JSON** (share sheet with the full snapshot — attach it to bug
+reports).
 
 | # | Stage | Fields | Read it as |
 |---|---|---|---|
@@ -133,7 +131,7 @@ attach it to bug reports).
 
 Latency rows:
 
-- **js press→call** — `lastPressToNoteOnMs`: `markPress()` in `onPressIn` to the native `noteOn`
+- **js press→call** — app-side: a timestamp taken in `onPressIn` to the native `noteOn`
   call. "(deferred)" means the note waited for setup; ignore that sample.
 - **note→render** — `lastNoteToRenderMs`: `noteOn` enqueue to the synth consuming it at
   the start of a block (segment 3). Bounded by one buffer.
@@ -175,7 +173,7 @@ Measures finger contact → sound, the only figure that includes the digitizer a
    Playback session, but write it down.
 3. Volume about 75 %. Built-in speaker unless you are testing another route; **disconnect
    Bluetooth** (Control Centre) so the route cannot change mid-run.
-4. Open the Dashboard, select pads, choose a high-contrast pad (the lit pad colour against the
+4. Open the screen with the pads and choose a high-contrast pad (the lit pad colour against the
    dark background is easy to see). Set waveform to square or saw for a sharp onset; leave
    attack at the default and note its value.
 5. Open the diagnostics panel once, check stage 3 shows `Speaker` and the buffer you expect,
@@ -277,9 +275,10 @@ interruption recovery — re-run setup from the panel or restart the app. With 0
 `interruptionCount` / `mediaResetCount` moved and `lastRecoveryError` is empty.
 
 **Category shows Ambient / silent switch mutes the synth.** Another audio library changed the
-shared session. BeeperNative calls `configureAudio()` (expo-av `playsInSilentModeIOS: true`) at
-startup for this reason; with 0.5.2+ expo-juce re-asserts Playback and counts it in
-`sessionReassertCount`.
+shared session. If the app also uses expo-av, call
+`Audio.setAudioModeAsync({ playsInSilentModeIOS: true })` at startup (expo-av's default sets
+Ambient as soon as it plays anything, even a muted `<Video>`); with 0.5.2+ expo-juce also
+re-asserts Playback and counts it in `sessionReassertCount`.
 
 **No click visible in the audio-only method.** Fingertip taps on glass are quiet; use a
 capacitive stylus, move the mic closer, or use the video method.

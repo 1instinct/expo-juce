@@ -4,7 +4,7 @@
 
 typedef void(^BeatCallback)(double beat, double bpm);
 
-@interface BeeperAudioEngine : NSObject
+@interface ExpoJuceAudioEngine : NSObject
 
 + (instancetype)sharedInstance;
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(beeper_audio_harness CXX)
+project(expo_juce_audio_harness CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

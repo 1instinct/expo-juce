@@ -27,7 +27,7 @@ expo-juce/
 ├── ios/                          # iOS native implementation
 │   ├── ExpoJuceModule.swift      # Expo Module definition
 │   ├── ExpoJuceBridge.h/m        # Objective-C wrapper
-│   ├── BeeperAudioEngine.h/mm    # Top-level JUCE coordinator
+│   ├── ExpoJuceAudioEngine.h/mm    # Top-level JUCE coordinator
 │   ├── PolySynthProcessor.h/mm   # 8-voice AudioProcessor
 │   ├── Voice.h/mm                # Single synth voice (osc+filter+ADSR)
 │   ├── VoiceAllocator.h/mm       # Note-to-voice mapping + stealing
@@ -52,7 +52,7 @@ ExpoJuceModule.swift
     ↓ calls
 ExpoJuceBridge.m (Obj-C wrapper)
     ↓ calls
-BeeperAudioEngine.mm (JUCE coordinator)
+ExpoJuceAudioEngine.mm (JUCE coordinator)
     ↓ owns
 AudioDeviceManager → AudioProcessorPlayer → AudioProcessorGraph
     ↓ contains
@@ -63,7 +63,7 @@ Voice[8] + VoiceAllocator + TransportEngine
 
 ## Core Components
 
-### 1. BeeperAudioEngine (`BeeperAudioEngine.mm`)
+### 1. ExpoJuceAudioEngine (`ExpoJuceAudioEngine.mm`)
 - **Purpose**: Top-level JUCE audio stack coordinator
 - **Technology**: JUCE AudioDeviceManager + AudioProcessorGraph
 - **Features**:
@@ -96,7 +96,7 @@ Voice[8] + VoiceAllocator + TransportEngine
 ### 5. Objective-C Bridge (`ExpoJuceBridge`)
 - **Purpose**: Simplify Swift ↔ Objective-C++ interop
 - **Why Needed**: Swift cannot directly import Objective-C++ headers
-- **Pattern**: Thin wrapper forwarding to BeeperAudioEngine singleton
+- **Pattern**: Thin wrapper forwarding to ExpoJuceAudioEngine singleton
 
 ### 6. Expo Module (`ExpoJuceModule.swift`)
 - **Purpose**: Define JavaScript API using Expo Modules DSL
@@ -137,7 +137,7 @@ Voice[8] + VoiceAllocator + TransportEngine
 3. **Native Bridge**:
    - Add Swift function in `ExpoJuceModule.swift` (AsyncFunction + .runOnQueue(.main))
    - Add Objective-C wrapper in `ExpoJuceBridge.m`
-   - Add forwarding in `BeeperAudioEngine.mm`
+   - Add forwarding in `ExpoJuceAudioEngine.mm`
 
 ### Code Style
 

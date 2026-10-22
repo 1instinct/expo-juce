@@ -1,4 +1,4 @@
-#import "BeeperAudioEngine.h"
+#import "ExpoJuceAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #include "JuceConfig.h"
@@ -31,7 +31,7 @@ static const int64_t kDeadDeviceCheckMs = 150; // callbackCount must advance wit
 static const int64_t kRebuildRetryDelayMs = 1000;
 static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt + 2 retries, then "failed"
 
-@interface BeeperAudioEngine ()
+@interface ExpoJuceAudioEngine ()
 @property (nonatomic, assign) bool isReady;
 @property (nonatomic, readwrite) int setupStep;
 @property (atomic, readwrite, copy) NSString *lastError;
@@ -122,8 +122,8 @@ static bool acquireUserLock(std::unique_lock<std::mutex>& lock) {
 }
 
 // Runs `body` with sSynth under sEngineLock (no-op if dropped or not ready). `body` must not
-// call any BeeperAudioEngine method that takes the lock.
-static void withSynth(BeeperAudioEngine *engine, void (^body)(PolySynthProcessor *synth)) {
+// call any ExpoJuceAudioEngine method that takes the lock.
+static void withSynth(ExpoJuceAudioEngine *engine, void (^body)(PolySynthProcessor *synth)) {
     std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
     if (!acquireUserLock(lock)) return;
     if (!engine.isReady || !sSynth) return;
@@ -131,17 +131,17 @@ static void withSynth(BeeperAudioEngine *engine, void (^body)(PolySynthProcessor
 }
 
 // Runs `body` with sTransport under sEngineLock (no-op if dropped or not ready). Same rule.
-static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngine *transport)) {
+static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEngine *transport)) {
     std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
     if (!acquireUserLock(lock)) return;
     if (!engine.isReady || !sTransport) return;
     body(sTransport);
 }
 
-@implementation BeeperAudioEngine
+@implementation ExpoJuceAudioEngine
 
 + (instancetype)sharedInstance {
-    static BeeperAudioEngine *instance = nil;
+    static ExpoJuceAudioEngine *instance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         instance = [[self alloc] init];
@@ -166,14 +166,14 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
 - (BOOL)setupWithBufferSize:(int)bufferSize sampleRate:(double)sampleRate {
     if (![NSThread isMainThread]) {
-        NSLog(@"[BeeperAudioEngine] ERROR: setup() called off main thread, dispatching to main");
+        NSLog(@"[ExpoJuceAudioEngine] ERROR: setup() called off main thread, dispatching to main");
         __block BOOL ok = NO;
         dispatch_sync(dispatch_get_main_queue(), ^{ ok = [self setupWithBufferSize:bufferSize sampleRate:sampleRate]; });
         return ok;
     }
 
     if (self.isReady) {
-        NSLog(@"[BeeperAudioEngine] Already initialized, skipping");
+        NSLog(@"[ExpoJuceAudioEngine] Already initialized, skipping");
         return YES;
     }
 
@@ -208,7 +208,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     @try {
         [self doSetup];
     } @catch (NSException *exception) {
-        NSLog(@"[BeeperAudioEngine] EXCEPTION in setup: %@ — %@", exception.name, exception.reason);
+        NSLog(@"[ExpoJuceAudioEngine] EXCEPTION in setup: %@ — %@", exception.name, exception.reason);
         [self noteFatal:[NSString stringWithFormat:@"exception %@: %@", exception.name, exception.reason]];
         [self teardownEngineLocked];
     }
@@ -221,7 +221,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 // Records a problem that does not abort setup (behaviour unchanged), so that
 // diagnostics can still surface it. Appends to lastError.
 - (void)noteNonFatal:(NSString *)message {
-    NSLog(@"[BeeperAudioEngine] %@", message);
+    NSLog(@"[ExpoJuceAudioEngine] %@", message);
     self.lastError = self.lastError ? [NSString stringWithFormat:@"%@; %@", self.lastError, message] : message;
 }
 
@@ -233,11 +233,11 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 // Caller holds sEngineLock (via setupEngineLocked).
 - (void)doSetup {
     self.setupStep = 0;
-    NSLog(@"[BeeperAudioEngine] Step 0: initialiseJuce_GUI");
+    NSLog(@"[ExpoJuceAudioEngine] Step 0: initialiseJuce_GUI");
     juce::initialiseJuce_GUI();
 
     self.setupStep = 1;
-    NSLog(@"[BeeperAudioEngine] Step 1: AVAudioSession (Playback)");
+    NSLog(@"[ExpoJuceAudioEngine] Step 1: AVAudioSession (Playback)");
     NSError *sessionError = nil;
     NSError *activationError = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
@@ -245,11 +245,11 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
              withOptions:AVAudioSessionCategoryOptionMixWithOthers
                    error:&sessionError];
     if (sessionError) {
-        NSLog(@"[BeeperAudioEngine] AVAudioSession category error: %@", sessionError);
+        NSLog(@"[ExpoJuceAudioEngine] AVAudioSession category error: %@", sessionError);
     }
     [session setActive:YES error:&activationError];
     if (activationError) {
-        NSLog(@"[BeeperAudioEngine] AVAudioSession activation error: %@", activationError);
+        NSLog(@"[ExpoJuceAudioEngine] AVAudioSession activation error: %@", activationError);
     }
     // Non-fatal (setup continues, as before); recorded so diagnostics can show it.
     if (sessionError) {
@@ -279,18 +279,18 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     }
 
     self.setupStep = 2;
-    NSLog(@"[BeeperAudioEngine] Step 2: TransportEngine");
+    NSLog(@"[ExpoJuceAudioEngine] Step 2: TransportEngine");
     sTransport = new TransportEngine();
 
     self.setupStep = 3;
-    NSLog(@"[BeeperAudioEngine] Step 3: AudioDeviceManager");
+    NSLog(@"[ExpoJuceAudioEngine] Step 3: AudioDeviceManager");
     sDeviceManager = new juce::AudioDeviceManager();
 
     self.setupStep = 4;
-    NSLog(@"[BeeperAudioEngine] Step 4: initialise(0, 2)");
+    NSLog(@"[ExpoJuceAudioEngine] Step 4: initialise(0, 2)");
     juce::String error = sDeviceManager->initialise(0, 2, nullptr, true);
     if (error.isNotEmpty()) {
-        NSLog(@"[BeeperAudioEngine] AudioDeviceManager init failed: %s", error.toRawUTF8());
+        NSLog(@"[ExpoJuceAudioEngine] AudioDeviceManager init failed: %s", error.toRawUTF8());
         NSString *message = [NSString stringWithUTF8String:error.toRawUTF8()];
         [self noteFatal:[NSString stringWithFormat:@"AudioDeviceManager::initialise failed: %@",
                          message ?: @"(unprintable error)"]];
@@ -310,29 +310,29 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     double sr = sDeviceManager->getAudioDeviceSetup().sampleRate;
     int bufSize = sDeviceManager->getAudioDeviceSetup().bufferSize;
     self.setupStep = 5;
-    NSLog(@"[BeeperAudioEngine] Step 5: AudioProcessorGraph (sr=%.0f, buf=%d)", sr, bufSize);
+    NSLog(@"[ExpoJuceAudioEngine] Step 5: AudioProcessorGraph (sr=%.0f, buf=%d)", sr, bufSize);
 
     sGraph = new juce::AudioProcessorGraph();
     sGraph->setPlayConfigDetails(0, 2, sr, bufSize);
 
     self.setupStep = 6;
-    NSLog(@"[BeeperAudioEngine] Step 6: PolySynthProcessor");
+    NSLog(@"[ExpoJuceAudioEngine] Step 6: PolySynthProcessor");
     auto synthProcessor = std::make_unique<PolySynthProcessor>();
     sSynth = synthProcessor.get();
     sSynth->setTransport(sTransport);
 
     self.setupStep = 7;
-    NSLog(@"[BeeperAudioEngine] Step 7: addNode (synth)");
+    NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth)");
     auto synthNode = sGraph->addNode(std::move(synthProcessor));
 
     self.setupStep = 8;
-    NSLog(@"[BeeperAudioEngine] Step 8: addNode (output)");
+    NSLog(@"[ExpoJuceAudioEngine] Step 8: addNode (output)");
     auto outputNode = sGraph->addNode(
         std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
             juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
 
     self.setupStep = 9;
-    NSLog(@"[BeeperAudioEngine] Step 9: connections");
+    NSLog(@"[ExpoJuceAudioEngine] Step 9: connections");
     bool connectedL = sGraph->addConnection({{synthNode->nodeID, 0}, {outputNode->nodeID, 0}});
     bool connectedR = sGraph->addConnection({{synthNode->nodeID, 1}, {outputNode->nodeID, 1}});
     if (!connectedL || !connectedR) {
@@ -341,17 +341,17 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     }
 
     self.setupStep = 10;
-    NSLog(@"[BeeperAudioEngine] Step 10: prepareToPlay");
+    NSLog(@"[ExpoJuceAudioEngine] Step 10: prepareToPlay");
     sGraph->prepareToPlay(sr, bufSize);
 
     self.setupStep = 11;
-    NSLog(@"[BeeperAudioEngine] Step 11: GraphPlayer + addAudioCallback");
+    NSLog(@"[ExpoJuceAudioEngine] Step 11: GraphPlayer + addAudioCallback");
     sPlayer = new GraphPlayer();
     sPlayer->setProcessor(sGraph);
     sDeviceManager->addAudioCallback(sPlayer);
 
     self.isReady = true;
-    NSLog(@"[BeeperAudioEngine] DONE — audio stack initialized (sr=%.0f, buf=%d)", sr, bufSize);
+    NSLog(@"[ExpoJuceAudioEngine] DONE — audio stack initialized (sr=%.0f, buf=%d)", sr, bufSize);
 }
 
 // Asks the open device for the preferred sample rate / buffer size through JUCE, so JUCE's own
@@ -381,7 +381,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     juce::AudioDeviceManager::AudioDeviceSetup wanted = original;
     wanted.sampleRate = sampleRate;
     wanted.bufferSize = chosen;
-    NSLog(@"[BeeperAudioEngine] Step 4: setAudioDeviceSetup(sr=%.0f, buf=%d; requested %d)", sampleRate, chosen, bufferSize);
+    NSLog(@"[ExpoJuceAudioEngine] Step 4: setAudioDeviceSetup(sr=%.0f, buf=%d; requested %d)", sampleRate, chosen, bufferSize);
     const juce::String error = sDeviceManager->setAudioDeviceSetup(wanted, true);
     if (error.isEmpty()) return;
 
@@ -401,7 +401,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
 // Main thread, caller holds sEngineLock. Deletes everything doSetup built (any subset).
 - (void)teardownEngineLocked {
-    NSLog(@"[BeeperAudioEngine] Tearing down engine...");
+    NSLog(@"[ExpoJuceAudioEngine] Tearing down engine...");
     self.isReady = false;
     if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
     delete sPlayer; sPlayer = nullptr;
@@ -440,14 +440,14 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     self.hasRecoveryState = NO;
     if (!self.isReady) return;
 
-    NSLog(@"[BeeperAudioEngine] Shutting down...");
+    NSLog(@"[ExpoJuceAudioEngine] Shutting down...");
     [self stopBeatTimer];
     {
         LifecycleLock lifecycle;
         if (sSynth) sSynth->allNotesOff();
         [self teardownEngineLocked];
     }
-    NSLog(@"[BeeperAudioEngine] Shutdown complete");
+    NSLog(@"[ExpoJuceAudioEngine] Shutdown complete");
 }
 
 // ── Session safeguard + recovery ──
@@ -491,7 +491,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 }
 
 - (void)noteRecoveryError:(NSString *)message {
-    NSLog(@"[BeeperAudioEngine] recovery: %@", message);
+    NSLog(@"[ExpoJuceAudioEngine] recovery: %@", message);
     self.lastRecoveryError = message;
 }
 
@@ -500,7 +500,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     if (reasonValue == nil) return;
     const AVAudioSessionRouteChangeReason reason = (AVAudioSessionRouteChangeReason)reasonValue.unsignedIntegerValue;
     if (reason != AVAudioSessionRouteChangeReasonCategoryChange) return;
-    __weak BeeperAudioEngine *weakSelf = self;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         [weakSelf reassertSessionCategoryIfNeeded];
     });
@@ -519,7 +519,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
     self.isReassertingSession = YES;
     self.sessionReassertCount = self.sessionReassertCount + 1;
-    NSLog(@"[BeeperAudioEngine] session category changed to %@; re-asserting Playback", category);
+    NSLog(@"[ExpoJuceAudioEngine] session category changed to %@; re-asserting Playback", category);
 
     NSError *categoryError = nil;
     [session setCategory:AVAudioSessionCategoryPlayback
@@ -544,13 +544,13 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     NSNumber *typeValue = notification.userInfo[AVAudioSessionInterruptionTypeKey];
     if (typeValue == nil) return;
     const AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)typeValue.unsignedIntegerValue;
-    __weak BeeperAudioEngine *weakSelf = self;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
     if (type == AVAudioSessionInterruptionTypeBegan) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            BeeperAudioEngine *strongSelf = weakSelf;
+            ExpoJuceAudioEngine *strongSelf = weakSelf;
             if (strongSelf == nil) return;
             strongSelf.interruptionCount = strongSelf.interruptionCount + 1;
-            NSLog(@"[BeeperAudioEngine] audio session interruption began");
+            NSLog(@"[ExpoJuceAudioEngine] audio session interruption began");
         });
     } else if (type == AVAudioSessionInterruptionTypeEnded) {
         // Resume whether or not the system set AVAudioSessionInterruptionOptionShouldResume:
@@ -566,7 +566,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 // Main thread.
 - (void)recoverFromInterruption {
     if (!self.isReady || sDeviceManager == nullptr) return;
-    NSLog(@"[BeeperAudioEngine] audio session interruption ended; reactivating");
+    NSLog(@"[ExpoJuceAudioEngine] audio session interruption ended; reactivating");
     NSError *activationError = nil;
     [[AVAudioSession sharedInstance] setActive:YES error:&activationError];
     if (activationError) {
@@ -578,7 +578,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 }
 
 - (void)handleAppDidBecomeActive:(NSNotification *)notification {
-    __weak BeeperAudioEngine *weakSelf = self;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         [weakSelf scheduleDeadDeviceCheck:@"app became active"];
     });
@@ -594,7 +594,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     if (!self.isReady || self.isRecovering || sPlayer == nullptr) return;
     GraphPlayer *player = sPlayer;
     const uint64_t before = player->callbackCount.load(std::memory_order_relaxed);
-    __weak BeeperAudioEngine *weakSelf = self;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDeadDeviceCheckMs * (int64_t)NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
         [weakSelf checkDeviceProgress:player since:before context:context restarted:NO];
@@ -613,7 +613,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
     if (!restarted) {
         sDeadDeviceRestarts.fetch_add(1, std::memory_order_relaxed);
-        NSLog(@"[BeeperAudioEngine] audio callback stalled after %@; reopening device", context);
+        NSLog(@"[ExpoJuceAudioEngine] audio callback stalled after %@; reopening device", context);
         {
             LifecycleLock lifecycle;
             if (sDeviceManager->getCurrentAudioDevice() != nullptr)
@@ -621,7 +621,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
             sDeviceManager->restartLastAudioDevice();
         }
         const uint64_t afterRestart = player->callbackCount.load(std::memory_order_relaxed);
-        __weak BeeperAudioEngine *weakSelf = self;
+        __weak ExpoJuceAudioEngine *weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDeadDeviceCheckMs * (int64_t)NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             [weakSelf checkDeviceProgress:player since:afterRestart context:context restarted:YES];
@@ -646,7 +646,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     if (!self.isReady || sDeviceManager == nullptr) return;
     if ([self isDeviceRunning]) return;
 
-    NSLog(@"[BeeperAudioEngine] device not running after %@; reopening", context);
+    NSLog(@"[ExpoJuceAudioEngine] device not running after %@; reopening", context);
     {
         LifecycleLock lifecycle;
         if (sDeviceManager->getCurrentAudioDevice() != nullptr)
@@ -660,11 +660,11 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 }
 
 - (void)handleSessionMediaServicesReset:(NSNotification *)notification {
-    __weak BeeperAudioEngine *weakSelf = self;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
     // Delayed so JUCE's own handler has finished with the old device before it is deleted.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kRecoveryDelayMs * (int64_t)NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
-        BeeperAudioEngine *strongSelf = weakSelf;
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
         if (strongSelf == nil) return;
         strongSelf.mediaResetCount = strongSelf.mediaResetCount + 1;
         [strongSelf rebuildEngine:@"media services reset"];
@@ -694,7 +694,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     self.isRecovering = YES;
     self.rebuildRetryPending = NO;
     self.rebuildAttempts = self.rebuildAttempts + 1;
-    NSLog(@"[BeeperAudioEngine] rebuilding engine (%@), attempt %d", context, self.rebuildAttempts);
+    NSLog(@"[ExpoJuceAudioEngine] rebuilding engine (%@), attempt %d", context, self.rebuildAttempts);
 
     // Beat timer stop is main-thread work outside the lock; it also clears beatCallback.
     [self stopBeatTimer];
@@ -734,10 +734,10 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     self.rebuildRetryPending = YES;
     self.isRecovering = NO;
     const int generation = self.recoveryGeneration;
-    __weak BeeperAudioEngine *weakSelf = self;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kRebuildRetryDelayMs * (int64_t)NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
-        BeeperAudioEngine *strongSelf = weakSelf;
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
         if (strongSelf == nil) return;
         // Cancelled by shutdown or superseded by an explicit setup.
         if (!strongSelf.rebuildRetryPending || strongSelf.recoveryGeneration != generation) return;
@@ -966,7 +966,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
 - (void)startBeatTimer {
     if (![NSThread isMainThread]) {
-        __weak BeeperAudioEngine *weakSelf = self;
+        __weak ExpoJuceAudioEngine *weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf startBeatTimer]; });
         return;
     }
@@ -975,9 +975,9 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
     self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
-    __weak BeeperAudioEngine *weakSelf = self;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
     dispatch_source_set_event_handler(self.beatTimer, ^{
-        BeeperAudioEngine *strongSelf = weakSelf;
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
         if (!strongSelf || !sSynth) return;
         BeatCallback cb = strongSelf.beatCallback;
         if (sSynth->beatState.crossed.exchange(false) && cb) {
@@ -989,7 +989,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
 - (void)stopBeatTimer {
     if (![NSThread isMainThread]) {
-        __weak BeeperAudioEngine *weakSelf = self;
+        __weak ExpoJuceAudioEngine *weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf stopBeatTimer]; });
         return;
     }

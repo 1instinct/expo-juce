@@ -4,17 +4,11 @@ Realtime DSP w/C++ & JUCE
 
 expo-juce embeds [JUCE](https://juce.com) 8 in an Expo / React Native app as an Expo
 module: a JUCE-owned audio device drives an `AudioProcessorGraph` with an 8-voice
-polyphonic synth and a transport, controlled from JS through synchronous JSI calls. It is
-the sound engine of the Beeper app ([BeeperNative](https://github.com/Beeper-Buzz/BeeperNative)).
+polyphonic synth and a transport, controlled from JS through synchronous JSI calls.
 iOS only for now; the Android and web modules are scaffolds.
 
-Terms used below are explained in the
-[BeeperNative glossary](https://github.com/Beeper-Buzz/BeeperNative/blob/@aaron.smulktis/develop/GLOSSARY.md)
-(lands on that branch when `debug/audio-diagnostics` is merged).
-
 > **Branches.** `main` is a stale scaffold. Current work is on `@aaron.smulktis/develop`;
-> the diagnostics and latency work is on `debug/audio-diagnostics`. The GitHub repo is
-> `1instinct/expo-juce` (`package.json` still names `Beeper-buzz/expo-juce`).
+> the diagnostics and latency work is on `debug/audio-diagnostics`.
 
 ## Architecture
 
@@ -25,7 +19,7 @@ Terms used below are explained in the
         │
  ExpoJuceBridge (ObjC)      plain ObjC surface for Swift
         │
- BeeperAudioEngine (ObjC++) AVAudioSession Playback + MixWithOthers; setup steps 0–11 on main thread
+ ExpoJuceAudioEngine (ObjC++) AVAudioSession Playback + MixWithOthers; setup steps 0–11 on main thread
         │
  juce::AudioDeviceManager ─► GraphPlayer (AudioIODeviceCallback: graph, peaks, NaNs, test tone)
         │
@@ -47,7 +41,7 @@ Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack buil
 ### Diagnostics, recovery and latency
 **Status:** Diagnostics done (0.5.2-diag.x); recovery and latency margin in 0.5.2 — see the [latency guide](docs/latency.md)
 
-`setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. 0.5.2 adds: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (restoring what was lost with `JuceToneGenerator`).
+`setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. 0.5.2 adds: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (keeping synth settings and transport state across rebuilds).
 
 ### Sub-project 2: Effects Chain
 **Status:** Planned
@@ -55,7 +49,7 @@ Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack buil
 Add `AudioProcessor` nodes for standard effects: reverb, delay, distortion, EQ, compressor. Inserted into the graph after the synth node on a master effects bus. Each effect is an independent processor — can be bypassed, reordered, or removed.
 
 ### Sub-project 3: Sample Playback / Drum Machine
-**Status:** Planned — the old app's `BeeperSampler` and its four WAVs are the starting point (salvage inventory)
+**Status:** Planned — an earlier JUCE sampler prototype is the starting point
 
 `SamplerProcessor` node that loads audio files and triggers playback via `noteOn`. Supports multi-sample mapping (e.g., different samples per MIDI note). Integrates with the transport for sequenced playback.
 
@@ -161,8 +155,11 @@ Check the shipped type definitions for the exact event payloads once 0.5.2 is pu
 (`lastNoteToRenderMs`) and the AVAudioSession state (`sessionCategory`, `sessionSampleRate`,
 `sessionIOBufferMs`, `sessionOutputLatencyMs`, `otherAudioPlaying`, `routeOutputs`). 0.5.2+ adds
 `lastTouchToRenderMs`, `preferredBufferSize`, `preferredSampleRate`, `sessionReassertCount`, `interruptionCount`,
-`mediaResetCount`, `lastRecoveryError`. BeeperNative's diagnostics panel shows them as a
-pass/fail ladder — see [docs/latency.md](docs/latency.md#5-reading-the-diagnostics-panel).
+`mediaResetCount`, `lastRecoveryError`, `engineState`. A debug screen in the app can show them
+as a pass/fail ladder — see [docs/latency.md](docs/latency.md#5-a-diagnostics-panel).
+
+Synth settings and transport state (tempo, position, playing) survive the engine's automatic
+rebuilds after a media-services reset or a stalled device; held notes do not.
 
 ## Latency
 
@@ -182,7 +179,7 @@ expo-juce/
 │   └── juce_modules/        # Vendored JUCE 8.0.1 modules
 ├── android/                 # Kotlin scaffold (no audio engine yet)
 ├── test/harness/            # Offline JUCE graph harness (WSL, CMake)
-├── example/                 # Old example app (Expo 51, pinned expo-juce 0.1.1) — stale; BeeperNative is the reference app
+├── example/                 # Old example app (Expo 51, pinned expo-juce 0.1.1) — stale
 ├── docs/
 │   └── latency.md           # Latency guide and measurement procedure
 └── package.json
@@ -203,23 +200,26 @@ npm publish --tag diag --ignore-scripts                            # npm 2FA cod
 `--ignore-scripts` skips `prepublishOnly`, so step 1's build is mandatory. Prereleases go
 under a dist-tag (`diag`) so `latest` is not moved.
 
-Then in BeeperNative: `npm install expo-juce@<version> --save-exact`, check that
-`package-lock.json` still has the `@sentry/cli-darwin` entry, and run a new EAS build (EAS
+Then in the consuming app: `npm install expo-juce@<version> --save-exact`, check that
+`package-lock.json` still has its macOS-only optional entries (a lockfile regenerated on
+Windows can drop them, and EAS's `npm ci` on macOS then fails), and run a new EAS build (EAS
 cannot resolve `file:` dependencies, which is why every native change goes through npm).
 
 ### Verifying without Xcode
 
-1. **TypeScript:** `npx tsc --noEmit` here and in BeeperNative.
+1. **TypeScript:** `npx tsc --noEmit` here and in the consuming app.
 2. **Engine C++:** the offline harness compiles the vendored JUCE headless with `Voice`,
    `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor` and a copy of `GraphPlayer`, replays the
-   `doSetup` order and drives the callback with iOS-like block sizes:
+   `doSetup` order and drives the callback with iOS-like block sizes. From `test/harness` in
+   WSL (or any Linux shell):
    ```sh
-   wsl -e bash -lc "cd /mnt/c/Users/aaron/Internal/Beeper/code/expo-juce/test/harness && cmake -S . -B build && cmake --build build -j16 && ./build/harness"
+   cmake -S . -B build && cmake --build build -j16 && ./build/harness
    ```
    See [test/harness/README.md](test/harness/README.md) (case `g2` is an expected-FAIL negative
    control). Extend it for every new graph node.
 3. **ObjC++ / Swift:** careful review (no compiler locally); the EAS build is the first compile.
-4. **Device:** BeeperNative's diagnostics panel (long-press BEEPER STUDIO), then the slow-motion
+4. **Device:** a diagnostics panel built on `getDiagnostics()`
+   ([docs/latency.md](docs/latency.md#5-a-diagnostics-panel)), then the slow-motion
    measurement in [docs/latency.md](docs/latency.md#6-slow-motion-measurement-procedure).
 
 ### JUCE vendoring
@@ -232,7 +232,7 @@ its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the m
 ## Documentation
 
 - [docs/latency.md](docs/latency.md) — latency budget, signal path, changes, panel fields, slow-motion measurement
-- [BeeperNative README](https://github.com/Beeper-Buzz/BeeperNative/blob/@aaron.smulktis/develop/README.md) and [GLOSSARY](https://github.com/Beeper-Buzz/BeeperNative/blob/@aaron.smulktis/develop/GLOSSARY.md) — the app and its vocabulary (land on that branch when `debug/audio-diagnostics` is merged)
+- [test/harness/README.md](test/harness/README.md) — the offline engine harness
 
 ## License
 
