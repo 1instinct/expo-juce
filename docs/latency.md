@@ -98,6 +98,18 @@ Expected panel estimate after the work on the same device and speaker:
 ≈ 1.5–2.5 (touch→render) + 2.7 (I/O) + 15.4 (output) ≈ **20 ms**, with the acoustic figure
 ≈ 8–16 ms higher because of segment 1. On wired headphones both drop by roughly 10 ms.
 
+### Known trade-offs
+
+Of the `JucePadView` touch path (change 3):
+
+- **Drag inside a ScrollView cuts the note.** A drag of about 10 pt makes the enclosing
+  `UIScrollView` take the gesture and cancel its content touches; the pad gets
+  `touchesCancelled` and sends note off.
+- **No glissando.** A touch stays on the pad it started on; sliding onto a neighbouring pad
+  neither ends the first note nor starts the next.
+- **Pads tapped before `setup()` completes are silent** on the native path (the engine drops
+  notes until it is ready; nothing is queued for later).
+
 ## 5. Reading the diagnostics panel
 
 Open it by **long-pressing the "BEEPER STUDIO" title** on the Dashboard (600 ms; works in
