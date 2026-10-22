@@ -327,6 +327,59 @@ static MultiProducerResult runMultiProducer() {
     return r;
 }
 
+// Rebuild state carry-over: what the engine captures before a rebuild's teardown
+// (getSettings / getState) must come back identical on freshly built objects (applySettings /
+// restoreState), including a seek the audio thread has not applied yet.
+static bool runRebuildState() {
+    TransportEngine oldTransport;
+    PolySynthProcessor oldSynth;
+    oldSynth.setTransport(&oldTransport);
+    oldSynth.setRateAndBufferSizeDetails(48000, 256);
+    oldSynth.prepareToPlay(48000, 256);
+    oldSynth.setWaveform(Waveform::Saw);
+    oldSynth.setFilterCutoff(1234.0);
+    oldSynth.setFilterResonance(0.7);
+    oldSynth.setAttack(15.0);
+    oldSynth.setDecay(300.0);
+    oldSynth.setSustain(0.4);
+    oldSynth.setRelease(900.0);
+    oldSynth.setDetune(-25.0);
+    oldSynth.setMasterLevel(0.0); // muted: must not come back at the 0.5 default
+    oldTransport.setTempo(90.0);
+    oldTransport.start();
+    juce::AudioBuffer<float> buf(2, 256);
+    juce::MidiBuffer midi;
+    for (int b = 0; b < 40; ++b) oldSynth.processBlock(buf, midi); // position advances
+    const double played = oldTransport.getPosition();
+    oldTransport.setPosition(7.5); // seek not yet applied by the audio thread
+
+    const SynthSettings ss = oldSynth.getSettings();
+    const TransportState ts = oldTransport.getState();
+
+    TransportEngine newTransport;
+    PolySynthProcessor newSynth;
+    newSynth.setTransport(&newTransport);
+    newSynth.applySettings(ss);
+    newTransport.restoreState(ts);
+
+    const SynthSettings back = newSynth.getSettings();
+    const bool synthOk = back.waveform == static_cast<int>(Waveform::Saw) && back.filterCutoff == 1234.0f
+        && back.filterResonance == 0.7f && back.attackMs == 15.0f && back.decayMs == 300.0f
+        && back.sustainLevel == 0.4f && back.releaseMs == 900.0f && back.detuneCents == -25.0f
+        && back.masterLevel == 0.0f;
+    const bool transportOk = played > 0.0 && ts.position == 7.5 && newTransport.getTempo() == 90.0
+        && newTransport.isPlaying() && newTransport.getPosition() == 7.5;
+    newSynth.setRateAndBufferSizeDetails(48000, 256);
+    newSynth.prepareToPlay(48000, 256);
+    newSynth.processBlock(buf, midi);
+    const bool continuesOk = newTransport.getPosition() > 7.5 && newTransport.getPosition() < 7.6;
+    std::printf("rs    rebuild carry-over (settings, tempo 90, playing, pending seek)  %-4s synth %d transport %d"
+                " continues %d (pos %.4f)\n", synthOk && transportOk && continuesOk ? "PASS" : "FAIL",
+                synthOk, transportOk, continuesOk, newTransport.getPosition());
+    std::fflush(stdout);
+    return synthOk && transportOk && continuesOk;
+}
+
 int main() {
     // App: MessageManager::getInstance() in a static constructor on the main thread, then
     // juce::initialiseJuce_GUI() at doSetup step 0. Same thread here.
@@ -382,6 +435,7 @@ int main() {
                     mp.nans);
         std::fflush(stdout);
     }
+    unexpected += runRebuildState() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

@@ -23,6 +23,18 @@ void TransportEngine::start() { playing.store(true); }
 void TransportEngine::stop() { playing.store(false); }
 bool TransportEngine::isPlaying() { return playing.load(); }
 
+TransportState TransportEngine::getState() {
+    const double pending = pendingPosition.load();
+    return { bpm.load(), std::isnan(pending) ? positionSnapshot.load() : pending, playing.load() };
+}
+
+void TransportEngine::restoreState(const TransportState& s) {
+    setTempo(s.bpm);
+    positionSnapshot.store(s.position);
+    pendingPosition.store(s.position);
+    playing.store(s.playing);
+}
+
 bool TransportEngine::advanceBlock(int numSamples, double sampleRate) {
     double pending = pendingPosition.exchange(std::numeric_limits<double>::quiet_NaN());
     if (!std::isnan(pending)) {

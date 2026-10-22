@@ -55,6 +55,11 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 @property (nonatomic, assign) int recoveryGeneration;  // bumped to cancel scheduled retries
 @property (nonatomic, copy) BeatCallback recoveryBeatCallback; // beat callback kept across retries
 @property (nonatomic, assign) BOOL recoveryTimerWasRunning;
+// Synth settings + transport state taken before a rebuild's first teardown and kept across
+// failed attempts; restored when the engine is built again (by a retry or an explicit setup).
+@property (nonatomic, assign) BOOL hasRecoveryState;
+@property (nonatomic, assign) SynthSettings recoverySynthSettings;
+@property (nonatomic, assign) TransportState recoveryTransportState;
 @end
 
 // Raw pointers — no JUCE smart pointers at file scope.
@@ -179,6 +184,8 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     {
         LifecycleLock lifecycle;
         ok = [self setupEngineLocked];
+        // Setup after a failed rebuild (retry pending or given up) continues that recovery.
+        if (ok) [self restoreRecoveryStateLocked];
     }
     if (ok) {
         [self registerSessionObservers];
@@ -404,6 +411,24 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     delete sTransport; sTransport = nullptr;
 }
 
+// Main thread, caller holds sEngineLock. Snapshot of what the app configured (synth parameters,
+// tempo / position / play state), which a teardown would otherwise reset to the defaults.
+- (void)captureRecoveryStateLocked {
+    if (!sSynth || !sTransport) return;
+    self.recoverySynthSettings = sSynth->getSettings();
+    self.recoveryTransportState = sTransport->getState();
+    self.hasRecoveryState = YES;
+}
+
+// Main thread, caller holds sEngineLock, engine just built. Applied before the lock is
+// released, so no caller ever sees the defaults. Held notes are not replayed.
+- (void)restoreRecoveryStateLocked {
+    if (!self.hasRecoveryState || !sSynth || !sTransport) return;
+    sSynth->applySettings(self.recoverySynthSettings);
+    sTransport->restoreState(self.recoveryTransportState);
+    self.hasRecoveryState = NO;
+}
+
 - (void)shutdown {
     if (![NSThread isMainThread]) return;
     [self unregisterSessionObservers];
@@ -412,6 +437,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
     self.rebuildRetryPending = NO;
     self.engineFailed = NO;
     self.recoveryBeatCallback = nil;
+    self.hasRecoveryState = NO;
     if (!self.isReady) return;
 
     NSLog(@"[BeeperAudioEngine] Shutting down...");
@@ -647,13 +673,18 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
 
 // Main thread. Full teardown + setup with the last options, under one hold of sEngineLock (JS
 // callers are dropped meanwhile instead of seeing a half-built engine). Keeps the beat callback
-// and timer, and the session observers. On failure, retries every kRebuildRetryDelayMs up to
-// kMaxRebuildAttempts attempts in total, then reports engineState "failed".
+// and timer, the session observers, the synth settings and the transport state (tempo,
+// position, playing). On failure, retries every kRebuildRetryDelayMs up to kMaxRebuildAttempts
+// attempts in total, then reports engineState "failed".
 - (void)rebuildEngine:(NSString *)context {
     if (self.isRecovering || self.rebuildRetryPending) return;
     if (!self.isReady) return;
     self.recoveryBeatCallback = self.beatCallback;
     self.recoveryTimerWasRunning = (self.beatTimer != nil) ? YES : NO;
+    {
+        LifecycleLock lifecycle;
+        [self captureRecoveryStateLocked];
+    }
     self.rebuildAttempts = 0;
     [self performRebuildAttempt:context];
 }
@@ -673,6 +704,7 @@ static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngin
         if (sSynth) sSynth->allNotesOff();
         [self teardownEngineLocked];
         ok = [self setupEngineLocked];
+        if (ok) [self restoreRecoveryStateLocked];
     }
 
     if (ok) {

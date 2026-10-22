@@ -213,3 +213,23 @@ void PolySynthProcessor::setDetune(double cents) {
 void PolySynthProcessor::setMasterLevel(double level) {
     masterLevel.store((float)std::clamp(level, 0.0, 1.0));
 }
+
+SynthSettings PolySynthProcessor::getSettings() const {
+    // The envelope is stored per voice but always set on all of them; voice 0 holds it.
+    return { waveform.load(), filterCutoff.load(), filterResonance.load(),
+             voices[0].attackMs.load(), voices[0].decayMs.load(),
+             voices[0].sustainLevel.load(), voices[0].releaseMs.load(),
+             detuneCents.load(), masterLevel.load() };
+}
+
+void PolySynthProcessor::applySettings(const SynthSettings& s) {
+    setWaveform(static_cast<Waveform>(s.waveform));
+    setFilterCutoff(s.filterCutoff);
+    setFilterResonance(s.filterResonance);
+    setAttack(s.attackMs);
+    setDecay(s.decayMs);
+    setSustain(s.sustainLevel);
+    setRelease(s.releaseMs);
+    setDetune(s.detuneCents);
+    setMasterLevel(s.masterLevel);
+}

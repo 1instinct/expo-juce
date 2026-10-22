@@ -49,6 +49,15 @@ struct NoteEvent {
     juce::int64 touchTicks; // originating UITouch.timestamp in high-res ticks (same clock); 0 if not a touch
 };
 
+// Every user-settable synth parameter, as stored (after clamping). getSettings / applySettings
+// carry the configuration across an engine rebuild, which replaces the processor.
+struct SynthSettings {
+    int waveform;
+    float filterCutoff, filterResonance;
+    float attackMs, decayMs, sustainLevel, releaseMs;
+    float detuneCents, masterLevel;
+};
+
 class PolySynthProcessor : public juce::AudioProcessor {
 public:
     PolySynthProcessor();
@@ -90,6 +99,10 @@ public:
     void setRelease(double ms);
     void setDetune(double cents);
     void setMasterLevel(double level);
+
+    // Any thread (atomic loads / stores, same as the setters).
+    SynthSettings getSettings() const;
+    void applySettings(const SynthSettings& s);
 
     void setTransport(TransportEngine* t) { transport = t; }
     BeatState beatState;
