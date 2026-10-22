@@ -16,9 +16,10 @@ struct BeatState {
 };
 
 // Diagnostics counters. Written on the audio thread (except notesQueued and
-// notesDropped, which the noteOn producer writes), read from any thread. Relaxed
+// notesDropped, which the noteOn producers write), read from any thread. Relaxed
 // loads only; notesQueued is incremented before the release-store that publishes
-// the event, so a reader never sees notesConsumed > notesQueued.
+// the event, so a reader never sees notesConsumed > notesQueued. notesQueued counts
+// accepted NoteOns only: attempted NoteOns == notesQueued + notesDropped.
 struct SynthDiagnostics {
     std::atomic<uint64_t> processCount{0};
     std::atomic<float> peak{0.0f};                // decaying hold of block max |x|
@@ -37,7 +38,8 @@ inline float diagPeakDecay(int numSamples, double sampleRate) {
     return (float)std::exp(-(double)numSamples / (0.43 * sampleRate));
 }
 
-// Lock-free SPSC note event queue
+// Note event queue: multi-producer (main thread + JS thread, serialised by a spinlock),
+// single consumer (audio thread, lock-free).
 struct NoteEvent {
     enum Type : uint8_t { NoteOn, NoteOff, AllNotesOff };
     Type type;
@@ -71,7 +73,8 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
-    // Thread-safe: called from main thread, queued for audio thread.
+    // Thread-safe: callable from any number of threads (producers are serialised by
+    // producerLock), queued for the audio thread.
     // touchTicks: originating UITouch timestamp in juce::Time high-resolution ticks
     // (mach_absolute_time on Apple), or 0 when the note did not come from a touch.
     void noteOn(int note, int velocity, juce::int64 touchTicks = 0);
@@ -105,9 +108,12 @@ private:
     std::atomic<float> detuneCents{0.0f};
     std::atomic<float> masterLevel{0.5f};
 
-    // SPSC ring buffer for note events (main thread → audio thread)
+    // Ring buffer for note events (producers → audio thread). Producers (noteOn / noteOff /
+    // allNotesOff, from the main thread and the JS thread) hold producerLock while they
+    // write; the consumer (processBlock) never touches it.
     static constexpr int EVENT_QUEUE_SIZE = 256;
     NoteEvent eventQueue[EVENT_QUEUE_SIZE];
     std::atomic<int> eventWritePos{0};
     std::atomic<int> eventReadPos{0};
+    std::atomic_flag producerLock = ATOMIC_FLAG_INIT;
 };

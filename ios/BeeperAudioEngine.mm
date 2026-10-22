@@ -1,5 +1,6 @@
 #import "BeeperAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
+#import <UIKit/UIKit.h>
 #include "JuceConfig.h"
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
@@ -10,6 +11,8 @@
 #include <atomic>
 #include <cmath>
 #include <algorithm>
+#include <mutex>
+#include <thread>
 
 #include "GraphPlayer.h"
 
@@ -24,11 +27,14 @@ static void initJuceMessageManager() {
 static const int kDefaultBufferSize = 128;
 static const double kDefaultSampleRate = 48000.0;
 static const int64_t kRecoveryDelayMs = 300; // let JUCE's own session handlers run first
+static const int64_t kDeadDeviceCheckMs = 150; // callbackCount must advance within this window
+static const int64_t kRebuildRetryDelayMs = 1000;
+static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt + 2 retries, then "failed"
 
 @interface BeeperAudioEngine ()
 @property (nonatomic, assign) bool isReady;
 @property (nonatomic, readwrite) int setupStep;
-@property (nonatomic, readwrite, copy) NSString *lastError;
+@property (atomic, readwrite, copy) NSString *lastError;
 @property (nonatomic, copy) BeatCallback beatCallback;
 @property (nonatomic, strong) dispatch_source_t beatTimer;
 // Options of the last setup call (reused by media-services-reset recovery).
@@ -37,11 +43,18 @@ static const int64_t kRecoveryDelayMs = 300; // let JUCE's own session handlers 
 // Session safeguard / recovery (main thread only). Counters are cumulative since launch.
 @property (nonatomic, assign) BOOL observingSession;
 @property (nonatomic, assign) BOOL isReassertingSession;
-@property (nonatomic, assign) BOOL isRecovering;
+@property (atomic, assign) BOOL isRecovering;      // atomic: engineState is read off the main thread
 @property (nonatomic, assign) int sessionReassertCount;
 @property (nonatomic, assign) int interruptionCount;
 @property (nonatomic, assign) int mediaResetCount;
 @property (atomic, copy) NSString *lastRecoveryError; // atomic: diagnostics reads it off the main thread
+// Failed-rebuild retry state (main thread writes; atomic flags are read by diagnostics).
+@property (atomic, assign) BOOL rebuildRetryPending;   // a retry is scheduled
+@property (atomic, assign) BOOL engineFailed;          // setup failed / rebuild retries exhausted
+@property (nonatomic, assign) int rebuildAttempts;     // attempts in the current recovery
+@property (nonatomic, assign) int recoveryGeneration;  // bumped to cancel scheduled retries
+@property (nonatomic, copy) BeatCallback recoveryBeatCallback; // beat callback kept across retries
+@property (nonatomic, assign) BOOL recoveryTimerWasRunning;
 @end
 
 // Raw pointers — no JUCE smart pointers at file scope.
@@ -50,6 +63,75 @@ static GraphPlayer* sPlayer = nullptr;
 static juce::AudioProcessorGraph* sGraph = nullptr;
 static PolySynthProcessor* sSynth = nullptr;
 static TransportEngine* sTransport = nullptr;
+
+// ── Engine lifecycle lock ──
+// Guards the pointers above (and isReady) between the lifecycle code, which runs only on the
+// main thread and takes the lock blocking (setup / teardown / rebuild / device restart), and the
+// users that dereference them (JS thread, and JucePadView on the main thread).
+// Rules that keep it deadlock-free:
+//  - Lifecycle sections take it at exactly one level (setupWithBufferSize, shutdown, dead-device reopen,
+//    rebuild, device restart); everything they call under it is a *Locked helper that never
+//    locks. No ObjC method that takes the lock is called while it is held.
+//  - Users hold it only for a few atomic stores/loads; they never wait on the main thread or
+//    call a locking method while holding it.
+//  - Users on the main thread lock blocking (the main thread cannot be inside a lifecycle
+//    section at the same time, so the only other holder is a short user section). Users on
+//    other threads use try_lock: if the lifecycle holds it, the call is dropped (safe default
+//    returned) and counted in lockBusyDrops. A short user section on another thread is waited
+//    out with a bounded retry so a note-off is not dropped for a microsecond of contention.
+// The audio thread never takes this lock.
+static std::mutex sEngineLock;
+static std::atomic<bool> sLifecycleBusy{false};       // true while a lifecycle section holds sEngineLock
+static std::atomic<uint64_t> sLockBusyDrops{0};
+static std::atomic<uint64_t> sDeadDeviceRestarts{0};
+
+// RAII: holds sEngineLock for a lifecycle section (main thread, blocking) and flags it busy.
+struct LifecycleLock {
+    std::lock_guard<std::mutex> guard;
+    LifecycleLock() : guard(sEngineLock) { sLifecycleBusy.store(true, std::memory_order_relaxed); }
+    ~LifecycleLock() { sLifecycleBusy.store(false, std::memory_order_relaxed); }
+    LifecycleLock(const LifecycleLock&) = delete;
+    LifecycleLock& operator=(const LifecycleLock&) = delete;
+};
+
+// Acquires sEngineLock for a user call (see rules above). Returns false (and counts a drop) if
+// the lock could not be taken; the caller must then return its safe default.
+static bool acquireUserLock(std::unique_lock<std::mutex>& lock) {
+    if ([NSThread isMainThread]) {
+        // Lifecycle sections run only on the main thread, so a busy flag seen here means this is
+        // a re-entrant call from inside one (e.g. a nested run loop): locking would self-deadlock.
+        if (sLifecycleBusy.load(std::memory_order_relaxed)) {
+            sLockBusyDrops.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        lock.lock();
+        return true;
+    }
+    if (lock.try_lock()) return true;
+    for (int attempt = 0; attempt < 64 && !sLifecycleBusy.load(std::memory_order_relaxed); ++attempt) {
+        std::this_thread::yield();
+        if (lock.try_lock()) return true;
+    }
+    sLockBusyDrops.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+// Runs `body` with sSynth under sEngineLock (no-op if dropped or not ready). `body` must not
+// call any BeeperAudioEngine method that takes the lock.
+static void withSynth(BeeperAudioEngine *engine, void (^body)(PolySynthProcessor *synth)) {
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return;
+    if (!engine.isReady || !sSynth) return;
+    body(sSynth);
+}
+
+// Runs `body` with sTransport under sEngineLock (no-op if dropped or not ready). Same rule.
+static void withTransport(BeeperAudioEngine *engine, void (^body)(TransportEngine *transport)) {
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return;
+    if (!engine.isReady || !sTransport) return;
+    body(sTransport);
+}
 
 @implementation BeeperAudioEngine
 
@@ -92,16 +174,36 @@ static TransportEngine* sTransport = nullptr;
 
     self.requestedBufferSize = (bufferSize > 0) ? std::min(bufferSize, 4096) : kDefaultBufferSize;
     self.requestedSampleRate = (sampleRate > 0.0) ? sampleRate : kDefaultSampleRate;
+
+    BOOL ok = NO;
+    {
+        LifecycleLock lifecycle;
+        ok = [self setupEngineLocked];
+    }
+    if (ok) {
+        [self registerSessionObservers];
+        // An explicit setup supersedes any pending rebuild retry.
+        self.recoveryGeneration = self.recoveryGeneration + 1;
+        self.rebuildRetryPending = NO;
+        self.engineFailed = NO;
+    } else if (!self.rebuildRetryPending) {
+        self.engineFailed = YES;
+    }
+    return ok;
+}
+
+// Main thread, caller holds sEngineLock (LifecycleLock). Builds the engine from the requested
+// options; on failure tears down what was built. Calls only non-locking helpers.
+- (BOOL)setupEngineLocked {
     self.setupStep = -1;
     self.lastError = nil;
 
     @try {
         [self doSetup];
-        if (self.isReady) [self registerSessionObservers];
     } @catch (NSException *exception) {
         NSLog(@"[BeeperAudioEngine] EXCEPTION in setup: %@ — %@", exception.name, exception.reason);
         [self noteFatal:[NSString stringWithFormat:@"exception %@: %@", exception.name, exception.reason]];
-        [self cleanup];
+        [self teardownEngineLocked];
     }
 
     if (!self.isReady && self.lastError == nil)
@@ -121,6 +223,7 @@ static TransportEngine* sTransport = nullptr;
     self.lastError = self.lastError ? [NSString stringWithFormat:@"%@; %@", message, self.lastError] : message;
 }
 
+// Caller holds sEngineLock (via setupEngineLocked).
 - (void)doSetup {
     self.setupStep = 0;
     NSLog(@"[BeeperAudioEngine] Step 0: initialiseJuce_GUI");
@@ -184,7 +287,7 @@ static TransportEngine* sTransport = nullptr;
         NSString *message = [NSString stringWithUTF8String:error.toRawUTF8()];
         [self noteFatal:[NSString stringWithFormat:@"AudioDeviceManager::initialise failed: %@",
                          message ?: @"(unprintable error)"]];
-        [self cleanup];
+        [self teardownEngineLocked];
         return;
     }
     if (sDeviceManager->getCurrentAudioDevice() == nullptr) {
@@ -285,26 +388,35 @@ static TransportEngine* sTransport = nullptr;
     }
 }
 
-- (void)cleanup {
-    NSLog(@"[BeeperAudioEngine] Cleaning up after failure...");
+// Main thread, caller holds sEngineLock. Deletes everything doSetup built (any subset).
+- (void)teardownEngineLocked {
+    NSLog(@"[BeeperAudioEngine] Tearing down engine...");
+    self.isReady = false;
     if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
     delete sPlayer; sPlayer = nullptr;
     sSynth = nullptr;
     delete sGraph; sGraph = nullptr;
     if (sDeviceManager) { sDeviceManager->closeAudioDevice(); delete sDeviceManager; sDeviceManager = nullptr; }
     delete sTransport; sTransport = nullptr;
-    self.isReady = false;
 }
 
 - (void)shutdown {
     if (![NSThread isMainThread]) return;
     [self unregisterSessionObservers];
+    // Cancel any scheduled rebuild retry; an explicit shutdown leaves the engine uninitialized.
+    self.recoveryGeneration = self.recoveryGeneration + 1;
+    self.rebuildRetryPending = NO;
+    self.engineFailed = NO;
+    self.recoveryBeatCallback = nil;
     if (!self.isReady) return;
 
     NSLog(@"[BeeperAudioEngine] Shutting down...");
     [self stopBeatTimer];
-    if (sSynth) sSynth->allNotesOff();
-    [self cleanup];
+    {
+        LifecycleLock lifecycle;
+        if (sSynth) sSynth->allNotesOff();
+        [self teardownEngineLocked];
+    }
     NSLog(@"[BeeperAudioEngine] Shutdown complete");
 }
 
@@ -331,6 +443,10 @@ static TransportEngine* sTransport = nullptr;
                selector:@selector(handleSessionMediaServicesReset:)
                    name:AVAudioSessionMediaServicesWereResetNotification
                  object:nil];
+    [center addObserver:self
+               selector:@selector(handleAppDidBecomeActive:)
+                   name:UIApplicationDidBecomeActiveNotification
+                 object:nil];
     self.observingSession = YES;
 }
 
@@ -340,6 +456,7 @@ static TransportEngine* sTransport = nullptr;
     [center removeObserver:self name:AVAudioSessionRouteChangeNotification object:nil];
     [center removeObserver:self name:AVAudioSessionInterruptionNotification object:nil];
     [center removeObserver:self name:AVAudioSessionMediaServicesWereResetNotification object:nil];
+    [center removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
     self.observingSession = NO;
 }
 
@@ -427,6 +544,64 @@ static TransportEngine* sTransport = nullptr;
                                  activationError.localizedDescription]];
     }
     [self restartDeviceIfStopped:@"interruption"];
+    [self scheduleDeadDeviceCheck:@"interruption"];
+}
+
+- (void)handleAppDidBecomeActive:(NSNotification *)notification {
+    __weak BeeperAudioEngine *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf scheduleDeadDeviceCheck:@"app became active"];
+    });
+}
+
+// ── Dead-device check ──
+// After an interruption (or returning to the foreground) the device can report isPlaying while
+// its render callback never runs again. Main thread: snapshot GraphPlayer::callbackCount, and if
+// it has not advanced kDeadDeviceCheckMs later, close + reopen the device; if it is still not
+// advancing after another kDeadDeviceCheckMs, rebuild the engine.
+
+- (void)scheduleDeadDeviceCheck:(NSString *)context {
+    if (!self.isReady || self.isRecovering || sPlayer == nullptr) return;
+    GraphPlayer *player = sPlayer;
+    const uint64_t before = player->callbackCount.load(std::memory_order_relaxed);
+    __weak BeeperAudioEngine *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDeadDeviceCheckMs * (int64_t)NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf checkDeviceProgress:player since:before context:context restarted:NO];
+    });
+}
+
+// Main thread. `player` is only compared with sPlayer (never dereferenced unless it still is
+// sPlayer), so a rebuild in between simply ends the check.
+- (void)checkDeviceProgress:(GraphPlayer *)player
+                      since:(uint64_t)before
+                    context:(NSString *)context
+                  restarted:(BOOL)restarted {
+    if (!self.isReady || self.isRecovering || sDeviceManager == nullptr) return;
+    if (sPlayer == nullptr || sPlayer != player) return;
+    if (player->callbackCount.load(std::memory_order_relaxed) != before) return; // alive
+
+    if (!restarted) {
+        sDeadDeviceRestarts.fetch_add(1, std::memory_order_relaxed);
+        NSLog(@"[BeeperAudioEngine] audio callback stalled after %@; reopening device", context);
+        {
+            LifecycleLock lifecycle;
+            if (sDeviceManager->getCurrentAudioDevice() != nullptr)
+                sDeviceManager->closeAudioDevice();
+            sDeviceManager->restartLastAudioDevice();
+        }
+        const uint64_t afterRestart = player->callbackCount.load(std::memory_order_relaxed);
+        __weak BeeperAudioEngine *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDeadDeviceCheckMs * (int64_t)NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf checkDeviceProgress:player since:afterRestart context:context restarted:YES];
+        });
+        return;
+    }
+
+    [self noteRecoveryError:[NSString stringWithFormat:@"audio callback still stalled after reopening (%@); rebuilding engine",
+                             context]];
+    [self rebuildEngine:context];
 }
 
 - (BOOL)isDeviceRunning {
@@ -442,9 +617,12 @@ static TransportEngine* sTransport = nullptr;
     if ([self isDeviceRunning]) return;
 
     NSLog(@"[BeeperAudioEngine] device not running after %@; reopening", context);
-    if (sDeviceManager->getCurrentAudioDevice() != nullptr)
-        sDeviceManager->closeAudioDevice();
-    sDeviceManager->restartLastAudioDevice();
+    {
+        LifecycleLock lifecycle;
+        if (sDeviceManager->getCurrentAudioDevice() != nullptr)
+            sDeviceManager->closeAudioDevice();
+        sDeviceManager->restartLastAudioDevice();
+    }
     if ([self isDeviceRunning]) return;
 
     [self noteRecoveryError:[NSString stringWithFormat:@"device did not restart after %@; rebuilding engine", context]];
@@ -463,80 +641,170 @@ static TransportEngine* sTransport = nullptr;
     });
 }
 
-// Main thread. Full teardown + setup with the last options. Keeps the beat callback and timer.
+// Main thread. Full teardown + setup with the last options, under one hold of sEngineLock (JS
+// callers are dropped meanwhile instead of seeing a half-built engine). Keeps the beat callback
+// and timer, and the session observers. On failure, retries every kRebuildRetryDelayMs up to
+// kMaxRebuildAttempts attempts in total, then reports engineState "failed".
 - (void)rebuildEngine:(NSString *)context {
-    if (self.isRecovering) return;
+    if (self.isRecovering || self.rebuildRetryPending) return;
     if (!self.isReady) return;
+    self.recoveryBeatCallback = self.beatCallback;
+    self.recoveryTimerWasRunning = (self.beatTimer != nil) ? YES : NO;
+    self.rebuildAttempts = 0;
+    [self performRebuildAttempt:context];
+}
+
+// Main thread. One rebuild attempt (see rebuildEngine:). Never called with sEngineLock held.
+- (void)performRebuildAttempt:(NSString *)context {
     self.isRecovering = YES;
-    NSLog(@"[BeeperAudioEngine] rebuilding engine (%@)", context);
+    self.rebuildRetryPending = NO;
+    self.rebuildAttempts = self.rebuildAttempts + 1;
+    NSLog(@"[BeeperAudioEngine] rebuilding engine (%@), attempt %d", context, self.rebuildAttempts);
 
-    BeatCallback savedCallback = self.beatCallback;
-    const BOOL timerWasRunning = (self.beatTimer != nil) ? YES : NO;
-    const int bufferSize = self.requestedBufferSize;
-    const double sampleRate = self.requestedSampleRate;
-
-    [self shutdown];
-    const BOOL ok = [self setupWithBufferSize:bufferSize sampleRate:sampleRate];
-    if (ok) {
-        self.beatCallback = savedCallback;
-        if (timerWasRunning) [self startBeatTimer];
-    } else {
-        [self noteRecoveryError:[NSString stringWithFormat:@"rebuild after %@ failed: step %d: %@",
-                                 context, self.setupStep, self.lastError ?: @"unknown error"]];
+    // Beat timer stop is main-thread work outside the lock; it also clears beatCallback.
+    [self stopBeatTimer];
+    BOOL ok = NO;
+    {
+        LifecycleLock lifecycle;
+        if (sSynth) sSynth->allNotesOff();
+        [self teardownEngineLocked];
+        ok = [self setupEngineLocked];
     }
+
+    if (ok) {
+        [self registerSessionObservers]; // no-op if still registered
+        self.beatCallback = self.recoveryBeatCallback;
+        if (self.recoveryTimerWasRunning) [self startBeatTimer];
+        self.recoveryBeatCallback = nil;
+        self.engineFailed = NO;
+        self.isRecovering = NO;
+        return;
+    }
+
+    // Failed: the session/app observers stay registered (rebuild never unregisters them).
+    [self registerSessionObservers];
+    if (self.rebuildAttempts >= kMaxRebuildAttempts) {
+        [self noteRecoveryError:[NSString stringWithFormat:@"rebuild after %@ failed (attempt %d of %d, giving up): step %d: %@",
+                                 context, self.rebuildAttempts, kMaxRebuildAttempts,
+                                 self.setupStep, self.lastError ?: @"unknown error"]];
+        self.engineFailed = YES;
+        self.isRecovering = NO;
+        return;
+    }
+
+    [self noteRecoveryError:[NSString stringWithFormat:@"rebuild after %@ failed (attempt %d of %d, retrying in %lld ms): step %d: %@",
+                             context, self.rebuildAttempts, kMaxRebuildAttempts, kRebuildRetryDelayMs,
+                             self.setupStep, self.lastError ?: @"unknown error"]];
+    self.rebuildRetryPending = YES;
     self.isRecovering = NO;
+    const int generation = self.recoveryGeneration;
+    __weak BeeperAudioEngine *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kRebuildRetryDelayMs * (int64_t)NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        BeeperAudioEngine *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        // Cancelled by shutdown or superseded by an explicit setup.
+        if (!strongSelf.rebuildRetryPending || strongSelf.recoveryGeneration != generation) return;
+        if (strongSelf.isReady) { // set up again by other means meanwhile
+            strongSelf.rebuildRetryPending = NO;
+            return;
+        }
+        [strongSelf performRebuildAttempt:context];
+    });
 }
 
 // ── Diagnostics ──
-// Called from the JS thread (sync Function). Audio-thread state is read via
-// relaxed atomics; AVAudioSession is read on the calling thread.
+// Called from the JS thread (sync Function). Engine pointers are read under sEngineLock
+// (try_lock: while the lifecycle holds it, engine fields report their defaults and
+// lockBusyDrops counts it). Audio-thread state is read via relaxed atomics; AVAudioSession is
+// read on the calling thread, outside the lock.
 
 - (NSDictionary<NSString *, id> *)diagnostics {
     NSMutableDictionary<NSString *, id> *d = [NSMutableDictionary dictionary];
-    const bool ready = self.isReady;
 
-    d[@"isReady"] = @(ready);
-    d[@"setupStep"] = @(self.setupStep);
-    d[@"lastError"] = self.lastError ?: @"";
-
+    bool ready = false;
     NSString *deviceName = @"";
     NSString *deviceType = @"";
     double sampleRate = 0.0;
     int bufferSize = 0;
     int outputLatencySamples = 0;
-    if (ready && sDeviceManager) {
-        if (juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice()) {
-            deviceName = [NSString stringWithUTF8String:device->getName().toRawUTF8()] ?: @"";
-            deviceType = [NSString stringWithUTF8String:device->getTypeName().toRawUTF8()] ?: @"";
-            sampleRate = device->getCurrentSampleRate();
-            bufferSize = device->getCurrentBufferSizeSamples();
-            outputLatencySamples = device->getOutputLatencyInSamples();
+    double callbackCount = 0.0, graphProcessCount = 0.0, outputPeak = 0.0, nanCount = 0.0, toneSamplesMixed = 0.0;
+    double synthProcessCount = 0.0, synthPeak = 0.0, notesQueued = 0.0, notesConsumed = 0.0, notesDropped = 0.0;
+    int activeVoices = 0;
+    double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
+    {
+        std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+        if (acquireUserLock(lock)) {
+            ready = self.isReady;
+            if (ready && sDeviceManager) {
+                if (juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice()) {
+                    deviceName = [NSString stringWithUTF8String:device->getName().toRawUTF8()] ?: @"";
+                    deviceType = [NSString stringWithUTF8String:device->getTypeName().toRawUTF8()] ?: @"";
+                    sampleRate = device->getCurrentSampleRate();
+                    bufferSize = device->getCurrentBufferSizeSamples();
+                    outputLatencySamples = device->getOutputLatencyInSamples();
+                }
+            }
+            GraphPlayer* player = ready ? sPlayer : nullptr;
+            PolySynthProcessor* synth = ready ? sSynth : nullptr;
+            const auto relaxed = std::memory_order_relaxed;
+            if (player) {
+                callbackCount = (double)player->callbackCount.load(relaxed);
+                graphProcessCount = (double)player->graphProcessCount.load(relaxed);
+                outputPeak = (double)player->outputPeak.load(relaxed);
+                nanCount = (double)player->nanCount.load(relaxed);
+                toneSamplesMixed = (double)player->toneSamplesMixed.load(relaxed);
+            }
+            if (synth) {
+                synthProcessCount = (double)synth->diag.processCount.load(relaxed);
+                synthPeak = (double)synth->diag.peak.load(relaxed);
+                notesQueued = (double)synth->diag.notesQueued.load(relaxed);
+                notesConsumed = (double)synth->diag.notesConsumed.load(relaxed);
+                notesDropped = (double)synth->diag.notesDropped.load(relaxed);
+                activeVoices = synth->diag.activeVoices.load(relaxed);
+                lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
+                lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
+            }
         }
     }
+
+    d[@"isReady"] = @(ready);
+    d[@"setupStep"] = @(self.setupStep);
+    d[@"lastError"] = self.lastError ?: @"";
+
     d[@"deviceName"] = deviceName;
     d[@"deviceType"] = deviceType;
     d[@"sampleRate"] = @(sampleRate);
     d[@"bufferSize"] = @(bufferSize);
     d[@"outputLatencySamples"] = @(outputLatencySamples);
 
-    GraphPlayer* player = ready ? sPlayer : nullptr;
-    PolySynthProcessor* synth = ready ? sSynth : nullptr;
-    const auto relaxed = std::memory_order_relaxed;
+    d[@"callbackCount"] = @(callbackCount);
+    d[@"graphProcessCount"] = @(graphProcessCount);
+    d[@"outputPeak"] = @(outputPeak);
+    d[@"nanCount"] = @(nanCount);
+    d[@"toneSamplesMixed"] = @(toneSamplesMixed);
 
-    d[@"callbackCount"] = @(player ? (double)player->callbackCount.load(relaxed) : 0.0);
-    d[@"graphProcessCount"] = @(player ? (double)player->graphProcessCount.load(relaxed) : 0.0);
-    d[@"outputPeak"] = @(player ? (double)player->outputPeak.load(relaxed) : 0.0);
-    d[@"nanCount"] = @(player ? (double)player->nanCount.load(relaxed) : 0.0);
-    d[@"toneSamplesMixed"] = @(player ? (double)player->toneSamplesMixed.load(relaxed) : 0.0);
+    d[@"synthProcessCount"] = @(synthProcessCount);
+    d[@"synthPeak"] = @(synthPeak);
+    d[@"notesQueued"] = @(notesQueued);
+    d[@"notesConsumed"] = @(notesConsumed);
+    d[@"notesDropped"] = @(notesDropped);
+    d[@"activeVoices"] = @(activeVoices);
+    d[@"lastNoteToRenderMs"] = @(lastNoteToRenderMs);
+    d[@"lastTouchToRenderMs"] = @(lastTouchToRenderMs);
 
-    d[@"synthProcessCount"] = @(synth ? (double)synth->diag.processCount.load(relaxed) : 0.0);
-    d[@"synthPeak"] = @(synth ? (double)synth->diag.peak.load(relaxed) : 0.0);
-    d[@"notesQueued"] = @(synth ? (double)synth->diag.notesQueued.load(relaxed) : 0.0);
-    d[@"notesConsumed"] = @(synth ? (double)synth->diag.notesConsumed.load(relaxed) : 0.0);
-    d[@"notesDropped"] = @(synth ? (double)synth->diag.notesDropped.load(relaxed) : 0.0);
-    d[@"activeVoices"] = @(synth ? synth->diag.activeVoices.load(relaxed) : 0);
-    d[@"lastNoteToRenderMs"] = @(synth ? synth->diag.lastNoteToRenderMs.load(relaxed) : -1.0);
-    d[@"lastTouchToRenderMs"] = @(synth ? synth->diag.lastTouchToRenderMs.load(relaxed) : -1.0);
+    // engineState: recovering (rebuild running or retry scheduled) > ready > failed > uninitialized.
+    // `ready` is false when the lock was busy, which only happens during a lifecycle section.
+    NSString *engineState = @"uninitialized";
+    if (self.isRecovering || self.rebuildRetryPending || sLifecycleBusy.load(std::memory_order_relaxed))
+        engineState = @"recovering";
+    else if (ready)
+        engineState = @"ready";
+    else if (self.engineFailed)
+        engineState = @"failed";
+    d[@"engineState"] = engineState;
+    d[@"lockBusyDrops"] = @((double)sLockBusyDrops.load(std::memory_order_relaxed));
+    d[@"deadDeviceRestarts"] = @((double)sDeadDeviceRestarts.load(std::memory_order_relaxed));
 
     d[@"preferredBufferSize"] = @(self.requestedBufferSize);
     d[@"preferredSampleRate"] = @(self.requestedSampleRate);
@@ -562,8 +830,10 @@ static TransportEngine* sTransport = nullptr;
 }
 
 - (BOOL)playTestTone:(double)durationMs {
-    if (!self.isReady || !sPlayer || !sDeviceManager) return NO;
     if (!(durationMs > 0.0)) return NO;
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return NO;
+    if (!self.isReady || !sPlayer || !sDeviceManager) return NO;
     juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice();
     if (device == nullptr || !device->isPlaying()) return NO;
     sPlayer->requestTestTone(durationMs);
@@ -571,64 +841,99 @@ static TransportEngine* sTransport = nullptr;
 }
 
 // ── Synth forwarding ──
+// Each call holds sEngineLock (acquireUserLock) while it dereferences sSynth / sTransport; if
+// the lifecycle holds it, the call is dropped and the safe default returned.
 
 - (void)noteOn:(int)note velocity:(int)velocity {
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return;
     if (!self.isReady || !sSynth) return;
     sSynth->noteOn(note, velocity);
 }
 
 - (void)noteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
-    if (!self.isReady || !sSynth) return;
     // UITouch.timestamp is seconds on the mach_absolute_time clock; on Apple platforms
     // juce::Time::getHighResolutionTicks() is mach_absolute_time(), so convert with JUCE's rate.
     const juce::int64 touchTicks = (touchTimestamp > 0.0)
         ? juce::Time::secondsToHighResolutionTicks(touchTimestamp)
         : (juce::int64)0;
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return;
+    if (!self.isReady || !sSynth) return;
     sSynth->noteOn(note, velocity, touchTicks);
 }
 
 - (void)noteOff:(int)note {
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return;
     if (!self.isReady || !sSynth) return;
     sSynth->noteOff(note);
 }
 
 - (void)allNotesOff {
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return;
     if (!self.isReady || !sSynth) return;
     sSynth->allNotesOff();
 }
 
 - (void)setWaveform:(NSString *)waveform {
+    Waveform wf = Waveform::Sine;
+    if ([waveform isEqualToString:@"square"]) wf = Waveform::Square;
+    else if ([waveform isEqualToString:@"saw"]) wf = Waveform::Saw;
+    else if ([waveform isEqualToString:@"triangle"]) wf = Waveform::Triangle;
+    std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+    if (!acquireUserLock(lock)) return;
     if (!self.isReady || !sSynth) return;
-    if ([waveform isEqualToString:@"square"]) sSynth->setWaveform(Waveform::Square);
-    else if ([waveform isEqualToString:@"saw"]) sSynth->setWaveform(Waveform::Saw);
-    else if ([waveform isEqualToString:@"triangle"]) sSynth->setWaveform(Waveform::Triangle);
-    else sSynth->setWaveform(Waveform::Sine);
+    sSynth->setWaveform(wf);
 }
 
-- (void)setFilterCutoff:(double)hz { if (self.isReady && sSynth) sSynth->setFilterCutoff(hz); }
-- (void)setFilterResonance:(double)q { if (self.isReady && sSynth) sSynth->setFilterResonance(q); }
-- (void)setAttack:(double)ms { if (self.isReady && sSynth) sSynth->setAttack(ms); }
-- (void)setDecay:(double)ms { if (self.isReady && sSynth) sSynth->setDecay(ms); }
-- (void)setSustain:(double)level { if (self.isReady && sSynth) sSynth->setSustain(level); }
-- (void)setRelease:(double)ms { if (self.isReady && sSynth) sSynth->setRelease(ms); }
-- (void)setDetune:(double)cents { if (self.isReady && sSynth) sSynth->setDetune(cents); }
-- (void)setMasterLevel:(double)level { if (self.isReady && sSynth) sSynth->setMasterLevel(level); }
+- (void)setFilterCutoff:(double)hz { withSynth(self, ^(PolySynthProcessor *synth) { synth->setFilterCutoff(hz); }); }
+- (void)setFilterResonance:(double)q { withSynth(self, ^(PolySynthProcessor *synth) { synth->setFilterResonance(q); }); }
+- (void)setAttack:(double)ms { withSynth(self, ^(PolySynthProcessor *synth) { synth->setAttack(ms); }); }
+- (void)setDecay:(double)ms { withSynth(self, ^(PolySynthProcessor *synth) { synth->setDecay(ms); }); }
+- (void)setSustain:(double)level { withSynth(self, ^(PolySynthProcessor *synth) { synth->setSustain(level); }); }
+- (void)setRelease:(double)ms { withSynth(self, ^(PolySynthProcessor *synth) { synth->setRelease(ms); }); }
+- (void)setDetune:(double)cents { withSynth(self, ^(PolySynthProcessor *synth) { synth->setDetune(cents); }); }
+- (void)setMasterLevel:(double)level { withSynth(self, ^(PolySynthProcessor *synth) { synth->setMasterLevel(level); }); }
 
 // ── Transport ──
 
-- (void)startTransport { if (self.isReady && sTransport) sTransport->start(); }
-- (void)stopTransport { if (self.isReady && sTransport) sTransport->stop(); }
-- (void)setTempo:(double)bpm { if (self.isReady && sTransport) sTransport->setTempo(bpm); }
-- (void)setTransportPosition:(double)beat { if (self.isReady && sTransport) sTransport->setPosition(beat); }
-- (double)getTransportPosition { return (self.isReady && sTransport) ? sTransport->getPosition() : 0.0; }
-- (double)getTempo { return (self.isReady && sTransport) ? sTransport->getTempo() : 120.0; }
-- (BOOL)isTransportPlaying { return (self.isReady && sTransport) ? sTransport->isPlaying() : NO; }
+- (void)startTransport { withTransport(self, ^(TransportEngine *transport) { transport->start(); }); }
+- (void)stopTransport { withTransport(self, ^(TransportEngine *transport) { transport->stop(); }); }
+- (void)setTempo:(double)bpm { withTransport(self, ^(TransportEngine *transport) { transport->setTempo(bpm); }); }
+- (void)setTransportPosition:(double)beat { withTransport(self, ^(TransportEngine *transport) { transport->setPosition(beat); }); }
+
+- (double)getTransportPosition {
+    __block double position = 0.0;
+    withTransport(self, ^(TransportEngine *transport) { position = transport->getPosition(); });
+    return position;
+}
+
+- (double)getTempo {
+    __block double tempo = 120.0;
+    withTransport(self, ^(TransportEngine *transport) { tempo = transport->getTempo(); });
+    return tempo;
+}
+
+- (BOOL)isTransportPlaying {
+    __block BOOL playing = NO;
+    withTransport(self, ^(TransportEngine *transport) { playing = transport->isPlaying() ? YES : NO; });
+    return playing;
+}
 
 // ── Beat events ──
 // -setBeatCallback: is the synthesized (copy) setter of the beatCallback property.
 // Do not hand-write it as `self.beatCallback = callback` — that calls itself forever.
+// The beat timer (and beatCallback) are main-thread state: start/stop called from another
+// thread (Expo's OnStartObserving / OnStopObserving / OnDestroy) re-dispatch to main.
 
 - (void)startBeatTimer {
+    if (![NSThread isMainThread]) {
+        __weak BeeperAudioEngine *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf startBeatTimer]; });
+        return;
+    }
     if (self.beatTimer) return;
     if (!sSynth) return;
 
@@ -647,6 +952,11 @@ static TransportEngine* sTransport = nullptr;
 }
 
 - (void)stopBeatTimer {
+    if (![NSThread isMainThread]) {
+        __weak BeeperAudioEngine *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf stopBeatTimer]; });
+        return;
+    }
     if (self.beatTimer) {
         dispatch_source_cancel(self.beatTimer);
         self.beatTimer = nil;

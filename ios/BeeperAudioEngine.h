@@ -21,7 +21,7 @@ typedef void(^BeatCallback)(double beat, double bpm);
 
 // Diagnostics
 @property (nonatomic, readonly) int setupStep;       // -1 = setup never run
-@property (nonatomic, readonly, copy) NSString *lastError; // nil = no error
+@property (atomic, readonly, copy) NSString *lastError; // nil = no error; atomic: read off the main thread
 - (NSDictionary<NSString *, id> *)diagnostics;
 // Returns NO if the engine is not ready or the device is not playing.
 - (BOOL)playTestTone:(double)durationMs;
@@ -56,6 +56,7 @@ typedef void(^BeatCallback)(double beat, double bpm);
 
 // Beat events
 - (void)setBeatCallback:(BeatCallback)callback;
+// The beat timer lives on the main queue; called off the main thread these re-dispatch to main.
 - (void)startBeatTimer;
 - (void)stopBeatTimer;
 

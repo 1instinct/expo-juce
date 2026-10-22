@@ -43,6 +43,9 @@ export type JucePadViewProps = {
   children?: React.ReactNode;
 };
 
+/** Native engine lifecycle state reported in `AudioDiagnostics.engineState`. */
+export type EngineState = 'ready' | 'recovering' | 'failed' | 'uninitialized';
+
 /**
  * Snapshot of native audio-engine state, returned by `getDiagnostics()`.
  * Counters are cumulative since setup; peaks are a decaying hold (~300 ms half-life)
@@ -95,6 +98,16 @@ export type AudioDiagnostics = {
   mediaResetCount: number;
   /** Last session-recovery problem; empty string if none. */
   lastRecoveryError: string;
+  /**
+   * Engine lifecycle (0.5.2+; absent on older binaries): "ready", "recovering" (rebuild running,
+   * retry scheduled, or a lifecycle section in progress), "failed" (setup failed or rebuild
+   * retries exhausted), "uninitialized" (never set up, or shut down).
+   */
+  engineState?: EngineState;
+  /** JS-thread calls dropped because the engine lifecycle lock was busy (0.5.2+). */
+  lockBusyDrops?: number;
+  /** Times the audio callback was found stalled and the device was reopened (0.5.2+). */
+  deadDeviceRestarts?: number;
   sessionCategory: string;
   sessionSampleRate: number;
   sessionIOBufferMs: number;

@@ -252,6 +252,81 @@ static Result runSynthAlone() {
     return res;
 }
 
+// Multi-producer note queue: two producer threads (as the main thread + JS thread do in the
+// app) hammer noteOn/noteOff while an audio thread consumes. Checks the producer spinlock keeps
+// the counters consistent (attempted == queued + dropped, queued == consumed after draining)
+// and that allNotesOff leaves no stuck voice.
+struct MultiProducerResult {
+    uint32_t attempted = 0, queued = 0, consumed = 0, dropped = 0;
+    int activeAfter = -1, nans = 0;
+    bool pass = false;
+};
+
+static MultiProducerResult runMultiProducer() {
+    constexpr int kPerProducer = 10000;
+    constexpr int kBlock = 128;
+    TransportEngine transport;
+    PolySynthProcessor synth;
+    synth.setTransport(&transport);
+    synth.setRateAndBufferSizeDetails(48000, kBlock);
+    synth.prepareToPlay(48000, kBlock);
+    synth.setRelease(10.0);
+
+    std::atomic<bool> stopAudio{false};
+    std::atomic<int> nans{0};
+    std::thread audio([&] {
+        juce::AudioBuffer<float> buf(2, kBlock);
+        juce::MidiBuffer midi;
+        while (!stopAudio.load()) {
+            synth.processBlock(buf, midi);
+            for (int i = 0; i < kBlock; ++i)
+                if (!std::isfinite(buf.getSample(0, i))) nans.fetch_add(1);
+        }
+    });
+
+    auto producer = [&](int baseNote) {
+        for (int i = 0; i < kPerProducer; ++i) {
+            const int note = baseNote + (i % 24);
+            synth.noteOn(note, 100);
+            synth.noteOff(note);
+            // Pace a little so most events are accepted (the queue holds 255) while the two
+            // producers still overlap constantly.
+            if ((i & 7) == 7) std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    };
+    std::thread p1(producer, 36);
+    std::thread p2(producer, 72);
+    p1.join();
+    p2.join();
+
+    // Let the audio thread drain what is left, then silence everything.
+    auto drained = [&] {
+        return synth.diag.notesConsumed.load() == synth.diag.notesQueued.load();
+    };
+    for (int i = 0; i < 2000 && !drained(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    synth.allNotesOff();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // consumer picks up AllNotesOff
+    stopAudio.store(true);
+    audio.join();
+
+    // Render ~1 s more on this thread so every release (10 ms) has finished.
+    {
+        juce::AudioBuffer<float> buf(2, kBlock);
+        juce::MidiBuffer midi;
+        for (int b = 0; b < 48000 / kBlock; ++b) synth.processBlock(buf, midi);
+    }
+
+    MultiProducerResult r;
+    r.attempted = 2u * kPerProducer;
+    r.queued = synth.diag.notesQueued.load();
+    r.consumed = synth.diag.notesConsumed.load();
+    r.dropped = synth.diag.notesDropped.load();
+    r.activeAfter = synth.diag.activeVoices.load();
+    r.nans = nans.load();
+    r.pass = r.attempted == r.queued + r.dropped && r.queued == r.consumed && r.activeAfter == 0 && r.nans == 0;
+    return r;
+}
+
 int main() {
     // App: MessageManager::getInstance() in a static constructor on the main thread, then
     // juce::initialiseJuce_GUI() at doSetup step 0. Same thread here.
@@ -297,6 +372,15 @@ int main() {
         auto r = runCase(c);
         unexpected += (r.pass == c.expectSilence) ? 1 : 0;
         row(c.id, c.desc, r);
+    }
+    {
+        const MultiProducerResult mp = runMultiProducer();
+        unexpected += mp.pass ? 0 : 1;
+        std::printf("mp    2 producers x 10k noteOn/noteOff + audio thread  %-4s attempted %u = queued %u + dropped %u;"
+                    " consumed %u; voices after allNotesOff %d; nan %d\n",
+                    mp.pass ? "PASS" : "FAIL", mp.attempted, mp.queued, mp.dropped, mp.consumed, mp.activeAfter,
+                    mp.nans);
+        std::fflush(stdout);
     }
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"

@@ -6,6 +6,7 @@ import {
   ChangeEventPayload,
   BeatEventPayload,
   AudioDiagnostics,
+  EngineState,
   SetupOptions,
   JucePadViewProps,
   PadNoteOnEvent,
@@ -17,7 +18,13 @@ import {
 // Rejects with code 'ERR_AUDIO_SETUP' and message "step N: <error>" if native setup fails.
 // options: preferred buffer size (samples, default 128) and sample rate (Hz, default 48000).
 // No effect if the engine is already set up.
+// Binary compatibility: binaries older than 0.5.2 export a zero-argument native setup and reject
+// an options argument; 0.5.2+ binaries (detected by hasJucePadView) require the options argument
+// (the native signature is setup(options, promise), so its required-argument count is 1).
 export async function setup(options?: SetupOptions): Promise<void> {
+  if (typeof ExpoJuceModule?.hasJucePadView !== 'function') {
+    return ExpoJuceModule.setup();
+  }
   const nativeOptions: { bufferSize?: number; sampleRate?: number } = {};
   if (options?.bufferSize !== undefined) nativeOptions.bufferSize = options.bufferSize;
   if (options?.sampleRate !== undefined) nativeOptions.sampleRate = options.sampleRate;
@@ -157,4 +164,5 @@ export {
   ChangeEventPayload,
   BeatEventPayload,
   AudioDiagnostics,
+  EngineState,
 };

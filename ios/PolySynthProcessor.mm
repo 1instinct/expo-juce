@@ -1,6 +1,21 @@
 #include "PolySynthProcessor.h"
 #include <cmath>
 #include <algorithm>
+#include <thread>
+
+namespace {
+// Spinlock guard for the note queue's producer side (test_and_set acquire / clear release).
+// Critical sections are a few stores; yield in case the holder was preempted.
+struct ProducerSpinGuard {
+    std::atomic_flag& flag;
+    explicit ProducerSpinGuard(std::atomic_flag& f) : flag(f) {
+        while (flag.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
+    }
+    ~ProducerSpinGuard() { flag.clear(std::memory_order_release); }
+    ProducerSpinGuard(const ProducerSpinGuard&) = delete;
+    ProducerSpinGuard& operator=(const ProducerSpinGuard&) = delete;
+};
+}
 
 PolySynthProcessor::PolySynthProcessor()
     : AudioProcessor(BusesProperties()
@@ -127,8 +142,9 @@ void PolySynthProcessor::processNoteEvent(const NoteEvent& event) {
     }
 }
 
-// Called from main thread — pushes event to lock-free FIFO
+// Producers (main thread, JS thread): push an event to the FIFO under producerLock.
 void PolySynthProcessor::noteOn(int note, int velocity, juce::int64 touchTicks) {
+    ProducerSpinGuard guard(producerLock);
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) { // full, drop event
@@ -143,6 +159,7 @@ void PolySynthProcessor::noteOn(int note, int velocity, juce::int64 touchTicks) 
 }
 
 void PolySynthProcessor::noteOff(int note) {
+    ProducerSpinGuard guard(producerLock);
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
@@ -151,6 +168,7 @@ void PolySynthProcessor::noteOff(int note) {
 }
 
 void PolySynthProcessor::allNotesOff() {
+    ProducerSpinGuard guard(producerLock);
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
