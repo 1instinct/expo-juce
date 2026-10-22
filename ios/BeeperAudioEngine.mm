@@ -36,6 +36,7 @@ public:
     std::atomic<uint64_t> graphProcessCount{0};
     std::atomic<uint64_t> nanCount{0};       // blocks with a non-finite output sample
     std::atomic<float> outputPeak{0.0f};     // decaying hold of block max |x| (graph output)
+    std::atomic<uint64_t> toneSamplesMixed{0}; // cumulative test-tone samples mixed into output
 
     void audioDeviceIOCallbackWithContext(const float* const* inputChannelData,
                                           int numInputChannels,
@@ -115,6 +116,7 @@ private:
                     outputChannelData[ch][s] += v;
         }
         toneSamplesRemaining -= n;
+        toneSamplesMixed.fetch_add((uint64_t)n, std::memory_order_relaxed);
     }
 
     juce::AudioProcessor* processor = nullptr;
@@ -364,11 +366,13 @@ static TransportEngine* sTransport = nullptr;
     d[@"graphProcessCount"] = @(player ? (double)player->graphProcessCount.load(relaxed) : 0.0);
     d[@"outputPeak"] = @(player ? (double)player->outputPeak.load(relaxed) : 0.0);
     d[@"nanCount"] = @(player ? (double)player->nanCount.load(relaxed) : 0.0);
+    d[@"toneSamplesMixed"] = @(player ? (double)player->toneSamplesMixed.load(relaxed) : 0.0);
 
     d[@"synthProcessCount"] = @(synth ? (double)synth->diag.processCount.load(relaxed) : 0.0);
     d[@"synthPeak"] = @(synth ? (double)synth->diag.peak.load(relaxed) : 0.0);
     d[@"notesQueued"] = @(synth ? (double)synth->diag.notesQueued.load(relaxed) : 0.0);
     d[@"notesConsumed"] = @(synth ? (double)synth->diag.notesConsumed.load(relaxed) : 0.0);
+    d[@"notesDropped"] = @(synth ? (double)synth->diag.notesDropped.load(relaxed) : 0.0);
     d[@"activeVoices"] = @(synth ? synth->diag.activeVoices.load(relaxed) : 0);
     d[@"lastNoteToRenderMs"] = @(synth ? synth->diag.lastNoteToRenderMs.load(relaxed) : -1.0);
 
@@ -388,11 +392,13 @@ static TransportEngine* sTransport = nullptr;
     return d;
 }
 
-- (void)playTestTone:(double)durationMs {
-    if (!self.isReady || !sPlayer || !sDeviceManager) return;
+- (BOOL)playTestTone:(double)durationMs {
+    if (!self.isReady || !sPlayer || !sDeviceManager) return NO;
+    if (!(durationMs > 0.0)) return NO;
     juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice();
-    if (device == nullptr || !device->isPlaying()) return;
+    if (device == nullptr || !device->isPlaying()) return NO;
     sPlayer->requestTestTone(durationMs);
+    return YES;
 }
 
 // ── Synth forwarding ──

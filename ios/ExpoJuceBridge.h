@@ -14,7 +14,8 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 
 // ── Diagnostics ──────────────────────────────────────────────────
 + (NSDictionary<NSString *, id> *)getDiagnostics NS_SWIFT_NAME(getDiagnostics());
-+ (void)playTestTone:(double)durationMs NS_SWIFT_NAME(playTestTone(durationMs:));
+// Returns NO if not queued (engine not ready / device not playing).
++ (BOOL)playTestTone:(double)durationMs NS_SWIFT_NAME(playTestTone(durationMs:));
 + (void)startBeatTimer;
 + (void)stopBeatTimer;
 

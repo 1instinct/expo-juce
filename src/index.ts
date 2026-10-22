@@ -27,9 +27,10 @@ export function getDiagnostics(): AudioDiagnostics {
 }
 
 // Mixes a 440 Hz sine directly into the device output (bypassing graph + synth).
-// No-op if the audio device is not running.
-export function playTestTone(durationMs: number): void {
-  ExpoJuceModule.playTestTone(durationMs);
+// Returns true if the tone was queued; false if the engine is not ready or the
+// audio device is not running (nothing is played in that case).
+export function playTestTone(durationMs: number): boolean {
+  return ExpoJuceModule.playTestTone(durationMs);
 }
 
 // ── Polyphonic Synth (MIDI-style) ────────────────────────────────

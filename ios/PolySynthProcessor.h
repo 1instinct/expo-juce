@@ -15,13 +15,16 @@ struct BeatState {
     std::atomic<double> bpm{120.0};
 };
 
-// Diagnostics counters. Written on the audio thread (except notesQueued,
-// which the noteOn producer writes), read from any thread. Relaxed ordering only.
+// Diagnostics counters. Written on the audio thread (except notesQueued and
+// notesDropped, which the noteOn producer writes), read from any thread. Relaxed
+// loads only; notesQueued is incremented before the release-store that publishes
+// the event, so a reader never sees notesConsumed > notesQueued.
 struct SynthDiagnostics {
     std::atomic<uint64_t> processCount{0};
     std::atomic<float> peak{0.0f};                // decaying hold of block max |x|
     std::atomic<uint32_t> notesQueued{0};
     std::atomic<uint32_t> notesConsumed{0};
+    std::atomic<uint32_t> notesDropped{0};        // noteOn rejected: event queue full
     std::atomic<int> activeVoices{0};
     std::atomic<double> lastNoteToRenderMs{-1.0}; // -1 = no NoteOn consumed yet
 };

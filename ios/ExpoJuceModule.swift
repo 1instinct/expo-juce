@@ -60,8 +60,8 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.getDiagnostics()
     }
 
-    Function("playTestTone") { (durationMs: Double) in
-      ExpoJuceBridge.playTestTone(durationMs: durationMs)
+    Function("playTestTone") { (durationMs: Double) -> Bool in
+      return ExpoJuceBridge.playTestTone(durationMs: durationMs)
     }
 
     // ── Synth (MIDI-style) ─────────────────────────────────────────

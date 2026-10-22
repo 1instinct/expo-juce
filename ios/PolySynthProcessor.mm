@@ -125,10 +125,15 @@ void PolySynthProcessor::processNoteEvent(const NoteEvent& event) {
 void PolySynthProcessor::noteOn(int note, int velocity) {
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
-    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return; // full, drop event
+    if (nextWp == eventReadPos.load(std::memory_order_acquire)) { // full, drop event
+        diag.notesDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     eventQueue[wp] = { NoteEvent::NoteOn, note, velocity, juce::Time::getHighResolutionTicks() };
-    eventWritePos.store(nextWp, std::memory_order_release);
+    // Count before publishing: the release-store below orders this increment
+    // ahead of the consumer's notesConsumed increment for the same event.
     diag.notesQueued.fetch_add(1, std::memory_order_relaxed);
+    eventWritePos.store(nextWp, std::memory_order_release);
 }
 
 void PolySynthProcessor::noteOff(int note) {

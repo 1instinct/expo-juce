@@ -40,8 +40,12 @@ export type AudioDiagnostics = {
   synthPeak: number;
   /** Device blocks containing a non-finite (NaN/Inf) output sample. */
   nanCount: number;
+  /** Cumulative test-tone samples actually mixed into the device output (audio thread). */
+  toneSamplesMixed: number;
   notesQueued: number;
   notesConsumed: number;
+  /** noteOn events dropped because the event queue was full. */
+  notesDropped: number;
   activeVoices: number;
   /** ms from noteOn enqueue to the synth consuming it; -1 if none yet. */
   lastNoteToRenderMs: number;

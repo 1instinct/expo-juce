@@ -13,7 +13,7 @@
 
 // ── Diagnostics ──
 + (NSDictionary<NSString *, id> *)getDiagnostics { return [[BeeperAudioEngine sharedInstance] diagnostics]; }
-+ (void)playTestTone:(double)durationMs { [[BeeperAudioEngine sharedInstance] playTestTone:durationMs]; }
++ (BOOL)playTestTone:(double)durationMs { return [[BeeperAudioEngine sharedInstance] playTestTone:durationMs]; }
 + (void)startBeatTimer { [[BeeperAudioEngine sharedInstance] startBeatTimer]; }
 + (void)stopBeatTimer { [[BeeperAudioEngine sharedInstance] stopBeatTimer]; }
 

@@ -18,7 +18,8 @@ typedef void(^BeatCallback)(double beat, double bpm);
 @property (nonatomic, readonly) int setupStep;       // -1 = setup never run
 @property (nonatomic, readonly, copy) NSString *lastError; // nil = no error
 - (NSDictionary<NSString *, id> *)diagnostics;
-- (void)playTestTone:(double)durationMs;
+// Returns NO if the engine is not ready or the device is not playing.
+- (BOOL)playTestTone:(double)durationMs;
 
 // Synth — MIDI-style
 - (void)noteOn:(int)note velocity:(int)velocity;
