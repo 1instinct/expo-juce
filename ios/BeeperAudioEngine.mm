@@ -446,8 +446,8 @@ static TransportEngine* sTransport = nullptr;
 - (BOOL)isTransportPlaying { return (self.isReady && sTransport) ? sTransport->isPlaying() : NO; }
 
 // ── Beat events ──
-
-- (void)setBeatCallback:(BeatCallback)callback { self.beatCallback = callback; }
+// -setBeatCallback: is the synthesized (copy) setter of the beatCallback property.
+// Do not hand-write it as `self.beatCallback = callback` — that calls itself forever.
 
 - (void)startBeatTimer {
     if (self.beatTimer) return;
