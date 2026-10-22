@@ -160,7 +160,7 @@ Check the shipped type definitions for the exact event payloads once 0.5.2 is pu
 `nanCount`, `toneSamplesMixed`), peaks (`outputPeak`, `synthPeak`), timing
 (`lastNoteToRenderMs`) and the AVAudioSession state (`sessionCategory`, `sessionSampleRate`,
 `sessionIOBufferMs`, `sessionOutputLatencyMs`, `otherAudioPlaying`, `routeOutputs`). 0.5.2+ adds
-`lastTouchToRenderMs`, `preferredBufferSize`, `sessionReassertCount`, `interruptionCount`,
+`lastTouchToRenderMs`, `preferredBufferSize`, `preferredSampleRate`, `sessionReassertCount`, `interruptionCount`,
 `mediaResetCount`, `lastRecoveryError`. BeeperNative's diagnostics panel shows them as a
 pass/fail ladder — see [docs/latency.md](docs/latency.md#5-reading-the-diagnostics-panel).
 
