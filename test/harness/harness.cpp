@@ -19,53 +19,8 @@
 #include <vector>
 
 //==============================================================================
-// GraphPlayer — copied VERBATIM from ios/BeeperAudioEngine.mm at commit 69c2252
-// (`git show 69c2252:ios/BeeperAudioEngine.mm`), before the diagnostics edits. Keep in sync.
-class GraphPlayer : public juce::AudioIODeviceCallback {
-public:
-    void setProcessor(juce::AudioProcessor* p) { processor = p; }
-
-    void audioDeviceIOCallbackWithContext(const float* const* inputChannelData,
-                                          int numInputChannels,
-                                          float* const* outputChannelData,
-                                          int numOutputChannels,
-                                          int numSamples,
-                                          const juce::AudioIODeviceCallbackContext& context) override {
-        juce::ignoreUnused(inputChannelData, numInputChannels, context);
-        if (!processor) {
-            for (int i = 0; i < numOutputChannels; ++i)
-                juce::FloatVectorOperations::clear(outputChannelData[i], numSamples);
-            return;
-        }
-
-        buffer.setSize(numOutputChannels, numSamples, false, false, true);
-        buffer.clear();
-        juce::MidiBuffer midi;
-        processor->processBlock(buffer, midi);
-        for (int i = 0; i < numOutputChannels; ++i)
-            juce::FloatVectorOperations::copy(outputChannelData[i], buffer.getReadPointer(i), numSamples);
-    }
-
-    void audioDeviceAboutToStart(juce::AudioIODevice* device) override {
-        if (processor) {
-            processor->setPlayConfigDetails(0, device->getActiveOutputChannels().countNumberOfSetBits(),
-                                            device->getCurrentSampleRate(),
-                                            device->getCurrentBufferSizeSamples());
-            processor->prepareToPlay(device->getCurrentSampleRate(),
-                                     device->getCurrentBufferSizeSamples());
-        }
-    }
-
-    void audioDeviceStopped() override {
-        if (processor)
-            processor->releaseResources();
-    }
-
-private:
-    juce::AudioProcessor* processor = nullptr;
-    juce::AudioBuffer<float> buffer;
-};
-// ── end of verbatim copy ──
+// GraphPlayer — the shipped class, from ios/GraphPlayer.h at the same git ref as the engine.
+#include "GraphPlayer.h"
 
 //==============================================================================
 // Harness-only probe: identical behaviour to PolySynthProcessor, plus counters so we can
@@ -121,11 +76,14 @@ struct Case {
     bool expectSilence = false;        // negative control: constructed to go silent
 };
 
-struct BlockRec { int phase; int n; float peak; int nans; bool zero; };
+struct BlockRec { int phase; int n; float peak; int nans; bool zero; bool tailZero; };
 
 struct Result {
     float peakNote = 0; int nans = 0; int noteBlocks = 0, zeroNoteBlocks = 0;
     int firstSoundBlock = -1; int synthCalls = 0; float synthPeak = 0;
+    int zeroTailBlocks = 0;            // note-held blocks whose last quarter is silent (chunking bug)
+    uint64_t graphCalls = 0, expectedGraphCalls = 0; // GraphPlayer chunking: ceil(n / capacity) per block
+    int capacity = 0, capacityAfter = 0;             // preallocated samples before/after the run
     bool pass = false;
 };
 
@@ -158,6 +116,8 @@ static Result runCase(const Case& c) {
     std::atomic<bool> attached{false}, paused{false}, stop{false};
     std::atomic<int> phase{0};
     std::vector<BlockRec> recs; recs.reserve(20000);
+    std::atomic<uint64_t> expectedGraphCalls{0};
+    std::atomic<int> capacityForThread{0};
     std::thread audio([&] {
         juce::AudioBuffer<float> out(2, 8192);
         juce::AudioIODeviceCallbackContext ctx{};
@@ -169,15 +129,21 @@ static Result runCase(const Case& c) {
             std::this_thread::sleep_until(next);
             if (paused.load()) continue;   // audio unit disposed during restart: no callbacks
             out.clear();
-            if (attached.load())
+            if (attached.load()) {
                 player->audioDeviceIOCallbackWithContext(nullptr, 0, out.getArrayOfWritePointers(), 2, n, ctx);
-            BlockRec r{phase.load(), n, 0.0f, 0, true};
+                const int cap = capacityForThread.load();
+                if (cap > 0) expectedGraphCalls.fetch_add((uint64_t)((n + cap - 1) / cap));
+            }
+            BlockRec r{phase.load(), n, 0.0f, 0, true, true};
             for (int ch = 0; ch < 2; ++ch) {
                 const float* d = out.getReadPointer(ch);
                 for (int i = 0; i < n; ++i) {
                     if (!std::isfinite(d[i])) { r.nans++; continue; }
                     r.peak = std::max(r.peak, std::fabs(d[i]));
-                    if (d[i] != 0.0f) r.zero = false;
+                    if (d[i] != 0.0f) {
+                        r.zero = false;
+                        if (i >= n - n / 4) r.tailZero = false;
+                    }
                 }
             }
             recs.push_back(r);
@@ -192,6 +158,8 @@ static Result runCase(const Case& c) {
     } else {
         player->audioDeviceAboutToStart(&device);
     }
+    const int capacityBefore = player->getCapacitySamples();
+    capacityForThread.store(capacityBefore);
     attached.store(true);
 
     pump(c.messageLoop, 50);
@@ -222,6 +190,7 @@ static Result runCase(const Case& c) {
         res.nans += r.nans;
         if (r.phase == 1) {
             res.noteBlocks++;
+            if (r.tailZero) res.zeroTailBlocks++;
             if (r.zero) res.zeroNoteBlocks++;
             else if (res.firstSoundBlock < 0) res.firstSoundBlock = idx;
             res.peakNote = std::max(res.peakNote, r.peak);
@@ -230,8 +199,18 @@ static Result runCase(const Case& c) {
     }
     res.synthCalls = synth->calls.load();
     res.synthPeak = synth->peak.load();
-    // A held note must sound in every block after the first (allow 1 block for event latency).
-    res.pass = res.peakNote > 1e-3f && res.nans == 0 && res.zeroNoteBlocks <= 1;
+    res.graphCalls = player->graphProcessCount.load();
+    res.expectedGraphCalls = expectedGraphCalls.load();
+    res.capacity = capacityBefore;
+    res.capacityAfter = player->getCapacitySamples();
+    // A held note must sound in every block after the first (allow 1 block for event latency),
+    // including the end of every block (a chunked render must fill the whole block), and the
+    // callback must render ceil(n / capacity) chunks per block without growing its buffer
+    // (the restart case re-runs aboutToStart with the same device, so capacity is unchanged).
+    res.pass = res.peakNote > 1e-3f && res.nans == 0 && res.zeroNoteBlocks <= 1
+            && res.zeroTailBlocks <= 1
+            && res.graphCalls == res.expectedGraphCalls
+            && res.capacity >= 1024 && res.capacityAfter == res.capacity;
 
     delete player;
     delete graph;      // owns synth
@@ -249,7 +228,8 @@ static Result runSynthAlone() {
     juce::AudioBuffer<float> buf(2, 512);
     juce::MidiBuffer midi;
     Result res;
-    synth.noteOn(60, 127);
+    // Touch-stamped noteOn, as JucePadView sends it: touch 10 ms before the enqueue.
+    synth.noteOn(60, 127, juce::Time::getHighResolutionTicks() - juce::Time::secondsToHighResolutionTicks(0.010));
     int nBlocks = (int)(0.5 * 48000 / 512);
     for (int b = 0; b < nBlocks; ++b) {
         synth.processBlock(buf, midi);
@@ -264,7 +244,11 @@ static Result runSynthAlone() {
         res.synthCalls++;
     }
     res.synthPeak = res.peakNote;
-    res.pass = res.peakNote > 1e-3f && res.nans == 0 && res.zeroNoteBlocks == 0;
+    const double touchMs = synth.diag.lastTouchToRenderMs.load();
+    const double noteMs = synth.diag.lastNoteToRenderMs.load();
+    std::printf("ctl touch->render %.3f ms (expect >= 10), note->render %.3f ms\n", touchMs, noteMs);
+    res.pass = res.peakNote > 1e-3f && res.nans == 0 && res.zeroNoteBlocks == 0
+            && touchMs >= 10.0 && touchMs < 1000.0 && noteMs >= 0.0 && noteMs < touchMs;
     return res;
 }
 
@@ -287,19 +271,28 @@ int main() {
         {"g3", "as (g2) but dev buf == setup buf (512)",             48000, 512, 48000, 512, {512}, false, true},
         {"h","as (b), device restart mid-note (route change)",     48000, 512, 48000, 256, {256}, true, false, true},
         {"i",  "setup reads 0 Hz/0 (device setup not populated)",    0, 0, 48000, 256, {256}},
+        {"j",  "dev 48k/128, deliver 128 (latency target)",          48000, 128, 48000, 128, {128}},
+        {"k",  "dev 48k/256 (cap 1024), deliver 4096 (4 chunks)",    48000, 256, 48000, 256, {4096}},
+        {"k2", "dev 48k/128 (cap 1024), deliver 1500/128 (chunked)", 48000, 128, 48000, 128, {1500, 128}},
     };
 
-    std::printf("\n%-5s %-52s %-4s %8s %5s %11s %10s %7s %9s\n",
-                "case", "description", "res", "peak", "nan", "zero/blocks", "1st-sound", "synth#", "synthPk");
-    std::printf("%s\n", std::string(118, '-').c_str());
+    std::printf("\n%-5s %-52s %-4s %8s %5s %11s %10s %7s %9s %5s %13s\n",
+                "case", "description", "res", "peak", "nan", "zero/blocks", "1st-sound", "synth#", "synthPk",
+                "cap", "graph#/expect");
+    std::printf("%s\n", std::string(138, '-').c_str());
     auto row = [](const std::string& id, const std::string& d, const Result& r) {
-        std::printf("%-5s %-52s %-4s %8.4f %5d %5d/%-5d %10d %7d %9.4f\n", id.c_str(), d.c_str(),
+        std::printf("%-5s %-52s %-4s %8.4f %5d %5d/%-5d %10d %7d %9.4f %5d %6llu/%-6llu\n", id.c_str(), d.c_str(),
                     r.pass ? "PASS" : "FAIL", r.peakNote, r.nans, r.zeroNoteBlocks, r.noteBlocks,
-                    r.firstSoundBlock, r.synthCalls, r.synthPeak);
+                    r.firstSoundBlock, r.synthCalls, r.synthPeak, r.capacity,
+                    (unsigned long long)r.graphCalls, (unsigned long long)r.expectedGraphCalls);
         std::fflush(stdout);
     };
-    row("ctl", "synth alone, processBlock direct, 48k/512", runSynthAlone());
     int unexpected = 0;
+    {
+        const Result ctl = runSynthAlone();
+        unexpected += ctl.pass ? 0 : 1;
+        row("ctl", "synth alone + touch stamp, direct, 48k/512", ctl);
+    }
     for (auto& c : cases) {
         auto r = runCase(c);
         unexpected += (r.pass == c.expectSilence) ? 1 : 0;

@@ -11,6 +11,8 @@
 #include <cmath>
 #include <algorithm>
 
+#include "GraphPlayer.h"
+
 // Ensure MessageManager exists before any JUCE static initializers.
 // On iOS, __attribute__((constructor)) runs on the main thread for
 // statically-linked frameworks (which Expo modules are).
@@ -19,114 +21,9 @@ static void initJuceMessageManager() {
     juce::MessageManager::getInstance();
 }
 
-// Lightweight AudioIODeviceCallback that drives an AudioProcessorGraph.
-class GraphPlayer : public juce::AudioIODeviceCallback {
-public:
-    void setProcessor(juce::AudioProcessor* p) { processor = p; }
-
-    // Any thread: ask the audio thread to mix a 440 Hz test tone into the
-    // device output (after the graph) for durationMs.
-    void requestTestTone(double durationMs) {
-        if (!(durationMs > 0.0)) return;
-        toneRequestMs.store((int)std::min(durationMs, 10000.0), std::memory_order_relaxed);
-    }
-
-    // Diagnostics: written on the audio thread, read from any thread (relaxed).
-    std::atomic<uint64_t> callbackCount{0};
-    std::atomic<uint64_t> graphProcessCount{0};
-    std::atomic<uint64_t> nanCount{0};       // blocks with a non-finite output sample
-    std::atomic<float> outputPeak{0.0f};     // decaying hold of block max |x| (graph output)
-    std::atomic<uint64_t> toneSamplesMixed{0}; // cumulative test-tone samples mixed into output
-
-    void audioDeviceIOCallbackWithContext(const float* const* inputChannelData,
-                                          int numInputChannels,
-                                          float* const* outputChannelData,
-                                          int numOutputChannels,
-                                          int numSamples,
-                                          const juce::AudioIODeviceCallbackContext& context) override {
-        juce::ignoreUnused(inputChannelData, numInputChannels, context);
-        callbackCount.fetch_add(1, std::memory_order_relaxed);
-
-        if (!processor) {
-            for (int i = 0; i < numOutputChannels; ++i)
-                juce::FloatVectorOperations::clear(outputChannelData[i], numSamples);
-        } else {
-            buffer.setSize(numOutputChannels, numSamples, false, false, true);
-            buffer.clear();
-            juce::MidiBuffer midi;
-            processor->processBlock(buffer, midi);
-            graphProcessCount.fetch_add(1, std::memory_order_relaxed);
-            for (int i = 0; i < numOutputChannels; ++i)
-                juce::FloatVectorOperations::copy(outputChannelData[i], buffer.getReadPointer(i), numSamples);
-        }
-
-        // Measure graph output (before the test tone is mixed in).
-        float blockPeak = 0.0f;
-        bool nonFinite = false;
-        for (int ch = 0; ch < numOutputChannels; ++ch) {
-            const float* data = outputChannelData[ch];
-            if (data == nullptr) continue;
-            for (int s = 0; s < numSamples; ++s) {
-                const float v = data[s];
-                if (!std::isfinite(v)) nonFinite = true;
-                else blockPeak = std::max(blockPeak, std::fabs(v));
-            }
-        }
-        if (nonFinite) nanCount.fetch_add(1, std::memory_order_relaxed);
-        const float held = outputPeak.load(std::memory_order_relaxed) * diagPeakDecay(numSamples, deviceSampleRate);
-        outputPeak.store(std::max(blockPeak, held), std::memory_order_relaxed);
-
-        mixTestTone(outputChannelData, numOutputChannels, numSamples);
-    }
-
-    void audioDeviceAboutToStart(juce::AudioIODevice* device) override {
-        const double deviceSr = device->getCurrentSampleRate();
-        if (deviceSr > 0.0) deviceSampleRate = deviceSr;
-        if (processor) {
-            processor->setPlayConfigDetails(0, device->getActiveOutputChannels().countNumberOfSetBits(),
-                                            device->getCurrentSampleRate(),
-                                            device->getCurrentBufferSizeSamples());
-            processor->prepareToPlay(device->getCurrentSampleRate(),
-                                     device->getCurrentBufferSizeSamples());
-        }
-    }
-
-    void audioDeviceStopped() override {
-        if (processor)
-            processor->releaseResources();
-    }
-
-private:
-    // Audio thread only.
-    void mixTestTone(float* const* outputChannelData, int numOutputChannels, int numSamples) {
-        const int requestedMs = toneRequestMs.exchange(0, std::memory_order_relaxed);
-        if (requestedMs > 0)
-            toneSamplesRemaining = (int)(requestedMs * deviceSampleRate / 1000.0);
-        if (toneSamplesRemaining <= 0 || numOutputChannels <= 0) return;
-
-        const double twoPi = juce::MathConstants<double>::twoPi;
-        const double increment = twoPi * 440.0 / deviceSampleRate;
-        const int n = std::min(toneSamplesRemaining, numSamples);
-        for (int s = 0; s < n; ++s) {
-            const float v = 0.2f * (float)std::sin(tonePhase);
-            tonePhase += increment;
-            if (tonePhase >= twoPi) tonePhase -= twoPi;
-            for (int ch = 0; ch < numOutputChannels; ++ch)
-                if (outputChannelData[ch] != nullptr)
-                    outputChannelData[ch][s] += v;
-        }
-        toneSamplesRemaining -= n;
-        toneSamplesMixed.fetch_add((uint64_t)n, std::memory_order_relaxed);
-    }
-
-    juce::AudioProcessor* processor = nullptr;
-    juce::AudioBuffer<float> buffer;
-
-    double deviceSampleRate = 48000.0;   // set in audioDeviceAboutToStart
-    std::atomic<int> toneRequestMs{0};   // any thread → audio thread
-    int toneSamplesRemaining = 0;        // audio thread only
-    double tonePhase = 0.0;              // audio thread only
-};
+static const int kDefaultBufferSize = 128;
+static const double kDefaultSampleRate = 48000.0;
+static const int64_t kRecoveryDelayMs = 300; // let JUCE's own session handlers run first
 
 @interface BeeperAudioEngine ()
 @property (nonatomic, assign) bool isReady;
@@ -134,6 +31,17 @@ private:
 @property (nonatomic, readwrite, copy) NSString *lastError;
 @property (nonatomic, copy) BeatCallback beatCallback;
 @property (nonatomic, strong) dispatch_source_t beatTimer;
+// Options of the last setup call (reused by media-services-reset recovery).
+@property (nonatomic, assign) int requestedBufferSize;
+@property (nonatomic, assign) double requestedSampleRate;
+// Session safeguard / recovery (main thread only). Counters are cumulative since launch.
+@property (nonatomic, assign) BOOL observingSession;
+@property (nonatomic, assign) BOOL isReassertingSession;
+@property (nonatomic, assign) BOOL isRecovering;
+@property (nonatomic, assign) int sessionReassertCount;
+@property (nonatomic, assign) int interruptionCount;
+@property (nonatomic, assign) int mediaResetCount;
+@property (atomic, copy) NSString *lastRecoveryError; // atomic: diagnostics reads it off the main thread
 @end
 
 // Raw pointers — no JUCE smart pointers at file scope.
@@ -159,15 +67,21 @@ static TransportEngine* sTransport = nullptr;
     if (self) {
         _isReady = false;
         _setupStep = -1;
+        _requestedBufferSize = kDefaultBufferSize;
+        _requestedSampleRate = kDefaultSampleRate;
     }
     return self;
 }
 
 - (BOOL)setup {
+    return [self setupWithBufferSize:kDefaultBufferSize sampleRate:kDefaultSampleRate];
+}
+
+- (BOOL)setupWithBufferSize:(int)bufferSize sampleRate:(double)sampleRate {
     if (![NSThread isMainThread]) {
         NSLog(@"[BeeperAudioEngine] ERROR: setup() called off main thread, dispatching to main");
         __block BOOL ok = NO;
-        dispatch_sync(dispatch_get_main_queue(), ^{ ok = [self setup]; });
+        dispatch_sync(dispatch_get_main_queue(), ^{ ok = [self setupWithBufferSize:bufferSize sampleRate:sampleRate]; });
         return ok;
     }
 
@@ -176,11 +90,14 @@ static TransportEngine* sTransport = nullptr;
         return YES;
     }
 
+    self.requestedBufferSize = (bufferSize > 0) ? std::min(bufferSize, 4096) : kDefaultBufferSize;
+    self.requestedSampleRate = (sampleRate > 0.0) ? sampleRate : kDefaultSampleRate;
     self.setupStep = -1;
     self.lastError = nil;
 
     @try {
         [self doSetup];
+        if (self.isReady) [self registerSessionObservers];
     } @catch (NSException *exception) {
         NSLog(@"[BeeperAudioEngine] EXCEPTION in setup: %@ — %@", exception.name, exception.reason);
         [self noteFatal:[NSString stringWithFormat:@"exception %@: %@", exception.name, exception.reason]];
@@ -234,6 +151,23 @@ static TransportEngine* sTransport = nullptr;
                             activationError.localizedDescription]];
     }
 
+    // Preferred hardware format. JUCE's iOS device re-requests the buffer duration itself when it
+    // opens (see setAudioDeviceSetup below); these preferences cover the first open.
+    const int preferredBuffer = self.requestedBufferSize;
+    const double preferredRate = self.requestedSampleRate;
+    NSError *rateError = nil;
+    [session setPreferredSampleRate:preferredRate error:&rateError];
+    if (rateError) {
+        [self noteNonFatal:[NSString stringWithFormat:@"step 1 (non-fatal): setPreferredSampleRate(%.0f): %@",
+                            preferredRate, rateError.localizedDescription]];
+    }
+    NSError *durationError = nil;
+    [session setPreferredIOBufferDuration:(NSTimeInterval)preferredBuffer / preferredRate error:&durationError];
+    if (durationError) {
+        [self noteNonFatal:[NSString stringWithFormat:@"step 1 (non-fatal): setPreferredIOBufferDuration(%d/%.0f): %@",
+                            preferredBuffer, preferredRate, durationError.localizedDescription]];
+    }
+
     self.setupStep = 2;
     NSLog(@"[BeeperAudioEngine] Step 2: TransportEngine");
     sTransport = new TransportEngine();
@@ -255,6 +189,8 @@ static TransportEngine* sTransport = nullptr;
     }
     if (sDeviceManager->getCurrentAudioDevice() == nullptr) {
         [self noteNonFatal:@"step 4 (non-fatal): initialise returned no error but no device is open"];
+    } else {
+        [self applyPreferredDeviceSetupWithBufferSize:preferredBuffer sampleRate:preferredRate];
     }
 
     double sr = sDeviceManager->getAudioDeviceSetup().sampleRate;
@@ -304,6 +240,51 @@ static TransportEngine* sTransport = nullptr;
     NSLog(@"[BeeperAudioEngine] DONE — audio stack initialized (sr=%.0f, buf=%d)", sr, bufSize);
 }
 
+// Asks the open device for the preferred sample rate / buffer size through JUCE, so JUCE's own
+// device restarts (route changes) keep it. AudioDeviceManager::chooseBestBufferSize only accepts a
+// size listed in getAvailableBufferSizes() (otherwise it falls back to the device default, 256 on
+// iOS), so the nearest listed size is requested. Non-fatal: on error the device is restored.
+- (void)applyPreferredDeviceSetupWithBufferSize:(int)bufferSize sampleRate:(double)sampleRate {
+    if (sDeviceManager == nullptr) return;
+    juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice();
+    if (device == nullptr) return;
+
+    const juce::Array<int> sizes = device->getAvailableBufferSizes();
+    int chosen = bufferSize;
+    if (sizes.size() > 0 && !sizes.contains(bufferSize)) {
+        int best = sizes[0];
+        for (int i = 1; i < sizes.size(); ++i) {
+            const int candidate = sizes[i];
+            const int candidateDistance = candidate > bufferSize ? candidate - bufferSize : bufferSize - candidate;
+            const int bestDistance = best > bufferSize ? best - bufferSize : bufferSize - best;
+            if (candidateDistance < bestDistance || (candidateDistance == bestDistance && candidate > best))
+                best = candidate;
+        }
+        chosen = best;
+    }
+
+    const juce::AudioDeviceManager::AudioDeviceSetup original = sDeviceManager->getAudioDeviceSetup();
+    juce::AudioDeviceManager::AudioDeviceSetup wanted = original;
+    wanted.sampleRate = sampleRate;
+    wanted.bufferSize = chosen;
+    NSLog(@"[BeeperAudioEngine] Step 4: setAudioDeviceSetup(sr=%.0f, buf=%d; requested %d)", sampleRate, chosen, bufferSize);
+    const juce::String error = sDeviceManager->setAudioDeviceSetup(wanted, true);
+    if (error.isEmpty()) return;
+
+    NSString *message = [NSString stringWithUTF8String:error.toRawUTF8()];
+    [self noteNonFatal:[NSString stringWithFormat:@"step 4 (non-fatal): setAudioDeviceSetup(%.0f Hz, %d): %@",
+                        sampleRate, chosen, message ?: @"(unprintable error)"]];
+    juce::AudioIODevice* current = sDeviceManager->getCurrentAudioDevice();
+    if (current == nullptr || !current->isPlaying()) {
+        const juce::String restoreError = sDeviceManager->setAudioDeviceSetup(original, true);
+        if (restoreError.isNotEmpty()) {
+            NSString *restoreMessage = [NSString stringWithUTF8String:restoreError.toRawUTF8()];
+            [self noteNonFatal:[NSString stringWithFormat:@"step 4 (non-fatal): restoring device setup: %@",
+                                restoreMessage ?: @"(unprintable error)"]];
+        }
+    }
+}
+
 - (void)cleanup {
     NSLog(@"[BeeperAudioEngine] Cleaning up after failure...");
     if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
@@ -317,6 +298,7 @@ static TransportEngine* sTransport = nullptr;
 
 - (void)shutdown {
     if (![NSThread isMainThread]) return;
+    [self unregisterSessionObservers];
     if (!self.isReady) return;
 
     NSLog(@"[BeeperAudioEngine] Shutting down...");
@@ -324,6 +306,185 @@ static TransportEngine* sTransport = nullptr;
     if (sSynth) sSynth->allNotesOff();
     [self cleanup];
     NSLog(@"[BeeperAudioEngine] Shutdown complete");
+}
+
+// ── Session safeguard + recovery ──
+// JUCE's iOS device (juce_Audio_ios.cpp) also observes these notifications: on interruption
+// began/ended it stops/starts its audio unit (handleStatusChange), on media-services reset it only
+// restarts the old (now dead) unit, and on CategoryChange it does nothing. What is added here:
+// re-assert our Playback category if something else changed it, reactivate the session and
+// reopen the device if it is still stopped after an interruption, and rebuild the whole engine
+// after a media-services reset. Notifications can arrive on any thread; all work runs on main.
+
+- (void)registerSessionObservers {
+    if (self.observingSession) return;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserver:self
+               selector:@selector(handleSessionRouteChange:)
+                   name:AVAudioSessionRouteChangeNotification
+                 object:nil];
+    [center addObserver:self
+               selector:@selector(handleSessionInterruption:)
+                   name:AVAudioSessionInterruptionNotification
+                 object:nil];
+    [center addObserver:self
+               selector:@selector(handleSessionMediaServicesReset:)
+                   name:AVAudioSessionMediaServicesWereResetNotification
+                 object:nil];
+    self.observingSession = YES;
+}
+
+- (void)unregisterSessionObservers {
+    if (!self.observingSession) return;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:self name:AVAudioSessionRouteChangeNotification object:nil];
+    [center removeObserver:self name:AVAudioSessionInterruptionNotification object:nil];
+    [center removeObserver:self name:AVAudioSessionMediaServicesWereResetNotification object:nil];
+    self.observingSession = NO;
+}
+
+- (void)noteRecoveryError:(NSString *)message {
+    NSLog(@"[BeeperAudioEngine] recovery: %@", message);
+    self.lastRecoveryError = message;
+}
+
+- (void)handleSessionRouteChange:(NSNotification *)notification {
+    NSNumber *reasonValue = notification.userInfo[AVAudioSessionRouteChangeReasonKey];
+    if (reasonValue == nil) return;
+    const AVAudioSessionRouteChangeReason reason = (AVAudioSessionRouteChangeReason)reasonValue.unsignedIntegerValue;
+    if (reason != AVAudioSessionRouteChangeReasonCategoryChange) return;
+    __weak BeeperAudioEngine *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf reassertSessionCategoryIfNeeded];
+    });
+}
+
+// Main thread. Another component (e.g. a recording or video library) switched the shared session
+// to a category that cannot play our output; switch it back.
+- (void)reassertSessionCategoryIfNeeded {
+    if (!self.isReady || self.isReassertingSession) return;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSString *category = session.category;
+    if ([category isEqualToString:AVAudioSessionCategoryPlayback] ||
+        [category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
+        return;
+    }
+
+    self.isReassertingSession = YES;
+    self.sessionReassertCount = self.sessionReassertCount + 1;
+    NSLog(@"[BeeperAudioEngine] session category changed to %@; re-asserting Playback", category);
+
+    NSError *categoryError = nil;
+    [session setCategory:AVAudioSessionCategoryPlayback
+             withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                   error:&categoryError];
+    if (categoryError) {
+        [self noteRecoveryError:[NSString stringWithFormat:@"re-assert setCategory: %@",
+                                 categoryError.localizedDescription]];
+    }
+    NSError *activationError = nil;
+    [session setActive:YES error:&activationError];
+    if (activationError) {
+        [self noteRecoveryError:[NSString stringWithFormat:@"re-assert setActive: %@",
+                                 activationError.localizedDescription]];
+    }
+    self.isReassertingSession = NO;
+
+    [self restartDeviceIfStopped:@"category change"];
+}
+
+- (void)handleSessionInterruption:(NSNotification *)notification {
+    NSNumber *typeValue = notification.userInfo[AVAudioSessionInterruptionTypeKey];
+    if (typeValue == nil) return;
+    const AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)typeValue.unsignedIntegerValue;
+    __weak BeeperAudioEngine *weakSelf = self;
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BeeperAudioEngine *strongSelf = weakSelf;
+            if (strongSelf == nil) return;
+            strongSelf.interruptionCount = strongSelf.interruptionCount + 1;
+            NSLog(@"[BeeperAudioEngine] audio session interruption began");
+        });
+    } else if (type == AVAudioSessionInterruptionTypeEnded) {
+        // Resume whether or not the system set AVAudioSessionInterruptionOptionShouldResume:
+        // this is an instrument; it should be playable as soon as the interruption is over.
+        // Delayed so JUCE's own handler (which restarts its audio unit) runs first.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kRecoveryDelayMs * (int64_t)NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf recoverFromInterruption];
+        });
+    }
+}
+
+// Main thread.
+- (void)recoverFromInterruption {
+    if (!self.isReady || sDeviceManager == nullptr) return;
+    NSLog(@"[BeeperAudioEngine] audio session interruption ended; reactivating");
+    NSError *activationError = nil;
+    [[AVAudioSession sharedInstance] setActive:YES error:&activationError];
+    if (activationError) {
+        [self noteRecoveryError:[NSString stringWithFormat:@"interruption ended setActive: %@",
+                                 activationError.localizedDescription]];
+    }
+    [self restartDeviceIfStopped:@"interruption"];
+}
+
+- (BOOL)isDeviceRunning {
+    if (sDeviceManager == nullptr) return NO;
+    juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice();
+    return (device != nullptr && device->isPlaying()) ? YES : NO;
+}
+
+// Main thread. Reopens the JUCE device with its last setup if it is closed or stopped; if that
+// does not get it running, rebuilds the whole engine.
+- (void)restartDeviceIfStopped:(NSString *)context {
+    if (!self.isReady || sDeviceManager == nullptr) return;
+    if ([self isDeviceRunning]) return;
+
+    NSLog(@"[BeeperAudioEngine] device not running after %@; reopening", context);
+    if (sDeviceManager->getCurrentAudioDevice() != nullptr)
+        sDeviceManager->closeAudioDevice();
+    sDeviceManager->restartLastAudioDevice();
+    if ([self isDeviceRunning]) return;
+
+    [self noteRecoveryError:[NSString stringWithFormat:@"device did not restart after %@; rebuilding engine", context]];
+    [self rebuildEngine:context];
+}
+
+- (void)handleSessionMediaServicesReset:(NSNotification *)notification {
+    __weak BeeperAudioEngine *weakSelf = self;
+    // Delayed so JUCE's own handler has finished with the old device before it is deleted.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kRecoveryDelayMs * (int64_t)NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        BeeperAudioEngine *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        strongSelf.mediaResetCount = strongSelf.mediaResetCount + 1;
+        [strongSelf rebuildEngine:@"media services reset"];
+    });
+}
+
+// Main thread. Full teardown + setup with the last options. Keeps the beat callback and timer.
+- (void)rebuildEngine:(NSString *)context {
+    if (self.isRecovering) return;
+    if (!self.isReady) return;
+    self.isRecovering = YES;
+    NSLog(@"[BeeperAudioEngine] rebuilding engine (%@)", context);
+
+    BeatCallback savedCallback = self.beatCallback;
+    const BOOL timerWasRunning = (self.beatTimer != nil) ? YES : NO;
+    const int bufferSize = self.requestedBufferSize;
+    const double sampleRate = self.requestedSampleRate;
+
+    [self shutdown];
+    const BOOL ok = [self setupWithBufferSize:bufferSize sampleRate:sampleRate];
+    if (ok) {
+        self.beatCallback = savedCallback;
+        if (timerWasRunning) [self startBeatTimer];
+    } else {
+        [self noteRecoveryError:[NSString stringWithFormat:@"rebuild after %@ failed: step %d: %@",
+                                 context, self.setupStep, self.lastError ?: @"unknown error"]];
+    }
+    self.isRecovering = NO;
 }
 
 // ── Diagnostics ──
@@ -375,6 +536,14 @@ static TransportEngine* sTransport = nullptr;
     d[@"notesDropped"] = @(synth ? (double)synth->diag.notesDropped.load(relaxed) : 0.0);
     d[@"activeVoices"] = @(synth ? synth->diag.activeVoices.load(relaxed) : 0);
     d[@"lastNoteToRenderMs"] = @(synth ? synth->diag.lastNoteToRenderMs.load(relaxed) : -1.0);
+    d[@"lastTouchToRenderMs"] = @(synth ? synth->diag.lastTouchToRenderMs.load(relaxed) : -1.0);
+
+    d[@"preferredBufferSize"] = @(self.requestedBufferSize);
+    d[@"preferredSampleRate"] = @(self.requestedSampleRate);
+    d[@"sessionReassertCount"] = @(self.sessionReassertCount);
+    d[@"interruptionCount"] = @(self.interruptionCount);
+    d[@"mediaResetCount"] = @(self.mediaResetCount);
+    d[@"lastRecoveryError"] = self.lastRecoveryError ?: @"";
 
     AVAudioSession *session = [AVAudioSession sharedInstance];
     d[@"sessionCategory"] = session.category ?: @"";
@@ -406,6 +575,16 @@ static TransportEngine* sTransport = nullptr;
 - (void)noteOn:(int)note velocity:(int)velocity {
     if (!self.isReady || !sSynth) return;
     sSynth->noteOn(note, velocity);
+}
+
+- (void)noteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
+    if (!self.isReady || !sSynth) return;
+    // UITouch.timestamp is seconds on the mach_absolute_time clock; on Apple platforms
+    // juce::Time::getHighResolutionTicks() is mach_absolute_time(), so convert with JUCE's rate.
+    const juce::int64 touchTicks = (touchTimestamp > 0.0)
+        ? juce::Time::secondsToHighResolutionTicks(touchTimestamp)
+        : (juce::int64)0;
+    sSynth->noteOn(note, velocity, touchTicks);
 }
 
 - (void)noteOff:(int)note {

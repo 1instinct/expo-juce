@@ -12,7 +12,9 @@ wsl -e bash -lc "cd /mnt/c/Users/aaron/Internal/Beeper/code/expo-juce/test/harne
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`) are
   taken from `git show HEAD:ios/...`; pass `-DHARNESS_GIT_REF=WORKTREE` (or any ref) to change.
-- `GraphPlayer` is a verbatim copy inside `harness.cpp` (source commit noted there).
+- `GraphPlayer` is the shipped class from `ios/GraphPlayer.h` (same git ref). Cases `k`/`k2` deliver
+  blocks larger than its preallocated capacity and check the chunked render (graph calls = ceil(n/cap)
+  per block, no silent block tails, no buffer growth).
 - Needs no root: missing X11/freetype dev headers (only needed because
   `juce_audio_processors` includes the gui modules) are fetched into `build/sysroot` by
   `fetch_deps.sh` via `apt-get download` + `dpkg -x`.

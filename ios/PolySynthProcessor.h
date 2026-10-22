@@ -27,6 +27,7 @@ struct SynthDiagnostics {
     std::atomic<uint32_t> notesDropped{0};        // noteOn rejected: event queue full
     std::atomic<int> activeVoices{0};
     std::atomic<double> lastNoteToRenderMs{-1.0}; // -1 = no NoteOn consumed yet
+    std::atomic<double> lastTouchToRenderMs{-1.0}; // -1 = no touch-stamped NoteOn consumed yet
 };
 
 // Per-block decay factor for peak holds: halves roughly every 300 ms
@@ -43,6 +44,7 @@ struct NoteEvent {
     int note;
     int velocity;
     juce::int64 stampTicks; // juce::Time::getHighResolutionTicks() at enqueue (0 if unused)
+    juce::int64 touchTicks; // originating UITouch.timestamp in high-res ticks (same clock); 0 if not a touch
 };
 
 class PolySynthProcessor : public juce::AudioProcessor {
@@ -69,8 +71,10 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
-    // Thread-safe: called from main thread, queued for audio thread
-    void noteOn(int note, int velocity);
+    // Thread-safe: called from main thread, queued for audio thread.
+    // touchTicks: originating UITouch timestamp in juce::Time high-resolution ticks
+    // (mach_absolute_time on Apple), or 0 when the note did not come from a touch.
+    void noteOn(int note, int velocity, juce::int64 touchTicks = 0);
     void noteOff(int note);
     void allNotesOff();
 

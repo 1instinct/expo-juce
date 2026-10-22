@@ -1,19 +1,34 @@
 import { NativeModulesProxy, EventEmitter, Subscription } from 'expo-modules-core';
 
 import ExpoJuceModule from './ExpoJuceModule';
-import ExpoJuceView from './ExpoJuceView';
+import JucePadView from './JucePadView';
 import {
   ChangeEventPayload,
   BeatEventPayload,
-  ExpoJuceViewProps,
   AudioDiagnostics,
+  SetupOptions,
+  JucePadViewProps,
+  PadNoteOnEvent,
+  PadNoteOffEvent,
 } from './ExpoJuce.types';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
 // Rejects with code 'ERR_AUDIO_SETUP' and message "step N: <error>" if native setup fails.
-export async function setup(): Promise<void> {
-  return ExpoJuceModule.setup();
+// options: preferred buffer size (samples, default 128) and sample rate (Hz, default 48000).
+// No effect if the engine is already set up.
+export async function setup(options?: SetupOptions): Promise<void> {
+  const nativeOptions: { bufferSize?: number; sampleRate?: number } = {};
+  if (options?.bufferSize !== undefined) nativeOptions.bufferSize = options.bufferSize;
+  if (options?.sampleRate !== undefined) nativeOptions.sampleRate = options.sampleRate;
+  return ExpoJuceModule.setup(nativeOptions);
+}
+
+// True if the native binary includes JucePadView (false on older binaries and on web).
+export function isJucePadViewAvailable(): boolean {
+  return (
+    typeof ExpoJuceModule?.hasJucePadView === 'function' && ExpoJuceModule.hasJucePadView() === true
+  );
 }
 
 export async function shutdown(): Promise<void> {
@@ -133,4 +148,13 @@ export function addBeatListener(listener: (event: BeatEventPayload) => void): Su
   return emitter.addListener<BeatEventPayload>('onBeat', listener);
 }
 
-export { ExpoJuceView, ExpoJuceViewProps, ChangeEventPayload, BeatEventPayload, AudioDiagnostics };
+export {
+  JucePadView,
+  JucePadViewProps,
+  PadNoteOnEvent,
+  PadNoteOffEvent,
+  SetupOptions,
+  ChangeEventPayload,
+  BeatEventPayload,
+  AudioDiagnostics,
+};

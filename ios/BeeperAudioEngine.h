@@ -11,7 +11,12 @@ typedef void(^BeatCallback)(double beat, double bpm);
 // Lifecycle
 // Returns YES on success (or if already initialized). On failure, setupStep
 // holds the step that failed and lastError a description.
+// -setup uses the defaults: 128-sample buffer at 48000 Hz.
 - (BOOL)setup;
+// Preferred I/O buffer size (samples) and sample rate; the device grants the nearest it
+// supports (see diagnostics: bufferSize / sampleRate vs preferredBufferSize / preferredSampleRate).
+// Values <= 0 fall back to the defaults.
+- (BOOL)setupWithBufferSize:(int)bufferSize sampleRate:(double)sampleRate;
 - (void)shutdown;
 
 // Diagnostics
@@ -23,6 +28,9 @@ typedef void(^BeatCallback)(double beat, double bpm);
 
 // Synth — MIDI-style
 - (void)noteOn:(int)note velocity:(int)velocity;
+// noteOn from a native touch: touchTimestamp is UITouch.timestamp (seconds since boot,
+// mach_absolute_time clock). Used for the lastTouchToRenderMs diagnostic.
+- (void)noteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp;
 - (void)noteOff:(int)note;
 - (void)allNotesOff;
 

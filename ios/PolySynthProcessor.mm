@@ -27,10 +27,16 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         processNoteEvent(event);
         if (event.type == NoteEvent::NoteOn) {
             diag.notesConsumed.fetch_add(1, std::memory_order_relaxed);
+            const juce::int64 nowTicks = juce::Time::getHighResolutionTicks();
             if (event.stampTicks != 0) {
-                const juce::int64 elapsed = juce::Time::getHighResolutionTicks() - event.stampTicks;
+                const juce::int64 elapsed = nowTicks - event.stampTicks;
                 diag.lastNoteToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
                                               std::memory_order_relaxed);
+            }
+            if (event.touchTicks != 0 && nowTicks >= event.touchTicks) {
+                const juce::int64 elapsed = nowTicks - event.touchTicks;
+                diag.lastTouchToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
+                                               std::memory_order_relaxed);
             }
         }
         rp = (rp + 1) % EVENT_QUEUE_SIZE;
@@ -122,14 +128,14 @@ void PolySynthProcessor::processNoteEvent(const NoteEvent& event) {
 }
 
 // Called from main thread — pushes event to lock-free FIFO
-void PolySynthProcessor::noteOn(int note, int velocity) {
+void PolySynthProcessor::noteOn(int note, int velocity, juce::int64 touchTicks) {
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) { // full, drop event
         diag.notesDropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    eventQueue[wp] = { NoteEvent::NoteOn, note, velocity, juce::Time::getHighResolutionTicks() };
+    eventQueue[wp] = { NoteEvent::NoteOn, note, velocity, juce::Time::getHighResolutionTicks(), touchTicks };
     // Count before publishing: the release-store below orders this increment
     // ahead of the consumer's notesConsumed increment for the same event.
     diag.notesQueued.fetch_add(1, std::memory_order_relaxed);
@@ -140,7 +146,7 @@ void PolySynthProcessor::noteOff(int note) {
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::NoteOff, note, 0, 0 };
+    eventQueue[wp] = { NoteEvent::NoteOff, note, 0, 0, 0 };
     eventWritePos.store(nextWp, std::memory_order_release);
 }
 
@@ -148,7 +154,7 @@ void PolySynthProcessor::allNotesOff() {
     int wp = eventWritePos.load(std::memory_order_relaxed);
     int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
     if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::AllNotesOff, 0, 0, 0 };
+    eventQueue[wp] = { NoteEvent::AllNotesOff, 0, 0, 0, 0 };
     eventWritePos.store(nextWp, std::memory_order_release);
 }
 

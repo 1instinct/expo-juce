@@ -1,3 +1,6 @@
+import type * as React from 'react';
+import type { StyleProp, ViewStyle } from 'react-native';
+
 export type ChangeEventPayload = {
   value: string;
 };
@@ -7,8 +10,37 @@ export type BeatEventPayload = {
   bpm: number;
 };
 
-export type ExpoJuceViewProps = {
-  name: string;
+export type SetupOptions = {
+  /** Preferred I/O buffer size in samples (default 128). The device grants the nearest size it supports. */
+  bufferSize?: number;
+  /** Preferred sample rate in Hz (default 48000). */
+  sampleRate?: number;
+};
+
+/** Payload of `JucePadView` `onNoteOn`. */
+export type PadNoteOnEvent = {
+  note: number;
+  velocity: number;
+};
+
+/** Payload of `JucePadView` `onNoteOff`. */
+export type PadNoteOffEvent = {
+  note: number;
+};
+
+export type JucePadViewProps = {
+  /** MIDI note triggered while the pad is touched. */
+  note: number;
+  /** MIDI velocity 0-127 (default 100). */
+  velocity?: number;
+  /** When false, touches pass through and no note is played (default true). */
+  enabled?: boolean;
+  /** Fired on the first touch, after the note has been sent to the engine (visuals/haptics only). */
+  onNoteOn?: (event: PadNoteOnEvent) => void;
+  /** Fired when the last touch lifts or is cancelled, after the note-off was sent. */
+  onNoteOff?: (event: PadNoteOffEvent) => void;
+  style?: StyleProp<ViewStyle>;
+  children?: React.ReactNode;
 };
 
 /**
@@ -49,6 +81,20 @@ export type AudioDiagnostics = {
   activeVoices: number;
   /** ms from noteOn enqueue to the synth consuming it; -1 if none yet. */
   lastNoteToRenderMs: number;
+  /** ms from the UITouch hardware timestamp (JucePadView) to the synth consuming the note; -1 if none yet. */
+  lastTouchToRenderMs: number;
+  /** Buffer size (samples) requested at setup; compare with `bufferSize` (granted). */
+  preferredBufferSize: number;
+  /** Sample rate (Hz) requested at setup; compare with `sampleRate` (granted). */
+  preferredSampleRate: number;
+  /** Times another component changed the session category and it was re-asserted to Playback. */
+  sessionReassertCount: number;
+  /** AVAudioSession interruptions (calls, Siri, alarms) begun since launch. */
+  interruptionCount: number;
+  /** AVAudioSession media-services resets handled (full engine rebuild) since launch. */
+  mediaResetCount: number;
+  /** Last session-recovery problem; empty string if none. */
+  lastRecoveryError: string;
   sessionCategory: string;
   sessionSampleRate: number;
   sessionIOBufferMs: number;

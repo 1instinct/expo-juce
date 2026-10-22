@@ -23,7 +23,7 @@ Pod::Spec.new do |s|
   # manual retain/release. Only files listed here get ARC enabled.
   s.requires_arc = [
     'ExpoJuceModule.swift',
-    'ExpoJuceView.swift',
+    'JucePadView.swift',
     'ExpoJuceBridge.m',
     'BeeperAudioEngine.mm',
     'PolySynthProcessor.mm',
@@ -41,6 +41,7 @@ Pod::Spec.new do |s|
     "VoiceAllocator.h",
     "PolySynthProcessor.h",
     "TransportEngine.h",
+    "GraphPlayer.h",
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)

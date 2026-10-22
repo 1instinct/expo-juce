@@ -4,6 +4,9 @@
 @implementation ExpoJuceBridge
 
 + (BOOL)setup { return [[BeeperAudioEngine sharedInstance] setup]; }
++ (BOOL)setupWithBufferSize:(int)bufferSize sampleRate:(double)sampleRate {
+    return [[BeeperAudioEngine sharedInstance] setupWithBufferSize:bufferSize sampleRate:sampleRate];
+}
 + (NSString *)setupErrorMessage {
     BeeperAudioEngine *engine = [BeeperAudioEngine sharedInstance];
     NSString *error = engine.lastError ?: @"unknown error";
@@ -20,6 +23,9 @@
 // ── Synth ──
 + (void)noteOn:(int)note velocity:(int)velocity {
     [[BeeperAudioEngine sharedInstance] noteOn:note velocity:velocity];
+}
++ (void)padNoteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
+    [[BeeperAudioEngine sharedInstance] noteOn:note velocity:velocity touchTimestamp:touchTimestamp];
 }
 + (void)noteOff:(int)note {
     [[BeeperAudioEngine sharedInstance] noteOff:note];

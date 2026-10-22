@@ -36,7 +36,7 @@ public:
     int fadeOutTailPos = 0;
     bool hasFadeOutTail() const { return fadeOutTailPos < fadeOutTailLength; }
 
-    std::atomic<float> attackMs{10.0f};
+    std::atomic<float> attackMs{2.0f};
     std::atomic<float> decayMs{1.0f};
     std::atomic<float> sustainLevel{1.0f};
     std::atomic<float> releaseMs{200.0f};

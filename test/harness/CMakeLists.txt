@@ -38,6 +38,21 @@ foreach(u IN LISTS ENGINE_UNITS)
   endforeach()
   list(APPEND ENGINE_CPP "${SNAP}/${u}.cpp")
 endforeach()
+# Header-only engine units (pure C++), e.g. the device callback GraphPlayer.
+set(ENGINE_HEADERS GraphPlayer)
+foreach(u IN LISTS ENGINE_HEADERS)
+  set(out "${SNAP}/${u}.h")
+  if(HARNESS_GIT_REF STREQUAL "WORKTREE")
+    configure_file("${REPO_ROOT}/ios/${u}.h" "${out}" COPYONLY)
+  else()
+    execute_process(COMMAND git show "${HARNESS_GIT_REF}:ios/${u}.h"
+                    WORKING_DIRECTORY "${REPO_ROOT}" OUTPUT_FILE "${out}"
+                    RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "git show ${HARNESS_GIT_REF}:ios/${u}.h failed")
+    endif()
+  endif()
+endforeach()
 
 # ── Linux dev headers for JUCE gui modules (needed only because juce_audio_processors
 #    includes juce_gui_extra). Fetched rootless into the build dir if not installed. ──
