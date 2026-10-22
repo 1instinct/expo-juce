@@ -1,6 +1,6 @@
 // Offline reproduction of the iOS native audio path (ios/BeeperAudioEngine.mm doSetup +
 // AudioDeviceManager::addAudioCallback + the device's audio thread), driven by a fake
-// AudioIODevice. See README.md and docs/superpowers/specs/2026-10-21-audio-silence-diagnostics.md.
+// AudioIODevice. See README.md.
 #include "JuceConfig.h"
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>

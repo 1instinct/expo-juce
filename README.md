@@ -40,14 +40,14 @@ Terms used below are explained in the
 expo-juce is being built toward full audio workstation capabilities. The work is decomposed into independent sub-projects, each building on the previous:
 
 ### Sub-project 1: Polyphonic Synth Engine
-**Status:** Done — working on device (iPhone, 2026-10-22) — [spec](docs/superpowers/specs/2026-05-11-polyphonic-synth-engine-design.md), [plan](docs/superpowers/plans/2026-05-11-polyphonic-synth-engine.md)
+**Status:** Done — working on device (iPhone, 2026-10-22)
 
 Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack built on `AudioProcessorGraph`. 8-voice polyphonic synth with per-voice oscillator, SVF filter, and full ADSR envelope. MIDI-style API (`noteOn(note, velocity)` / `noteOff(note)`). JUCE owns device management and output for cross-platform support (iOS, macOS, Windows, Linux).
 
 ### Diagnostics, recovery and latency
-**Status:** Diagnostics done (0.5.2-diag.x); recovery and latency margin in progress (0.5.2+) — [silence spec](docs/superpowers/specs/2026-10-21-audio-silence-diagnostics.md), [latency spec](docs/superpowers/specs/2026-10-22-latency-margin.md), [latency guide](docs/latency.md)
+**Status:** Diagnostics done (0.5.2-diag.x); recovery and latency margin in 0.5.2 — see the [latency guide](docs/latency.md)
 
-`setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. In progress: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (restoring what was lost with `JuceToneGenerator`, see the [salvage inventory](docs/superpowers/2026-10-22-salvage-inventory.md)).
+`setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. 0.5.2 adds: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (restoring what was lost with `JuceToneGenerator`).
 
 ### Sub-project 2: Effects Chain
 **Status:** Planned
@@ -184,8 +184,7 @@ expo-juce/
 ├── test/harness/            # Offline JUCE graph harness (WSL, CMake)
 ├── example/                 # Old example app (Expo 51, pinned expo-juce 0.1.1) — stale; BeeperNative is the reference app
 ├── docs/
-│   ├── latency.md           # Latency guide and measurement procedure
-│   └── superpowers/         # Specs, plans and the salvage inventory
+│   └── latency.md           # Latency guide and measurement procedure
 └── package.json
 ```
 
@@ -233,10 +232,6 @@ its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the m
 ## Documentation
 
 - [docs/latency.md](docs/latency.md) — latency budget, signal path, changes, panel fields, slow-motion measurement
-- [docs/superpowers/specs/2026-05-11-polyphonic-synth-engine-design.md](docs/superpowers/specs/2026-05-11-polyphonic-synth-engine-design.md) and its [plan](docs/superpowers/plans/2026-05-11-polyphonic-synth-engine.md)
-- [docs/superpowers/specs/2026-10-21-audio-silence-diagnostics.md](docs/superpowers/specs/2026-10-21-audio-silence-diagnostics.md) — silence investigation, diagnostics design
-- [docs/superpowers/specs/2026-10-22-latency-margin.md](docs/superpowers/specs/2026-10-22-latency-margin.md) — latency work spec and plan
-- [docs/superpowers/2026-10-22-salvage-inventory.md](docs/superpowers/2026-10-22-salvage-inventory.md) — what is reusable from earlier audio code
 - [BeeperNative README](https://github.com/Beeper-Buzz/BeeperNative/blob/@aaron.smulktis/develop/README.md) and [GLOSSARY](https://github.com/Beeper-Buzz/BeeperNative/blob/@aaron.smulktis/develop/GLOSSARY.md) — the app and its vocabulary (land on that branch when `debug/audio-diagnostics` is merged)
 
 ## License

@@ -3,7 +3,7 @@
 How long it takes from a finger touching a pad in the Beeper app to sound leaving the
 phone, where that time goes, what expo-juce does about it, how to read the numbers the
 app reports, and how to measure the real figure with a slow-motion camera. Written for
-the latency-margin work of 2026-10-22 ([spec](superpowers/specs/2026-10-22-latency-margin.md));
+the latency-margin work of 2026-10-22;
 behaviour that arrives with that work is marked **(0.5.2+)** and should be re-checked
 against the code and a device once it ships.
 
