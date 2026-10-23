@@ -238,6 +238,23 @@ estimated is the part the app cannot see (segment 1 plus, on the `Pressable` pat
 
 ## 7. Results
 
+### TODO: device checks pending for 0.5.2
+
+`0.5.2-rc.2` compiles and installs (EAS preview, app build 7, 2026-10-23); these checks have
+not been run on a device yet:
+
+- [ ] **Latency:** slow-motion measurement (section 6) on the built-in speaker, recorded below.
+- [ ] **Stuck notes:** mash pads quickly and lift; nothing keeps sounding, `notesDropped` stays 0.
+- [ ] **Interruption:** hold a pad, then trigger an interruption (incoming call, Siri, alarm).
+      After it ends: silence (no stuck note), `interruptionCount` moved, pads play again,
+      `lastRecoveryError` empty.
+- [ ] **Route change:** plug and unplug wired headphones while playing; sound follows the route,
+      no stuck note.
+- [ ] **State across recovery:** change waveform / envelope and tempo, start the transport, then
+      trigger an interruption. Settings, tempo and play state are unchanged afterwards. (The full
+      rebuild path, a media-services reset, is hard to trigger on demand; the offline harness
+      covers it with case `rs`.)
+
 Copy the template row; newest first.
 
 | Date | Build (app / expo-juce) | Device / iOS | Route | Buffer (actual / pref.) | Panel est. (ms) | Measured median (ms) | Min | Max | Notes |

@@ -11,8 +11,11 @@ class JucePadView: ExpoView {
 
   var note: Int = 60
   var velocity: Int = 100
+  // Disabled pads leave hit-testing entirely, so touches reach the views underneath (forwarding
+  // to super would only walk the responder chain, which does not include siblings).
   var enabled: Bool = true {
     didSet {
+      isUserInteractionEnabled = enabled
       if !enabled {
         releaseAllTouches()
       }
