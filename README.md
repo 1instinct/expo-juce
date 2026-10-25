@@ -23,10 +23,12 @@ iOS only for now; the Android and web modules are scaffolds.
         │
  juce::AudioDeviceManager ─► GraphPlayer (AudioIODeviceCallback: graph, peaks, NaNs, test tone)
         │
- juce::AudioProcessorGraph  PolySynthProcessor ─► audio output node
+ juce::AudioProcessorGraph  PolySynthProcessor ─► FxChainProcessor ─► audio output node
                             ├─ NoteEventQueue: note-on ring (256) drained at block start; releases as marks
                             ├─ 8 × Voice: dsp::Oscillator → StateVariableTPTFilter (LP) → ADSR
                             └─ TransportEngine (tempo / position / beat crossings)
+                            FxChainProcessor: drive → crush → eq → chorus → phaser → echo → reverb →
+                            pump → compressor → safety limiter; settings in a process-lifetime store
 ```
 
 ## Roadmap: Full Audio Workstation
@@ -44,9 +46,9 @@ Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack buil
 `setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. 0.5.2 adds: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (keeping synth settings and transport state across rebuilds).
 
 ### Sub-project 2: Effects Chain
-**Status:** Planned
+**Status:** In progress (0.6.0) — engine + JS API done and verified in the offline harness; not yet run on a device
 
-Add `AudioProcessor` nodes for standard effects: reverb, delay, distortion, EQ, compressor. Inserted into the graph after the synth node on a master effects bus. Each effect is an independent processor — can be bypassed, reordered, or removed.
+One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Next in 0.6.0: an aux path (metronome, backing track) summed into the output after the effects. Later: reorderable / per-node effects via modular routing (sub-project 5).
 
 ### Sub-project 3: Sample Playback / Drum Machine
 **Status:** Planned — an earlier JUCE sampler prototype is the starting point
@@ -126,6 +128,46 @@ ExpoJuce.playTestTone(500);           // 440 Hz into the device output, bypasses
 await ExpoJuce.shutdown();
 ```
 
+### Effects (0.6.0+)
+
+A master effects chain sits between the synth and the output. All effects are off by
+default; order is fixed (drive → crush → eq → chorus → phaser → echo → reverb → pump →
+compressor), followed by a safety limiter (-0.3 dBFS ceiling, always on, not user-facing).
+
+```ts
+ExpoJuce.setEffectEnabled('reverb', true);            // boolean: false = unknown effect
+ExpoJuce.setEffectParam('reverb', 'mix', 0.4);        // boolean: false = unknown effect/param or NaN
+ExpoJuce.setEffectParam('echo', 'division', 1);       // synced echo, 1/8 at the transport tempo
+const fx = ExpoJuce.getEffectsState();                // { reverb: { enabled, params: { size, … } }, … }
+```
+
+- Synchronous and lock-free, any thread. Values are clamped to the ranges below (switches and
+  division indices rounded); `getEffectsState()` reports the stored values.
+- Settings are remembered natively whether or not the engine is running: calls made before
+  `setup()`, or during an automatic engine rebuild, take effect when the chain runs.
+- Turning an effect on or off crossfades it (10 ms); a disabled effect is skipped entirely and
+  an effect turned on starts clean (no stale echo or reverb tail). With every effect off the
+  output is the synth output, bit for bit (while it stays under the limiter ceiling).
+- Parameter changes are smoothed where they would click (mix, gains, delay time, EQ bands).
+- Echo `sync` and `pump` follow the transport tempo; pump is locked to the transport beat
+  while it plays and free-runs at the tempo while it is stopped.
+- Binaries older than 0.6.0: the setters return `false` and `getEffectsState()` returns the
+  defaults. Web: no-ops.
+
+| effect | params (range, default) |
+|---|---|
+| `drive` | `amount` 0–1 (0.4), `tone` 0–1 (0.6), `mix` 0–1 (1) — pre-gain 1–40×, tanh, tone LP 800 Hz–20 kHz |
+| `crush` | `bits` 2–16 (8), `downsample` 1–32 (4), `noise` 0–1 (0.1), `mix` 0–1 (1) |
+| `eq` | `low` −12–12 dB (0, shelf 120 Hz), `mid` −12–12 dB (0, peak Q 0.9), `midFreq` 200–5000 Hz (1000), `high` −12–12 dB (0, shelf 6 kHz) |
+| `chorus` | `rate` 0.05–5 Hz (0.8), `depth` 0–1 (0.4), `mix` 0–1 (0.5) |
+| `phaser` | `rate` 0.05–5 Hz (0.4), `depth` 0–1 (0.6), `feedback` 0–0.9 (0.5), `mix` 0–1 (0.5) |
+| `echo` | `time` 0.02–2 s (0.375), `sync` 0/1 (1), `division` 0–5 (2; 1/4, 1/8, 1/8 dotted, 1/16, 1/4 dotted, 1/2), `feedback` 0–0.95 (0.4), `tone` 0–1 (0.5), `pingPong` 0/1 (0), `mix` 0–1 (0.35) |
+| `reverb` | `size` 0–1 (0.6), `damping` 0–1 (0.5), `width` 0–1 (1), `mix` 0–1 (0.3) |
+| `pump` | `depth` 0–1 (0.6), `shape` 0–1 (0.5; soft → snappy), `division` 0–3 (0; 1/4, 1/8, 1/2, 1/1) |
+| `compressor` | `threshold` −60–0 dB (−18), `ratio` 1–20 (4), `attack` 0.1–100 ms (10), `release` 10–1000 ms (120), `makeup` 0–24 dB (4) |
+
+`mix` is a dry/wet crossfade (0 = dry). Synced echo time is capped at 2 s.
+
 ### `JucePadView` (0.5.2+)
 
 A native view that plays a note on touch from the iOS main thread, without the JS thread,
@@ -159,8 +201,11 @@ Check the shipped type definitions for the exact event payloads once 0.5.2 is pu
 `mediaResetCount`, `lastRecoveryError`, `engineState`. A debug screen in the app can show them
 as a pass/fail ladder — see [docs/latency.md](docs/latency.md#5-a-diagnostics-panel).
 
-Synth settings and transport state (tempo, position, playing) survive the engine's automatic
-rebuilds after a media-services reset or a stalled device; held notes do not.
+0.6.0+ adds `fxProcessCount`, `fxLimiterGain` (1 = the safety limiter is idle) and
+`fxNonFiniteResets`.
+
+Synth settings, effect settings and transport state (tempo, position, playing) survive the
+engine's automatic rebuilds after a media-services reset or a stalled device; held notes do not.
 
 ## Latency
 
@@ -210,8 +255,9 @@ cannot resolve `file:` dependencies, which is why every native change goes throu
 
 1. **TypeScript:** `npx tsc --noEmit` here and in the consuming app.
 2. **Engine C++:** the offline harness compiles the vendored JUCE headless with `Voice`,
-   `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor` and a copy of `GraphPlayer`, replays the
-   `doSetup` order and drives the callback with iOS-like block sizes. From `test/harness` in
+   `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `FxChainProcessor` and a copy of
+   `GraphPlayer`, replays the `doSetup` order (synth → fx → output) and drives the callback with
+   iOS-like block sizes; separate cases check every effect, bypass and echo sync. From `test/harness` in
    WSL (or any Linux shell):
    ```sh
    cmake -S . -B build && cmake --build build -j16 && ./build/harness

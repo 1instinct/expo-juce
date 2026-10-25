@@ -42,12 +42,18 @@ bool TransportEngine::advanceBlock(int numSamples, double sampleRate) {
         lastBeatInt = (int)beatPosition;
     }
 
-    if (!playing.load()) {
+    // One load of each per block, shared by the advance below and the block-start info.
+    const double currentBpm = bpm.load();
+    const bool playingNow = playing.load();
+    blockStartBeat = beatPosition;
+    blockBpm = currentBpm;
+    blockPlaying = playingNow;
+
+    if (!playingNow) {
         positionSnapshot.store(beatPosition);
         return false;
     }
 
-    double currentBpm = bpm.load();
     double beatsPerSample = currentBpm / (60.0 * sampleRate);
     double beatsThisBlock = beatsPerSample * numSamples;
 

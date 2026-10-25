@@ -11,7 +11,12 @@ import {
   JucePadViewProps,
   PadNoteOnEvent,
   PadNoteOffEvent,
+  EffectId,
+  EffectParams,
+  EffectState,
+  EffectsState,
 } from './ExpoJuce.types';
+import { defaultEffectsState } from './effectDefaults';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
@@ -109,6 +114,37 @@ export function setMasterLevel(level: number): void {
   ExpoJuceModule.setMasterLevel(level);
 }
 
+// ── Effects (0.6.0+) ─────────────────────────────────────────────
+// Master chain: synth → drive → crush → eq → chorus → phaser → echo → reverb → pump →
+// compressor → safety limiter → output. Synchronous and lock-free; settings are remembered
+// natively whether or not the engine is running (before setup, across engine rebuilds).
+// Binaries older than 0.6.0 have no chain: the setters return false and getEffectsState
+// returns the defaults.
+
+// Turns an effect on or off (short crossfade; an effect starts from a clear state).
+// Returns false for an unknown effect, or if the binary has no effects chain.
+export function setEffectEnabled(id: EffectId, enabled: boolean): boolean {
+  if (typeof ExpoJuceModule?.setEffectEnabled !== 'function') return false;
+  return ExpoJuceModule.setEffectEnabled(id, enabled) === true;
+}
+
+// Sets one parameter; the value is clamped to its range (switches / divisions rounded).
+// Returns false for an unknown effect or parameter, a non-finite value, or no effects chain.
+export function setEffectParam<T extends EffectId>(
+  id: T,
+  param: EffectParams[T] | (string & {}),
+  value: number
+): boolean {
+  if (typeof ExpoJuceModule?.setEffectParam !== 'function') return false;
+  return ExpoJuceModule.setEffectParam(id, param, value) === true;
+}
+
+// Every effect's enabled flag and parameter values, as stored natively (after clamping).
+export function getEffectsState(): EffectsState {
+  if (typeof ExpoJuceModule?.getEffectsState !== 'function') return defaultEffectsState();
+  return ExpoJuceModule.getEffectsState();
+}
+
 // ── Transport ────────────────────────────────────────────────────
 
 export function startTransport(): void {
@@ -165,4 +201,8 @@ export {
   BeatEventPayload,
   AudioDiagnostics,
   EngineState,
+  EffectId,
+  EffectParams,
+  EffectState,
+  EffectsState,
 };

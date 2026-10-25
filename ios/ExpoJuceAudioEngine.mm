@@ -7,6 +7,7 @@
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PolySynthProcessor.h"
+#include "FxChainProcessor.h"
 #include "TransportEngine.h"
 #include <atomic>
 #include <cmath>
@@ -67,6 +68,7 @@ static juce::AudioDeviceManager* sDeviceManager = nullptr;
 static GraphPlayer* sPlayer = nullptr;
 static juce::AudioProcessorGraph* sGraph = nullptr;
 static PolySynthProcessor* sSynth = nullptr;
+static FxChainProcessor* sFx = nullptr;   // owned by sGraph, like sSynth
 static TransportEngine* sTransport = nullptr;
 
 // ── Engine lifecycle lock ──
@@ -100,6 +102,14 @@ static std::atomic<uint64_t> sDeadDeviceRestarts{0};
 // note-ons left in the ring before the new synth is attached, so nothing stale plays.
 static NoteEventQueue sNoteQueue;
 static std::atomic<bool> sAcceptingNotes{false};
+
+// ── Effect settings ──
+// Also one for the life of the process: every FxChainProcessor the engine builds reads its
+// settings from here (atomics, see FxChainProcessor.h). setEffectEnabled / setEffectParam write
+// it without the engine lock, so a change is never dropped and is never lost when it is made
+// before setup, during a rebuild, or while a failed rebuild waits for its retry: the next chain
+// simply starts with it. For the same reason it is not part of the rebuild recovery state.
+static FxParamStore sFxParams;
 
 // RAII: holds sEngineLock for a lifecycle section (main thread, blocking) and flags it busy.
 struct LifecycleLock {
@@ -341,8 +351,17 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sSynth->setNoteQueue(&sNoteQueue);
 
     self.setupStep = 7;
-    NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth)");
+    NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth, fx chain)");
     auto synthNode = sGraph->addNode(std::move(synthProcessor));
+    // Effects chain between the synth and the output. Its settings come from the process-lifetime
+    // sFxParams, so whatever the app set before (or across a rebuild) is in effect from the
+    // first block. Sources that must bypass the effects connect to the output node directly
+    // (the graph sums every connection into an input channel).
+    auto fxProcessor = std::make_unique<FxChainProcessor>();
+    sFx = fxProcessor.get();
+    sFx->setParamStore(&sFxParams);
+    sFx->setTransport(sTransport);
+    auto fxNode = sGraph->addNode(std::move(fxProcessor));
 
     self.setupStep = 8;
     NSLog(@"[ExpoJuceAudioEngine] Step 8: addNode (output)");
@@ -352,11 +371,18 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 
     self.setupStep = 9;
     NSLog(@"[ExpoJuceAudioEngine] Step 9: connections");
-    bool connectedL = sGraph->addConnection({{synthNode->nodeID, 0}, {outputNode->nodeID, 0}});
-    bool connectedR = sGraph->addConnection({{synthNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    // synth → fx → output
+    bool connectedL = sGraph->addConnection({{synthNode->nodeID, 0}, {fxNode->nodeID, 0}});
+    bool connectedR = sGraph->addConnection({{synthNode->nodeID, 1}, {fxNode->nodeID, 1}});
     if (!connectedL || !connectedR) {
-        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection failed (L=%d, R=%d)",
+        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection synth->fx failed (L=%d, R=%d)",
                             connectedL ? 1 : 0, connectedR ? 1 : 0]];
+    }
+    bool fxConnectedL = sGraph->addConnection({{fxNode->nodeID, 0}, {outputNode->nodeID, 0}});
+    bool fxConnectedR = sGraph->addConnection({{fxNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    if (!fxConnectedL || !fxConnectedR) {
+        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection fx->output failed (L=%d, R=%d)",
+                            fxConnectedL ? 1 : 0, fxConnectedR ? 1 : 0]];
     }
 
     self.setupStep = 10;
@@ -426,6 +452,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
     delete sPlayer; sPlayer = nullptr;
     sSynth = nullptr;
+    sFx = nullptr;
     delete sGraph; sGraph = nullptr;
     if (sDeviceManager) { sDeviceManager->closeAudioDevice(); delete sDeviceManager; sDeviceManager = nullptr; }
     delete sTransport; sTransport = nullptr;
@@ -433,6 +460,9 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 
 // Main thread, caller holds sEngineLock. Snapshot of what the app configured (synth parameters,
 // tempo / position / play state), which a teardown would otherwise reset to the defaults.
+// Effect settings are deliberately not captured: they live in sFxParams, which outlives the
+// engine and is attached to the rebuilt chain (restoring a snapshot taken here would undo
+// changes the app makes while a failed rebuild waits for its retry).
 - (void)captureRecoveryStateLocked {
     if (!sSynth || !sTransport) return;
     self.recoverySynthSettings = sSynth->getSettings();
@@ -791,6 +821,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     double synthProcessCount = 0.0, synthPeak = 0.0, notesQueued = 0.0, notesConsumed = 0.0, notesDropped = 0.0;
     int activeVoices = 0;
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
+    double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
         if (acquireUserLock(lock)) {
@@ -820,6 +851,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 activeVoices = synth->diag.activeVoices.load(relaxed);
                 lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
                 lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
+            }
+            if (FxChainProcessor* fx = ready ? sFx : nullptr) {
+                fxProcessCount = (double)fx->diag.processCount.load(relaxed);
+                fxLimiterGain = (double)fx->diag.limiterGain.load(relaxed);
+                fxNonFiniteResets = (double)fx->diag.nonFiniteResets.load(relaxed);
             }
         }
     }
@@ -852,6 +888,10 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"activeVoices"] = @(activeVoices);
     d[@"lastNoteToRenderMs"] = @(lastNoteToRenderMs);
     d[@"lastTouchToRenderMs"] = @(lastTouchToRenderMs);
+
+    d[@"fxProcessCount"] = @(fxProcessCount);
+    d[@"fxLimiterGain"] = @(fxLimiterGain);
+    d[@"fxNonFiniteResets"] = @(fxNonFiniteResets);
 
     // engineState: recovering (rebuild running or retry scheduled) > ready > failed > uninitialized.
     // `ready` is false when the lock was busy, which only happens during a lifecycle section.
@@ -944,6 +984,36 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 - (void)setRelease:(double)ms { withSynth(self, ^(PolySynthProcessor *synth) { synth->setRelease(ms); }); }
 - (void)setDetune:(double)cents { withSynth(self, ^(PolySynthProcessor *synth) { synth->setDetune(cents); }); }
 - (void)setMasterLevel:(double)level { withSynth(self, ^(PolySynthProcessor *synth) { synth->setMasterLevel(level); }); }
+
+// ── Effects ──
+// No engine lock: the settings are atomics in the process-lifetime sFxParams (see "Effect
+// settings"), read by the running chain every chunk and by any chain built later.
+
+// Float-stored values reported to JS rounded to 6 decimals (0.4f → 0.4, not 0.4000000059604645).
+static double fxValueForJS(float value) {
+    return std::round((double)value * 1e6) / 1e6;
+}
+
+- (BOOL)setEffectEnabled:(NSString *)effectId enabled:(BOOL)enabled {
+    return sFxParams.setEnabled(effectId.UTF8String, enabled ? true : false) ? YES : NO;
+}
+
+- (BOOL)setEffectParam:(NSString *)effectId param:(NSString *)param value:(double)value {
+    return sFxParams.setParam(effectId.UTF8String, param.UTF8String, value) ? YES : NO;
+}
+
+- (NSDictionary<NSString *, id> *)effectsState {
+    const FxSettings settings = sFxParams.snapshot();
+    NSMutableDictionary<NSString *, id> *state = [NSMutableDictionary dictionaryWithCapacity:kFxCount];
+    for (int fx = 0; fx < kFxCount; ++fx) {
+        const FxSpec& spec = kFxSpecs[fx];
+        NSMutableDictionary<NSString *, NSNumber *> *params = [NSMutableDictionary dictionaryWithCapacity:spec.numParams];
+        for (int p = 0; p < spec.numParams; ++p)
+            params[@(spec.params[p].name)] = @(fxValueForJS(settings.values[fx][p]));
+        state[@(spec.id)] = @{ @"enabled": @(settings.enabled[fx] ? YES : NO), @"params": params };
+    }
+    return state;
+}
 
 // ── Transport ──
 

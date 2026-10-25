@@ -43,6 +43,15 @@
 + (void)setDetune:(double)cents { [[ExpoJuceAudioEngine sharedInstance] setDetune:cents]; }
 + (void)setMasterLevel:(double)level { [[ExpoJuceAudioEngine sharedInstance] setMasterLevel:level]; }
 
+// ── Effects ──
++ (BOOL)setEffectEnabled:(NSString *)effectId enabled:(BOOL)enabled {
+    return [[ExpoJuceAudioEngine sharedInstance] setEffectEnabled:effectId enabled:enabled];
+}
++ (BOOL)setEffectParam:(NSString *)effectId param:(NSString *)param value:(double)value {
+    return [[ExpoJuceAudioEngine sharedInstance] setEffectParam:effectId param:param value:value];
+}
++ (NSDictionary<NSString *, id> *)getEffectsState { return [[ExpoJuceAudioEngine sharedInstance] effectsState]; }
+
 // ── Transport ──
 + (void)startTransport { [[ExpoJuceAudioEngine sharedInstance] startTransport]; }
 + (void)stopTransport { [[ExpoJuceAudioEngine sharedInstance] stopTransport]; }

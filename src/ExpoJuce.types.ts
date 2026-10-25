@@ -43,6 +43,43 @@ export type JucePadViewProps = {
   children?: React.ReactNode;
 };
 
+/**
+ * Effects of the master chain (synth → effects → output), in processing order. A safety
+ * limiter (-0.3 dBFS ceiling) always runs after them and is not user-facing.
+ */
+export type EffectId =
+  | 'drive'
+  | 'crush'
+  | 'eq'
+  | 'chorus'
+  | 'phaser'
+  | 'echo'
+  | 'reverb'
+  | 'pump'
+  | 'compressor';
+
+/** Parameter names per effect (ranges and defaults: see README "Effects"). */
+export type EffectParams = {
+  drive: 'amount' | 'tone' | 'mix';
+  crush: 'bits' | 'downsample' | 'noise' | 'mix';
+  eq: 'low' | 'mid' | 'midFreq' | 'high';
+  chorus: 'rate' | 'depth' | 'mix';
+  phaser: 'rate' | 'depth' | 'feedback' | 'mix';
+  echo: 'time' | 'sync' | 'division' | 'feedback' | 'tone' | 'pingPong' | 'mix';
+  reverb: 'size' | 'damping' | 'width' | 'mix';
+  pump: 'depth' | 'shape' | 'division';
+  compressor: 'threshold' | 'ratio' | 'attack' | 'release' | 'makeup';
+};
+
+/** One effect's state as stored natively (values after clamping). */
+export type EffectState = {
+  enabled: boolean;
+  params: Record<string, number>;
+};
+
+/** Returned by `getEffectsState()`: every effect, enabled or not. */
+export type EffectsState = Record<EffectId, EffectState>;
+
 /** Native engine lifecycle state reported in `AudioDiagnostics.engineState`. */
 export type EngineState = 'ready' | 'recovering' | 'failed' | 'uninitialized';
 
@@ -110,6 +147,12 @@ export type AudioDiagnostics = {
   lockBusyDrops?: number;
   /** Times the audio callback was found stalled and the device was reopened (0.5.2+). */
   deadDeviceRestarts?: number;
+  /** FxChainProcessor::processBlock calls (0.6.0+). */
+  fxProcessCount?: number;
+  /** Lowest safety-limiter gain in the last effects block, 1 = not limiting (0.6.0+). */
+  fxLimiterGain?: number;
+  /** Effect chunks whose output went non-finite and were silenced + reset (0.6.0+). */
+  fxNonFiniteResets?: number;
   sessionCategory: string;
   sessionSampleRate: number;
   sessionIOBufferMs: number;

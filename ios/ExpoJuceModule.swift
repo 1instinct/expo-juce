@@ -141,6 +141,22 @@ public class ExpoJuceModule: Module {
       ExpoJuceBridge.setMasterLevel(level)
     }
 
+    // ── Effects ────────────────────────────────────────────────────
+    // Lock-free: atomics in a process-lifetime store, remembered before setup and across
+    // engine rebuilds. false = unknown effect / parameter or non-finite value.
+
+    Function("setEffectEnabled") { (effect: String, enabled: Bool) -> Bool in
+      return ExpoJuceBridge.setEffectEnabled(effect, enabled: enabled)
+    }
+
+    Function("setEffectParam") { (effect: String, param: String, value: Double) -> Bool in
+      return ExpoJuceBridge.setEffectParam(effect, param: param, value: value)
+    }
+
+    Function("getEffectsState") { () -> [String: Any] in
+      return ExpoJuceBridge.getEffectsState()
+    }
+
     // ── Transport ──────────────────────────────────────────────────
 
     Function("startTransport") {

@@ -45,6 +45,15 @@ typedef void(^BeatCallback)(double beat, double bpm);
 - (void)setDetune:(double)cents;
 - (void)setMasterLevel:(double)level;
 
+// Effects chain (synth → fx → output). Any thread, never blocks; settings are remembered
+// whether or not the engine is running (before setup, across rebuilds) and apply to the
+// running chain at its next processing chunk. effectId / param as in FxChainProcessor.h
+// (kFxSpecs). Unknown id / param or a non-finite value: no-op, returns NO. Values are clamped.
+- (BOOL)setEffectEnabled:(NSString *)effectId enabled:(BOOL)enabled;
+- (BOOL)setEffectParam:(NSString *)effectId param:(NSString *)param value:(double)value;
+// { <effectId>: { enabled: BOOL, params: { <param>: number } } } for every effect.
+- (NSDictionary<NSString *, id> *)effectsState;
+
 // Transport
 - (void)startTransport;
 - (void)stopTransport;

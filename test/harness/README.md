@@ -12,8 +12,19 @@ From this directory, in WSL or any Linux shell:
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
 ```
 
-- Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`) are
-  taken from `git show HEAD:ios/...`; pass `-DHARNESS_GIT_REF=WORKTREE` (or any ref) to change.
+- Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`,
+  `FxChainProcessor`) are taken from `git show HEAD:ios/...`; pass `-DHARNESS_GIT_REF=WORKTREE`
+  (or any ref) to change.
+- The graph cases build `synth → FxChainProcessor → output` like `doSetup` (effects off, so the
+  output is the dry synth); case `fx` runs the same with every effect on. Effects cases:
+  `fx <id>` / `fx all` (each effect, then all, with non-default params over odd block sizes:
+  finite, non-silent, differs from dry, under the limiter ceiling, 0 allocations), `fxb` (chain
+  off == dry bit-exact, again after re-bypass), `fxe` (synced echo returns exactly
+  division × 60 / bpm later), `fxp` (pump dips right after each transport beat; limiter holds a
+  2.0 sine under -0.3 dBFS); `rs` also round-trips the effect settings.
+- From a Windows checkout (`core.autocrlf=true`) `fetch_deps.sh` has CRLF line endings and bash
+  rejects it: run from a copy with LF endings, or copy an existing `build/sysroot` (with its
+  `.done`) and convert the script (`sed -i 's/\r$//' fetch_deps.sh`).
 - `GraphPlayer` is the shipped class from `ios/GraphPlayer.h` (same git ref). Cases `k`/`k2` deliver
   blocks larger than its preallocated capacity and check the chunked render (graph calls = ceil(n/cap)
   per block, no silent block tails, no buffer growth).

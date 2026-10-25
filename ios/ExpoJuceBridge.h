@@ -41,6 +41,14 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 + (void)setDetune:(double)cents;
 + (void)setMasterLevel:(double)level;
 
+// ── Effects ──────────────────────────────────────────────────────
+// Lock-free, any thread; remembered across setup / rebuilds. NO for an unknown effect or
+// parameter, or a non-finite value. Swift: `setEffectEnabled(_:enabled:)`,
+// `setEffectParam(_:param:value:)`, `getEffectsState()`.
++ (BOOL)setEffectEnabled:(NSString *)effectId enabled:(BOOL)enabled NS_SWIFT_NAME(setEffectEnabled(_:enabled:));
++ (BOOL)setEffectParam:(NSString *)effectId param:(NSString *)param value:(double)value NS_SWIFT_NAME(setEffectParam(_:param:value:));
++ (NSDictionary<NSString *, id> *)getEffectsState NS_SWIFT_NAME(getEffectsState());
+
 // ── Transport ────────────────────────────────────────────────────
 + (void)startTransport;
 + (void)stopTransport;

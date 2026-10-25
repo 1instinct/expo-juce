@@ -8,11 +8,13 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PolySynthProcessor.h"
 #include "TransportEngine.h"
+#include "FxChainProcessor.h"
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <thread>
@@ -107,7 +109,27 @@ struct Case {
     bool aboutToStartOffThread = false;
     bool restartMidNote = false;       // simulate iOS route-change restart (stopped + aboutToStart)
     bool expectSilence = false;        // negative control: constructed to go silent
+    bool allFx = false;                // every effect enabled with non-default params
 };
+
+// Turns effect `fx` on with non-default parameters (through the string API the engine uses).
+static bool enableFxNonDefault(FxParamStore& s, int fx) {
+    struct P { const char* name; double value; };
+    static const std::vector<std::vector<P>> sets = {
+        {{"amount", 0.8}, {"tone", 0.3}, {"mix", 0.9}},
+        {{"bits", 5}, {"downsample", 6}, {"noise", 0.3}, {"mix", 0.8}},
+        {{"low", 6}, {"mid", -4}, {"midFreq", 2500}, {"high", 3}},
+        {{"rate", 1.7}, {"depth", 0.7}, {"mix", 0.6}},
+        {{"rate", 1.1}, {"depth", 0.8}, {"feedback", 0.7}, {"mix", 0.7}},
+        {{"time", 0.25}, {"sync", 0}, {"division", 1}, {"feedback", 0.6}, {"tone", 0.7}, {"pingPong", 1}, {"mix", 0.5}},
+        {{"size", 0.85}, {"damping", 0.3}, {"width", 0.7}, {"mix", 0.45}},
+        {{"depth", 0.8}, {"shape", 0.8}, {"division", 1}},
+        {{"threshold", -30}, {"ratio", 8}, {"attack", 3}, {"release", 200}, {"makeup", 9}},
+    };
+    bool ok = true;
+    for (const P& p : sets[(size_t)fx]) ok = s.setParam(kFxSpecs[fx].id, p.name, p.value) && ok;
+    return s.setEnabled(kFxSpecs[fx].id, true) && ok;
+}
 
 struct BlockRec { int phase; int n; float peak; int nans; bool zero; bool tailZero; };
 
@@ -127,7 +149,11 @@ static void pump(bool loop, int ms) {
 }
 
 static Result runCase(const Case& c) {
-    // ── doSetup replica (ios/ExpoJuceAudioEngine.mm, HEAD), steps 2 and 5–11 ──
+    // ── doSetup replica (ios/ExpoJuceAudioEngine.mm, HEAD), steps 2 and 5–11:
+    //    synth → fx chain → output ──
+    FxParamStore fxStore;              // the engine's process-lifetime store (outlives the graph)
+    if (c.allFx)
+        for (int fx = 0; fx < kFxCount; ++fx) enableFxNonDefault(fxStore, fx);
     auto* transport = new TransportEngine();
     auto* graph = new juce::AudioProcessorGraph();
     graph->setPlayConfigDetails(0, 2, c.setupSr, c.setupBuf);
@@ -135,10 +161,16 @@ static Result runCase(const Case& c) {
     ProbeSynth* synth = synthProcessor.get();
     synth->setTransport(transport);
     auto synthNode = graph->addNode(std::move(synthProcessor));
+    auto fxProcessor = std::make_unique<FxChainProcessor>();
+    fxProcessor->setParamStore(&fxStore);
+    fxProcessor->setTransport(transport);
+    auto fxNode = graph->addNode(std::move(fxProcessor));
     auto outputNode = graph->addNode(std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
         juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
-    graph->addConnection({{synthNode->nodeID, 0}, {outputNode->nodeID, 0}});
-    graph->addConnection({{synthNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    graph->addConnection({{synthNode->nodeID, 0}, {fxNode->nodeID, 0}});
+    graph->addConnection({{synthNode->nodeID, 1}, {fxNode->nodeID, 1}});
+    graph->addConnection({{fxNode->nodeID, 0}, {outputNode->nodeID, 0}});
+    graph->addConnection({{fxNode->nodeID, 1}, {outputNode->nodeID, 1}});
     graph->prepareToPlay(c.setupSr, c.setupBuf);
     auto* player = new GraphPlayer();
     player->setProcessor(graph);
@@ -488,11 +520,332 @@ static bool runRebuildState() {
     newSynth.prepareToPlay(48000, 256);
     newSynth.processBlock(buf, midi);
     const bool continuesOk = newTransport.getPosition() > 7.5 && newTransport.getPosition() < 7.6;
-    std::printf("rs    rebuild carry-over (settings, tempo 90, playing, pending seek)  %-4s synth %d transport %d"
-                " continues %d (pos %.4f)\n", synthOk && transportOk && continuesOk ? "PASS" : "FAIL",
-                synthOk, transportOk, continuesOk, newTransport.getPosition());
+
+    // Effects: the engine keeps one FxParamStore for the process and attaches it to each new
+    // FxChainProcessor, so a rebuilt chain renders exactly like the old one did. Checked: the
+    // string API (clamping, rounding, unknown id / param / NaN rejected), snapshot / apply
+    // round trip, and two chains (old store, store restored from its snapshot) rendering the
+    // same input bit-identically.
+    FxParamStore oldFx;
+    bool apiOk = true;
+    for (int fx : {kFxDrive, kFxEq, kFxEcho, kFxReverb, kFxPump, kFxCompressor})
+        apiOk = enableFxNonDefault(oldFx, fx) && apiOk;
+    apiOk = oldFx.setEnabled("eq", false) && apiOk; // params kept while off
+    apiOk = oldFx.setParam("echo", "feedback", 5.0) && oldFx.get(kFxEcho, kEchoFeedback) == 0.95f && apiOk;
+    apiOk = oldFx.setParam("pump", "division", 2.6) && oldFx.get(kFxPump, kPumpDivision) == 3.0f && apiOk;
+    apiOk = oldFx.setParam("eq", "midFreq", -1.0) && oldFx.get(kFxEq, kEqMidFreq) == 200.0f && apiOk;
+    apiOk = !oldFx.setParam("nope", "mix", 0.5) && !oldFx.setParam("echo", "nope", 0.5) && apiOk;
+    apiOk = !oldFx.setEnabled("nope", true) && !oldFx.setParam("echo", "time", std::nan("")) && apiOk;
+    apiOk = oldFx.get(kFxEcho, kEchoTime) == 0.25f && apiOk; // the NaN left it unchanged
+    const FxSettings fxSnap = oldFx.snapshot();
+    FxParamStore newFx;
+    newFx.apply(fxSnap);
+    const bool fxStateOk = apiOk && newFx.snapshot() == fxSnap && !(fxSnap == FxSettings::defaults())
+        && fxSnap.enabled[kFxEcho] && !fxSnap.enabled[kFxEq] && fxSnap.values[kFxEq][kEqLow] == 6.0f;
+    bool fxRenderOk = true;
+    {
+        TransportEngine ta, tb;
+        FxChainProcessor a, b;
+        a.setParamStore(&oldFx); a.setTransport(&ta);
+        b.setParamStore(&newFx); b.setTransport(&tb);
+        for (FxChainProcessor* p : {&a, &b}) { p->setRateAndBufferSizeDetails(48000, 256); p->prepareToPlay(48000, 256); }
+        juce::AudioBuffer<float> ba(2, 256), bb(2, 256);
+        double phase = 0.0;
+        for (int blk = 0; blk < 200; ++blk) {
+            for (int i = 0; i < 256; ++i, phase += 0.0571) {
+                const float v = 0.4f * (float)std::sin(phase);
+                for (int ch = 0; ch < 2; ++ch) { ba.setSample(ch, i, v); bb.setSample(ch, i, v); }
+            }
+            ta.advanceBlock(256, 48000); tb.advanceBlock(256, 48000);
+            a.processBlock(ba, midi);
+            b.processBlock(bb, midi);
+            for (int ch = 0; ch < 2; ++ch)
+                if (std::memcmp(ba.getReadPointer(ch), bb.getReadPointer(ch), 256 * sizeof(float)) != 0) fxRenderOk = false;
+        }
+    }
+    const bool fxOk = fxStateOk && fxRenderOk;
+    const bool ok = synthOk && transportOk && continuesOk && fxOk;
+    std::printf("rs    rebuild carry-over (settings, tempo 90, playing, pending seek, fx)  %-4s synth %d transport %d"
+                " continues %d (pos %.4f) fx state %d fx render %d\n", ok ? "PASS" : "FAIL",
+                synthOk, transportOk, continuesOk, newTransport.getPosition(), fxStateOk, fxRenderOk);
     std::fflush(stdout);
-    return synthOk && transportOk && continuesOk;
+    return ok;
+}
+
+//==============================================================================
+// Effects chain, standalone (synth → FxChainProcessor on this thread, the graph's order).
+// Every render call (synth + fx) runs with the allocation counter on.
+
+struct FxRig {
+    TransportEngine transport;
+    PolySynthProcessor synth;
+    FxParamStore store;
+    FxChainProcessor fx;
+    explicit FxRig(double sr) {
+        synth.setTransport(&transport);
+        synth.setRateAndBufferSizeDetails(sr, 512);
+        synth.prepareToPlay(sr, 512);
+        fx.setParamStore(&store);
+        fx.setTransport(&transport);
+        fx.setRateAndBufferSizeDetails(sr, 512);
+        fx.prepareToPlay(sr, 512);
+    }
+};
+
+// Block sizes cycled by the fx tests: odd sizes and blocks larger than the chain's chunk.
+static const std::vector<int> kFxBlocks = {256, 471, 64, 1024, 128, 333};
+
+// Each effect alone (and all together) with non-default params: finite, non-silent, audibly
+// different from the dry synth, never above the limiter ceiling, 0 allocations.
+static int runFxEffects() {
+    int failures = 0;
+    const float ceiling = juce::Decibels::decibelsToGain(FxChainProcessor::kLimiterCeilingDb);
+    for (int which = 0; which <= kFxCount; ++which) {
+        FxRig rig(48000);
+        rig.transport.setTempo(120);
+        rig.transport.start();
+        bool apiOk = true;
+        if (which == kFxCount) {
+            for (int fx = 0; fx < kFxCount; ++fx) apiOk = enableFxNonDefault(rig.store, fx) && apiOk;
+        } else {
+            apiOk = enableFxNonDefault(rig.store, which);
+        }
+        rig.synth.setWaveform(Waveform::Saw);
+        rig.synth.setMasterLevel(0.6);
+        rig.synth.noteOn(57, 120);
+        rig.synth.noteOn(64, 100);
+        juce::AudioBuffer<float> buf(2, 1024), dry(2, 1024);
+        juce::MidiBuffer midi;
+        const int total = (int)(1.5 * 48000);
+        int done = 0, nans = 0;
+        size_t bi = 0;
+        float peak = 0.0f;
+        double diff2 = 0.0;
+        bool released = false;
+        gRenderAllocs.store(0);
+        while (done < total) {
+            const int n = kFxBlocks[bi++ % kFxBlocks.size()];
+            if (!released && done >= 48000) { rig.synth.noteOff(57); rig.synth.noteOff(64); released = true; }
+            buf.setSize(2, n, false, false, true);
+            dry.setSize(2, n, false, false, true);
+            tCountAllocs = true;
+            rig.synth.processBlock(buf, midi);
+            tCountAllocs = false;
+            for (int ch = 0; ch < 2; ++ch) dry.copyFrom(ch, 0, buf, ch, 0, n);
+            tCountAllocs = true;
+            rig.fx.processBlock(buf, midi);
+            tCountAllocs = false;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < n; ++i) {
+                    const float v = buf.getSample(ch, i);
+                    if (!std::isfinite(v)) { ++nans; continue; }
+                    peak = std::max(peak, std::fabs(v));
+                    const double d = (double)v - dry.getSample(ch, i);
+                    diff2 += d * d;
+                }
+            done += n;
+        }
+        const double diffRms = std::sqrt(diff2 / (2.0 * total));
+        const uint64_t allocs = gRenderAllocs.load();
+        const bool pass = apiOk && nans == 0 && peak > 1e-3f && peak <= ceiling + 1e-6f && diffRms > 1e-4 && allocs == 0;
+        failures += pass ? 0 : 1;
+        const std::string id = which == kFxCount ? std::string("all") : std::string(kFxSpecs[which].id);
+        std::printf("fx    %-12s non-default params, blocks 256/471/64/1024/128/333  %-4s peak %.4f (ceiling %.4f)"
+                    " diff-rms %.5f nan %d allocs %llu limiter-min %.3f\n", id.c_str(), pass ? "PASS" : "FAIL", peak,
+                    ceiling, diffRms, nans, (unsigned long long)allocs, rig.fx.diag.limiterGain.load());
+        std::fflush(stdout);
+    }
+    return failures;
+}
+
+// Bypass: chain all off == dry synth, bit-exact; on again (reverb + echo) it differs; off
+// again, once the 10 ms crossfade is over, bit-exact again. 0 allocations throughout.
+static bool runFxBypass() {
+    FxRig rig(48000);
+    rig.synth.setWaveform(Waveform::Saw);
+    rig.synth.setMasterLevel(0.4);
+    rig.synth.noteOn(60, 100);
+    juce::AudioBuffer<float> buf(2, 1024), dry(2, 1024);
+    juce::MidiBuffer midi;
+    int done = 0;
+    size_t bi = 0;
+    int mismatchOff = 0, comparedOff = 0, mismatchAfter = 0, comparedAfter = 0;
+    double diffOn = 0.0;
+    float dryPeak = 0.0f;
+    const int onAt = 24000, offAt = 48000, settleAt = offAt + 1024 + 480 /* 10 ms */, end = 96000;
+    gRenderAllocs.store(0);
+    while (done < end) {
+        const int n = kFxBlocks[bi++ % kFxBlocks.size()];
+        if (done >= onAt && done < offAt) { rig.store.setEnabled("reverb", true); rig.store.setEnabled("echo", true); }
+        if (done >= offAt) { rig.store.setEnabled("reverb", false); rig.store.setEnabled("echo", false); }
+        buf.setSize(2, n, false, false, true);
+        dry.setSize(2, n, false, false, true);
+        tCountAllocs = true;
+        rig.synth.processBlock(buf, midi);
+        tCountAllocs = false;
+        for (int ch = 0; ch < 2; ++ch) dry.copyFrom(ch, 0, buf, ch, 0, n);
+        dryPeak = std::max(dryPeak, dry.getMagnitude(0, n));
+        tCountAllocs = true;
+        rig.fx.processBlock(buf, midi);
+        tCountAllocs = false;
+        bool same = true;
+        for (int ch = 0; ch < 2; ++ch)
+            if (std::memcmp(buf.getReadPointer(ch), dry.getReadPointer(ch), (size_t)n * sizeof(float)) != 0) same = false;
+        if (done + n <= onAt) { ++comparedOff; mismatchOff += same ? 0 : 1; }
+        else if (done >= settleAt) { ++comparedAfter; mismatchAfter += same ? 0 : 1; }
+        else if (done >= onAt && done + n <= offAt) {
+            for (int i = 0; i < n; ++i) { const double d = buf.getSample(0, i) - dry.getSample(0, i); diffOn += d * d; }
+        }
+        done += n;
+    }
+    const uint64_t allocs = gRenderAllocs.load();
+    const bool pass = comparedOff > 10 && mismatchOff == 0 && comparedAfter > 10 && mismatchAfter == 0
+                   && diffOn > 1e-3 && allocs == 0;
+    std::printf("fxb   chain off == dry bit-exact; on (reverb+echo) differs; off again == dry  %-4s off %d/%d blocks equal,"
+                " after re-bypass %d/%d equal, on-diff %.4f, dry peak %.4f, allocs %llu\n", pass ? "PASS" : "FAIL",
+                comparedOff - mismatchOff, comparedOff, comparedAfter - mismatchAfter, comparedAfter, diffOn, dryPeak,
+                (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Echo sync: an impulse through echo (sync on, mix 1, feedback 0, tone 1) comes back exactly
+// division x 60 / bpm seconds later; nothing before it. The transport is advanced per block as
+// the synth does it (block-start beat info). Odd block size (471) so the echo crosses blocks.
+static bool runFxEchoSyncOne(double bpm, int division, int expectedDelay) {
+    TransportEngine transport;
+    transport.setTempo(bpm);
+    FxParamStore store;
+    FxChainProcessor fx;
+    fx.setParamStore(&store);
+    fx.setTransport(&transport);
+    fx.setRateAndBufferSizeDetails(48000, 512);
+    fx.prepareToPlay(48000, 512);
+    bool ok = store.setParam("echo", "sync", 1) && store.setParam("echo", "division", division)
+           && store.setParam("echo", "feedback", 0) && store.setParam("echo", "tone", 1)
+           && store.setParam("echo", "mix", 1) && store.setParam("echo", "pingPong", 0)
+           && store.setEnabled("echo", true);
+    const int impulseAt = 3000; // after the 10 ms enable crossfade
+    const int total = impulseAt + expectedDelay + 4000;
+    std::vector<float> outL((size_t)total, 0.0f), outR((size_t)total, 0.0f);
+    juce::AudioBuffer<float> buf(2, 512);
+    juce::MidiBuffer midi;
+    gRenderAllocs.store(0);
+    for (int done = 0; done < total;) {
+        const int n = std::min(471, total - done);
+        buf.setSize(2, n, false, false, true);
+        buf.clear();
+        if (impulseAt >= done && impulseAt < done + n) {
+            buf.setSample(0, impulseAt - done, 0.5f);
+            buf.setSample(1, impulseAt - done, 0.5f);
+        }
+        tCountAllocs = true;
+        transport.advanceBlock(n, 48000);
+        fx.processBlock(buf, midi);
+        tCountAllocs = false;
+        std::memcpy(&outL[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+        std::memcpy(&outR[(size_t)done], buf.getReadPointer(1), (size_t)n * sizeof(float));
+        done += n;
+    }
+    int first = -1;
+    for (int i = 0; i < total && first < 0; ++i)
+        if (std::fabs(outL[(size_t)i]) > 1e-7f || std::fabs(outR[(size_t)i]) > 1e-7f) first = i;
+    const int got = first < 0 ? -1 : first - impulseAt;
+    const float echoPeak = first < 0 ? 0.0f : outL[(size_t)first];
+    ok = ok && got == expectedDelay && echoPeak > 0.3f && gRenderAllocs.load() == 0;
+    std::printf("fxe   echo sync %.0f bpm division %d: impulse returns after %d samples (expect %d)  %-4s peak %.4f allocs %llu\n",
+                bpm, division, got, expectedDelay, ok ? "PASS" : "FAIL", echoPeak,
+                (unsigned long long)gRenderAllocs.load());
+    std::fflush(stdout);
+    return ok;
+}
+
+// Pump beat lock + limiter. Pump (depth 1, shape 1, 1/4) on a constant 0.5 input with the
+// transport started at beat 0.5 at 120 bpm: the gain dips right after each beat boundary
+// (samples 12000, 36000, 60000; 4 ms attack), whatever the block size (471). Then the limiter
+// alone: a 2.0-amplitude sine through the all-off chain never exceeds -0.3 dBFS.
+static bool runFxPumpAndLimiter() {
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf(2, 512);
+    gRenderAllocs.store(0);
+    bool pumpOk = true;
+    int dips[3] = {-1, -1, -1};
+    {
+        TransportEngine transport;
+        transport.setTempo(120);
+        transport.setPosition(0.5);
+        transport.start();
+        FxParamStore store;
+        FxChainProcessor fx;
+        fx.setParamStore(&store);
+        fx.setTransport(&transport);
+        fx.setRateAndBufferSizeDetails(48000, 512);
+        fx.prepareToPlay(48000, 512);
+        pumpOk = store.setParam("pump", "depth", 1) && store.setParam("pump", "shape", 1)
+              && store.setParam("pump", "division", 0) && store.setEnabled("pump", true);
+        const int total = 66000;
+        std::vector<float> out((size_t)total, 0.0f);
+        for (int done = 0; done < total;) {
+            const int n = std::min(471, total - done);
+            buf.setSize(2, n, false, false, true);
+            for (int ch = 0; ch < 2; ++ch) juce::FloatVectorOperations::fill(buf.getWritePointer(ch), 0.5f, n);
+            tCountAllocs = true;
+            transport.advanceBlock(n, 48000);
+            fx.processBlock(buf, midi);
+            tCountAllocs = false;
+            std::memcpy(&out[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+            done += n;
+        }
+        // Lowest gain within each beat (windows centred on the beats, skipping the fade-in).
+        const int beats[3] = {12000, 36000, 60000};
+        for (int b = 0; b < 3; ++b) {
+            int at = -1;
+            float lo = 1e9f;
+            for (int i = beats[b] - 6000; i < beats[b] + 6000; ++i)
+                if (out[(size_t)i] < lo) { lo = out[(size_t)i]; at = i; }
+            dips[b] = at - beats[b];
+            pumpOk = pumpOk && dips[b] >= 0 && dips[b] <= 400 && lo < 0.05f && out[(size_t)beats[b] - 1] > 0.3f;
+        }
+    }
+    bool limiterOk = true;
+    float limPeak = 0.0f;
+    {
+        FxChainProcessor fx; // own store: all effects off
+        fx.setRateAndBufferSizeDetails(48000, 512);
+        fx.prepareToPlay(48000, 512);
+        double phase = 0.0;
+        for (int blk = 0; blk < 100; ++blk) {
+            buf.setSize(2, 333, false, false, true);
+            for (int i = 0; i < 333; ++i, phase += 0.0571)
+                for (int ch = 0; ch < 2; ++ch) buf.setSample(ch, i, 2.0f * (float)std::sin(phase));
+            tCountAllocs = true;
+            fx.processBlock(buf, midi);
+            tCountAllocs = false;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 333; ++i) {
+                    const float v = buf.getSample(ch, i);
+                    if (!std::isfinite(v)) limiterOk = false;
+                    limPeak = std::max(limPeak, std::fabs(v));
+                }
+        }
+        const float ceiling = juce::Decibels::decibelsToGain(FxChainProcessor::kLimiterCeilingDb);
+        limiterOk = limiterOk && limPeak <= ceiling * 1.0001f && limPeak > 0.9f;
+    }
+    const uint64_t allocs = gRenderAllocs.load();
+    const bool pass = pumpOk && limiterOk && allocs == 0;
+    std::printf("fxp   pump locked to beat (start 0.5, 120 bpm), limiter on a 2.0 sine  %-4s dips +%d/+%d/+%d samples"
+                " after the beats (want 0..400), limiter peak %.4f, allocs %llu\n", pass ? "PASS" : "FAIL",
+                dips[0], dips[1], dips[2], limPeak, (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
+static int runFxEchoSync() {
+    int failures = 0;
+    failures += runFxEchoSyncOne(120.0, 0, 24000) ? 0 : 1; // 1/4 at 120 bpm = 0.5 s
+    failures += runFxEchoSyncOne(90.0, 3, 8000) ? 0 : 1;   // 1/16 at 90 bpm = 1/6 s
+    failures += runFxEchoSyncOne(120.0, 2, 18000) ? 0 : 1; // 1/8 dotted at 120 bpm = 0.375 s
+    return failures;
 }
 
 int main() {
@@ -517,6 +870,8 @@ int main() {
         {"j",  "dev 48k/128, deliver 128 (latency target)",          48000, 128, 48000, 128, {128}},
         {"k",  "dev 48k/256 (cap 1024), deliver 4096 (4 chunks)",    48000, 256, 48000, 256, {4096}},
         {"k2", "dev 48k/128 (cap 1024), deliver 1500/128 (chunked)", 48000, 128, 48000, 128, {1500, 128}},
+        {"fx", "as (d), every effect on (non-default params)",       48000, 512, 48000, 1024, {471, 1024},
+         true, false, false, false, true},
     };
 
     std::printf("\n%-5s %-52s %-4s %8s %5s %11s %10s %7s %9s %5s %13s %6s\n",
@@ -555,6 +910,10 @@ int main() {
     }
     unexpected += runRebuildState() ? 0 : 1;
     unexpected += runReleases().pass ? 0 : 1;
+    unexpected += runFxEffects();
+    unexpected += runFxBypass() ? 0 : 1;
+    unexpected += runFxEchoSync();
+    unexpected += runFxPumpAndLimiter() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");
