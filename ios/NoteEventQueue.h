@@ -110,6 +110,8 @@ public:
     std::atomic<uint32_t> notesConsumed{0};
     std::atomic<uint32_t> notesDropped{0};   // note-on rejected: ring full
     std::atomic<uint32_t> notesDiscarded{0}; // dropped by discardPending (engine setup)
+    // Last note the synth started (0–127), -1 = none yet. Written by the consumer (relaxed).
+    std::atomic<int> lastNoteStarted{-1};
 
 private:
     // Spinlock guard for the producer side (test_and_set acquire / clear release). Critical

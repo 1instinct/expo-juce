@@ -24,11 +24,15 @@ iOS only for now; the Android and web modules are scaffolds.
  juce::AudioDeviceManager ─► GraphPlayer (AudioIODeviceCallback: graph, peaks, NaNs, test tone)
         │
  juce::AudioProcessorGraph  PolySynthProcessor ─► FxChainProcessor ─► audio output node
+                            AuxProcessor (metronome + backing track) ───► audio output node (summed)
                             ├─ NoteEventQueue: note-on ring (256) drained at block start; releases as marks
                             ├─ 8 × Voice: dsp::Oscillator → StateVariableTPTFilter (LP) → ADSR
                             └─ TransportEngine (tempo / position / beat crossings)
                             FxChainProcessor: drive → crush → eq → chorus → phaser → echo → reverb →
                             pump → compressor → safety limiter; settings in a process-lifetime store
+                            AuxProcessor: clicks rendered at prepare; track buffer swapped in from
+                            a process-lifetime BackingTrack holder (decoded on a background queue)
+ GraphPlayer also writes the output into an AnalysisRing (getAnalysis: peak / rms / scope)
 ```
 
 ## Roadmap: Full Audio Workstation
@@ -48,7 +52,7 @@ Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack buil
 ### Sub-project 2: Effects Chain
 **Status:** In progress (0.6.0) — engine + JS API done and verified in the offline harness; not yet run on a device
 
-One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Next in 0.6.0: an aux path (metronome, backing track) summed into the output after the effects. Later: reorderable / per-node effects via modular routing (sub-project 5).
+One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Also in 0.6.0: an `AuxProcessor` node summed into the output after the effects, with a sample-accurate metronome (5 click styles, bar accent) and a backing track (off-thread decode + resample, gapless MP3 loop regions, lock-free swap, follows transport play / stop / seek; see [Metronome and backing track](#metronome-and-backing-track-060)); `getAnalysis()` (output peak / rms, 128-point scope, last note, transport) for HUDs; a `hitPolygon` touch shape on `JucePadView`. Later: reorderable / per-node effects via modular routing (sub-project 5).
 
 ### Sub-project 3: Sample Playback / Drum Machine
 **Status:** Planned — an earlier JUCE sampler prototype is the starting point
@@ -168,6 +172,70 @@ const fx = ExpoJuce.getEffectsState();                // { reverb: { enabled, pa
 
 `mix` is a dry/wet crossfade (0 = dry). Synced echo time is capped at 2 s.
 
+### Metronome and backing track (0.6.0+)
+
+An aux source next to the synth: its output is summed into the device output **after** the
+effects chain (clicks and the track are not effected). Both follow the transport.
+
+```ts
+ExpoJuce.setMetronome({ enabled: true, style: 'wood', level: 0.7, accent: true, beatsPerBar: 4 });
+
+const info = await ExpoJuce.loadBackingTrack(fileUri, {   // gapless info: optional, MP3 only
+  loopSamples: 682839, leadingSamples: 4561, trailingSamples: 1496,
+});
+// { durationSec, sampleRate, channels, loopStartSample, loopSamples, decodedSamples, decoder }
+ExpoJuce.setBackingTrackOptions({ level: 0.8, loop: true, enabled: true });
+ExpoJuce.startTransport();                                 // the track and the clicks start
+ExpoJuce.unloadBackingTrack();
+```
+
+- **Metronome**: a click on every beat while the transport plays, starting on the exact
+  sample where the beat falls (any block size), accented on beat 1 of the bar. Styles
+  `classic` (sine blip 1.5 kHz / accent 2.5 kHz), `wood` (resonant noise burst), `beep`
+  (square 1 / 2 kHz), `cowbell` (two squares 540 / 800 Hz through a band-pass), `hat`
+  (high-passed noise). Clicks are rendered once when the engine prepares (no allocation while
+  playing). Options: `enabled` (false), `style` ('classic'), `level` 0–1 (0.8), `accent`
+  (true), `beatsPerBar` 1–16 (4).
+- **Backing track**: `loadBackingTrack(uri, gapless?)` takes a local file (`file://` URI or
+  absolute path; download remote files first). It decodes WAV, AIFF, FLAC and MP3 (plus
+  CoreAudio formats such as M4A / AAC on iOS) on a background queue, resamples to the device
+  rate and swaps the buffer in without blocking or allocating on the audio thread; the old
+  buffer is freed on the main thread after the audio thread has let go of it. Up to 600 s.
+  A newer load or `unloadBackingTrack()` supersedes a load in flight (it rejects with
+  `ERR_BACKING_TRACK_SUPERSEDED`); other errors: `ERR_BACKING_TRACK_URI`, `_FILE`, `_FORMAT`,
+  `_TOO_LONG`.
+- **Gapless MP3 loops**: MP3 encoders pad the start and end. With `gapless` (the LAME / Xing
+  tag values, frames at the file's rate) the loop region is: decoded length == `loopSamples`
+  (the decoder honoured the tag) → `[0, loopSamples)`; decoded length == 1152 + leading +
+  loopSamples + trailing (the decoder ignored the tag and decoded the tag frame) → `[1152 +
+  leading, +loopSamples)`; anything else → the whole file. The region is cut before
+  resampling; `decodedSamples` / `decoder` in the result tell which case applied.
+- **Playback** follows the transport: it plays while the transport plays; its position is
+  the transport position converted to seconds at the current tempo, counted from the start
+  of the bar the transport started in. `setTransportPosition()` seeks the track (5 ms
+  crossfade), stopping fades it out (5 ms). With `loop` off it plays once and then stays
+  silent until the transport is restarted or moved back. The track is not time-stretched: a
+  tempo change while playing moves it to the position the new tempo implies (5 ms crossfade).
+- Options: `level` 0–1 (0.8), `loop` (true), `enabled` (true).
+- Metronome and backing-track options and the loaded track are kept natively for the life of
+  the app: they work before `setup()` and survive engine rebuilds (after a sample-rate change
+  the track is resampled again off the audio thread).
+- Binaries older than 0.6.0: the setters are no-ops and `loadBackingTrack` rejects with
+  `ERR_UNSUPPORTED`. Web: the same.
+
+### Analysis (0.6.0+)
+
+```ts
+const a = ExpoJuce.getAnalysis();
+// { peak, rms, scope: number[128], lastNote, bpm, beat, playing }
+```
+
+Synchronous and cheap enough to call every animation frame. `peak` / `rms` are of the last
+output block (synth, effects, metronome and backing track as sent to the device); `scope` is
+128 points, oldest first, taken every 16th sample from the last 2048 output samples (mono, may
+tear across a block; it is for display). `lastNote` is the last note the synth started (-1 if
+none). Zeros when the engine is not running.
+
 ### `JucePadView` (0.5.2+)
 
 A native view that plays a note on touch from the iOS main thread, without the JS thread,
@@ -189,6 +257,15 @@ import { JucePadView } from 'expo-juce';
 
 Check the shipped type definitions for the exact event payloads once 0.5.2 is published.
 
+`hitPolygon` (0.6.0+) makes the touch area non-rectangular: a flat `[x0, y0, x1, y1, …]`
+polygon normalised to the view (0–1). Touches outside it (including on its children) pass
+through to the views underneath, so pads with overlapping bounding boxes do not steal each
+other's touches. Empty, odd-length or fewer than 3 points: the whole view.
+
+```tsx
+<JucePadView note={62} hitPolygon={[0.5, 0, 1, 0.5, 0.5, 1, 0, 0.5]} style={{ width: 96, height: 96 }} />
+```
+
 ### Diagnostics
 
 `getDiagnostics()` returns setup state (`isReady`, `setupStep`, `lastError`), device
@@ -201,10 +278,10 @@ Check the shipped type definitions for the exact event payloads once 0.5.2 is pu
 `mediaResetCount`, `lastRecoveryError`, `engineState`. A debug screen in the app can show them
 as a pass/fail ladder — see [docs/latency.md](docs/latency.md#5-a-diagnostics-panel).
 
-0.6.0+ adds `fxProcessCount`, `fxLimiterGain` (1 = the safety limiter is idle) and
-`fxNonFiniteResets`.
+0.6.0+ adds `fxProcessCount`, `fxLimiterGain` (1 = the safety limiter is idle),
+`fxNonFiniteResets`, `metronomeClicks`, `backingTrackLoaded` and `backingTrackPositionSec`.
 
-Synth settings, effect settings and transport state (tempo, position, playing) survive the
+Synth settings, effect, metronome and backing-track settings (and the loaded track) and transport state (tempo, position, playing) survive the
 engine's automatic rebuilds after a media-services reset or a stalled device; held notes do not.
 
 ## Latency

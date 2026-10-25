@@ -8,6 +8,9 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PolySynthProcessor.h"
 #include "FxChainProcessor.h"
+#include "AuxProcessor.h"
+#include "BackingTrack.h"
+#include "AnalysisRing.h"
 #include "TransportEngine.h"
 #include <atomic>
 #include <cmath>
@@ -61,6 +64,9 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 @property (nonatomic, assign) BOOL hasRecoveryState;
 @property (nonatomic, assign) SynthSettings recoverySynthSettings;
 @property (nonatomic, assign) TransportState recoveryTransportState;
+// Main thread: a deferred free of retired backing-track buffers is scheduled.
+@property (nonatomic, assign) BOOL backingTrackCollectScheduled;
+- (void)scheduleBackingTrackCollect;
 @end
 
 // Raw pointers — no JUCE smart pointers at file scope.
@@ -69,6 +75,7 @@ static GraphPlayer* sPlayer = nullptr;
 static juce::AudioProcessorGraph* sGraph = nullptr;
 static PolySynthProcessor* sSynth = nullptr;
 static FxChainProcessor* sFx = nullptr;   // owned by sGraph, like sSynth
+static AuxProcessor* sAux = nullptr;      // owned by sGraph
 static TransportEngine* sTransport = nullptr;
 
 // ── Engine lifecycle lock ──
@@ -110,6 +117,26 @@ static std::atomic<bool> sAcceptingNotes{false};
 // before setup, during a rebuild, or while a failed rebuild waits for its retry: the next chain
 // simply starts with it. For the same reason it is not part of the rebuild recovery state.
 static FxParamStore sFxParams;
+
+// ── Aux (metronome + backing track) and analysis ──
+// Same pattern: metronome / backing-track options, the backing track itself (decoded source +
+// the buffer the audio thread plays) and the output analysis ring live for the whole process,
+// so they need no engine lock, work before setup and survive rebuilds. The backing track is
+// decoded and resampled on sBackingTrackQueue (serial, never the audio or main thread); buffers
+// it replaces are freed on the main thread once the audio thread has moved past them
+// (BackingTrack::collect, scheduleBackingTrackCollect).
+static AuxSettingsStore sAuxSettings;
+static BackingTrack sBackingTrack;
+static AnalysisRing sAnalysis;
+
+static dispatch_queue_t backingTrackQueue() {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("expo-juce.backing-track", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
 
 // RAII: holds sEngineLock for a lifecycle section (main thread, blocking) and flags it busy.
 struct LifecycleLock {
@@ -177,6 +204,14 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
         _setupStep = -1;
         _requestedBufferSize = kDefaultBufferSize;
         _requestedSampleRate = kDefaultSampleRate;
+        // The aux node asks for the track at the device rate when it is prepared (setup, rebuild,
+        // device restart with a new rate): resample off that thread, then free the old buffer.
+        sBackingTrack.setRateListener([](double) {
+            dispatch_async(backingTrackQueue(), ^{
+                sBackingTrack.resampleToWanted();
+                [[ExpoJuceAudioEngine sharedInstance] scheduleBackingTrackCollect];
+            });
+        });
     }
     return self;
 }
@@ -362,6 +397,13 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sFx->setParamStore(&sFxParams);
     sFx->setTransport(sTransport);
     auto fxNode = sGraph->addNode(std::move(fxProcessor));
+    // Aux source (metronome + backing track): straight into the output, not through the effects.
+    auto auxProcessor = std::make_unique<AuxProcessor>();
+    sAux = auxProcessor.get();
+    sAux->setSettings(&sAuxSettings);
+    sAux->setBackingTrack(&sBackingTrack);
+    sAux->setTransport(sTransport);
+    auto auxNode = sGraph->addNode(std::move(auxProcessor));
 
     self.setupStep = 8;
     NSLog(@"[ExpoJuceAudioEngine] Step 8: addNode (output)");
@@ -384,6 +426,13 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
         [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection fx->output failed (L=%d, R=%d)",
                             fxConnectedL ? 1 : 0, fxConnectedR ? 1 : 0]];
     }
+    // aux → output (summed with the fx output by the graph)
+    bool auxConnectedL = sGraph->addConnection({{auxNode->nodeID, 0}, {outputNode->nodeID, 0}});
+    bool auxConnectedR = sGraph->addConnection({{auxNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    if (!auxConnectedL || !auxConnectedR) {
+        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection aux->output failed (L=%d, R=%d)",
+                            auxConnectedL ? 1 : 0, auxConnectedR ? 1 : 0]];
+    }
 
     self.setupStep = 10;
     NSLog(@"[ExpoJuceAudioEngine] Step 10: prepareToPlay");
@@ -393,6 +442,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     NSLog(@"[ExpoJuceAudioEngine] Step 11: GraphPlayer + addAudioCallback");
     sPlayer = new GraphPlayer();
     sPlayer->setProcessor(sGraph);
+    sPlayer->setAnalysis(&sAnalysis);
     sDeviceManager->addAudioCallback(sPlayer);
 
     self.isReady = true;
@@ -453,7 +503,9 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     delete sPlayer; sPlayer = nullptr;
     sSynth = nullptr;
     sFx = nullptr;
-    delete sGraph; sGraph = nullptr;
+    sAux = nullptr;
+    delete sGraph; sGraph = nullptr; // ~AuxProcessor releases its backing-track reader slot
+    [self scheduleBackingTrackCollect];
     if (sDeviceManager) { sDeviceManager->closeAudioDevice(); delete sDeviceManager; sDeviceManager = nullptr; }
     delete sTransport; sTransport = nullptr;
 }
@@ -822,6 +874,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     int activeVoices = 0;
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
     double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
+    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
         if (acquireUserLock(lock)) {
@@ -856,6 +909,10 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 fxProcessCount = (double)fx->diag.processCount.load(relaxed);
                 fxLimiterGain = (double)fx->diag.limiterGain.load(relaxed);
                 fxNonFiniteResets = (double)fx->diag.nonFiniteResets.load(relaxed);
+            }
+            if (AuxProcessor* aux = ready ? sAux : nullptr) {
+                metronomeClicks = (double)aux->diag.clicks.load(relaxed);
+                backingTrackPositionSec = aux->diag.trackPositionSec.load(relaxed);
             }
         }
     }
@@ -892,6 +949,9 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"fxProcessCount"] = @(fxProcessCount);
     d[@"fxLimiterGain"] = @(fxLimiterGain);
     d[@"fxNonFiniteResets"] = @(fxNonFiniteResets);
+    d[@"metronomeClicks"] = @(metronomeClicks);
+    d[@"backingTrackLoaded"] = @(sBackingTrack.hasTrack() ? YES : NO);
+    d[@"backingTrackPositionSec"] = @(backingTrackPositionSec);
 
     // engineState: recovering (rebuild running or retry scheduled) > ready > failed > uninitialized.
     // `ready` is false when the lock was busy, which only happens during a lifecycle section.
@@ -1013,6 +1073,153 @@ static double fxValueForJS(float value) {
         state[@(spec.id)] = @{ @"enabled": @(settings.enabled[fx] ? YES : NO), @"params": params };
     }
     return state;
+}
+
+// ── Metronome / backing track ──
+// Options: atomics in the process-lifetime sAuxSettings (no lock, remembered before setup and
+// across rebuilds). Keys that are absent or of the wrong type are left unchanged.
+
+static NSNumber *numberFrom(NSDictionary<NSString *, id> *options, NSString *key) {
+    id value = options[key];
+    if (![value isKindOfClass:[NSNumber class]]) return nil;
+    return std::isfinite([(NSNumber *)value doubleValue]) ? (NSNumber *)value : nil;
+}
+
+- (void)setMetronome:(NSDictionary<NSString *, id> *)options {
+    if (NSNumber *v = numberFrom(options, @"enabled")) sAuxSettings.setMetronomeEnabled(v.boolValue);
+    id style = options[@"style"];
+    if ([style isKindOfClass:[NSString class]]) sAuxSettings.setMetronomeStyle(((NSString *)style).UTF8String);
+    if (NSNumber *v = numberFrom(options, @"level")) sAuxSettings.setMetronomeLevel(v.doubleValue);
+    if (NSNumber *v = numberFrom(options, @"accent")) sAuxSettings.setMetronomeAccent(v.boolValue);
+    if (NSNumber *v = numberFrom(options, @"beatsPerBar")) sAuxSettings.setBeatsPerBar(v.doubleValue);
+}
+
+- (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options {
+    if (NSNumber *v = numberFrom(options, @"level")) sAuxSettings.setTrackLevel(v.doubleValue);
+    if (NSNumber *v = numberFrom(options, @"loop")) sAuxSettings.setTrackLoop(v.boolValue);
+    if (NSNumber *v = numberFrom(options, @"enabled")) sAuxSettings.setTrackEnabled(v.boolValue);
+}
+
+// file:// URL or absolute path → path; nil for anything else (remote URLs are not fetched).
+static NSString *backingTrackPath(NSString *uri) {
+    if ([uri hasPrefix:@"/"]) return uri;
+    if ([uri hasPrefix:@"file://"]) {
+        NSURL *url = [NSURL URLWithString:uri];
+        if (url != nil && url.isFileURL && url.path.length > 0) return url.path;
+        NSString *rest = [[uri substringFromIndex:7] stringByRemovingPercentEncoding];
+        if ([rest hasPrefix:@"localhost/"]) rest = [rest substringFromIndex:9];
+        return [rest hasPrefix:@"/"] ? rest : nil;
+    }
+    return nil;
+}
+
+- (void)loadBackingTrack:(NSString *)uri
+                 gapless:(NSDictionary<NSString *, id> *)gapless
+              completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode, NSString *errorMessage))completion {
+    NSString *path = uri != nil ? backingTrackPath(uri) : nil;
+    if (path == nil) {
+        completion(nil, @"ERR_BACKING_TRACK_URI", [NSString stringWithFormat:@"not a local file URI: %@", uri ?: @"(nil)"]);
+        return;
+    }
+    BackingTrackGapless g;
+    bool hasGapless = false;
+    if (gapless != nil) {
+        NSNumber *loop = numberFrom(gapless, @"loopSamples");
+        NSNumber *leading = numberFrom(gapless, @"leadingSamples");
+        NSNumber *trailing = numberFrom(gapless, @"trailingSamples");
+        if (loop != nil && leading != nil && trailing != nil) {
+            g.loopSamples = loop.longLongValue;
+            g.leadingSamples = leading.longLongValue;
+            g.trailingSamples = trailing.longLongValue;
+            hasGapless = g.loopSamples > 0;
+        }
+    }
+    // A newer load or an unload supersedes this one (checked while decoding and before publishing).
+    const uint64_t generation = sBackingTrack.beginLoad();
+    std::string utf8Path(path.UTF8String);
+    dispatch_async(backingTrackQueue(), ^{
+        std::string error;
+        BackingTrackGapless region = g;
+        auto decoded = BackingTrack::decode(juce::File(juce::String::fromUTF8(utf8Path.c_str())),
+                                            hasGapless ? &region : nullptr,
+                                            [generation] { return !sBackingTrack.isCurrent(generation); }, error);
+        if (decoded == nullptr) {
+            NSString *full = [NSString stringWithUTF8String:error.c_str()] ?: @"ERR_BACKING_TRACK: decode failed";
+            NSRange colon = [full rangeOfString:@": "];
+            NSString *code = colon.location != NSNotFound ? [full substringToIndex:colon.location] : @"ERR_BACKING_TRACK";
+            NSString *message = colon.location != NSNotFound ? [full substringFromIndex:NSMaxRange(colon)] : full;
+            completion(nil, code, message);
+            return;
+        }
+        const BackingTrackInfo info = decoded->info;
+        if (!sBackingTrack.install(std::move(decoded), generation)) {
+            completion(nil, @"ERR_BACKING_TRACK_SUPERSEDED", @"a newer load or unload replaced this one");
+            return;
+        }
+        [self scheduleBackingTrackCollect];
+        completion(@{
+            @"durationSec": @(info.durationSec),
+            @"sampleRate": @(info.sampleRate),
+            @"channels": @(info.channels),
+            @"loopStartSample": @((double)info.loopStartSample),
+            @"loopSamples": @((double)info.loopSamples),
+            @"decodedSamples": @((double)info.decodedSamples),
+            @"decoder": [NSString stringWithUTF8String:info.formatName.c_str()] ?: @"",
+        }, nil, nil);
+    });
+}
+
+- (void)unloadBackingTrack {
+    sBackingTrack.unload();
+    [self scheduleBackingTrackCollect];
+}
+
+// Main thread. Frees replaced backing-track buffers the audio thread no longer uses; retries
+// every 100 ms while some are still in use (e.g. the device is stopped mid-swap).
+- (void)scheduleBackingTrackCollect {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self scheduleBackingTrackCollect]; });
+        return;
+    }
+    if (self.backingTrackCollectScheduled) return;
+    if (sBackingTrack.collect() == 0) return;
+    self.backingTrackCollectScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * (int64_t)NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        self.backingTrackCollectScheduled = NO;
+        [self scheduleBackingTrackCollect];
+    });
+}
+
+// ── Analysis ──
+// Any thread, cheap: the ring / peak / rms are lock-free reads of the process-lifetime
+// sAnalysis; tempo / position / play state are read under the engine lock (try_lock off the
+// main thread). Not ready: zeros.
+- (NSDictionary<NSString *, id> *)analysis {
+    bool ready = false;
+    double bpm = 120.0, beat = 0.0;
+    bool playing = false;
+    {
+        std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+        if (acquireUserLock(lock) && self.isReady && sTransport != nullptr) {
+            ready = true;
+            bpm = sTransport->getTempo();
+            beat = sTransport->getPosition();
+            playing = sTransport->isPlaying();
+        }
+    }
+    float scope[AnalysisRing::kScopePoints] = {};
+    if (ready) sAnalysis.readScope(scope);
+    NSMutableArray<NSNumber *> *points = [NSMutableArray arrayWithCapacity:AnalysisRing::kScopePoints];
+    for (int i = 0; i < AnalysisRing::kScopePoints; ++i) [points addObject:@(scope[i])];
+    return @{
+        @"peak": @(ready ? sAnalysis.peak() : 0.0f),
+        @"rms": @(ready ? sAnalysis.rms() : 0.0f),
+        @"scope": points,
+        @"lastNote": @(sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed)),
+        @"bpm": @(bpm),
+        @"beat": @(beat),
+        @"playing": @(playing ? YES : NO),
+    };
 }
 
 // ── Transport ──

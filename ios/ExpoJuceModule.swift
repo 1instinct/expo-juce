@@ -157,6 +157,37 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.getEffectsState()
     }
 
+    // ── Metronome / backing track / analysis ───────────────────────
+    // Options are lock-free and remembered before setup and across rebuilds.
+
+    Function("setMetronome") { (options: [String: Any]) in
+      ExpoJuceBridge.setMetronome(options)
+    }
+
+    Function("setBackingTrackOptions") { (options: [String: Any]) in
+      ExpoJuceBridge.setBackingTrackOptions(options)
+    }
+
+    // Decode + resample run on a background queue; a newer load or unload supersedes this one
+    // (rejects with ERR_BACKING_TRACK_SUPERSEDED).
+    AsyncFunction("loadBackingTrack") { (uri: String, gapless: [String: Any]?, promise: Promise) in
+      ExpoJuceBridge.loadBackingTrack(uri, gapless: gapless) { result, code, message in
+        if let result = result {
+          promise.resolve(result)
+        } else {
+          promise.reject(code ?? "ERR_BACKING_TRACK", message ?? "backing track load failed")
+        }
+      }
+    }
+
+    Function("unloadBackingTrack") {
+      ExpoJuceBridge.unloadBackingTrack()
+    }
+
+    Function("getAnalysis") { () -> [String: Any] in
+      return ExpoJuceBridge.getAnalysis()
+    }
+
     // ── Transport ──────────────────────────────────────────────────
 
     Function("startTransport") {
@@ -215,6 +246,11 @@ public class ExpoJuceModule: Module {
 
       Prop("enabled") { (view: JucePadView, enabled: Bool?) in
         view.enabled = enabled ?? true
+      }
+
+      // Normalised flat [x0, y0, x1, y1, …]; empty / odd / < 3 points = whole rect.
+      Prop("hitPolygon") { (view: JucePadView, polygon: [Double]?) in
+        view.hitPolygon = polygon ?? []
       }
     }
   }

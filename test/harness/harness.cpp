@@ -9,6 +9,9 @@
 #include "PolySynthProcessor.h"
 #include "TransportEngine.h"
 #include "FxChainProcessor.h"
+#include "AuxProcessor.h"
+#include "BackingTrack.h"
+#include "AnalysisRing.h"
 
 #include <atomic>
 #include <chrono>
@@ -34,6 +37,7 @@ void __libc_free(void*);
 }
 static thread_local bool tCountAllocs = false;
 static std::atomic<uint64_t> gRenderAllocs{0};
+static std::atomic<uint64_t> gRenderFrees{0}; // frees inside counted render calls (must be 0 too)
 static inline void countAlloc() {
     if (tCountAllocs) gRenderAllocs.fetch_add(1, std::memory_order_relaxed);
 }
@@ -50,7 +54,10 @@ int posix_memalign(void** out, size_t a, size_t n) {
     *out = p;
     return 0;
 }
-void free(void* p) { __libc_free(p); }
+void free(void* p) {
+    if (tCountAllocs && p != nullptr) gRenderFrees.fetch_add(1, std::memory_order_relaxed);
+    __libc_free(p);
+}
 }
 
 //==============================================================================
@@ -150,8 +157,10 @@ static void pump(bool loop, int ms) {
 
 static Result runCase(const Case& c) {
     // ── doSetup replica (ios/ExpoJuceAudioEngine.mm, HEAD), steps 2 and 5–11:
-    //    synth → fx chain → output ──
+    //    synth → fx chain → output, aux (metronome + backing track, defaults: silent) → output ──
     FxParamStore fxStore;              // the engine's process-lifetime store (outlives the graph)
+    AuxSettingsStore auxStore;         // process-lifetime aux settings / track holder (outlive it too)
+    BackingTrack auxTrack;
     if (c.allFx)
         for (int fx = 0; fx < kFxCount; ++fx) enableFxNonDefault(fxStore, fx);
     auto* transport = new TransportEngine();
@@ -165,12 +174,19 @@ static Result runCase(const Case& c) {
     fxProcessor->setParamStore(&fxStore);
     fxProcessor->setTransport(transport);
     auto fxNode = graph->addNode(std::move(fxProcessor));
+    auto auxProcessor = std::make_unique<AuxProcessor>();
+    auxProcessor->setSettings(&auxStore);
+    auxProcessor->setBackingTrack(&auxTrack);
+    auxProcessor->setTransport(transport);
+    auto auxNode = graph->addNode(std::move(auxProcessor));
     auto outputNode = graph->addNode(std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
         juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
     graph->addConnection({{synthNode->nodeID, 0}, {fxNode->nodeID, 0}});
     graph->addConnection({{synthNode->nodeID, 1}, {fxNode->nodeID, 1}});
     graph->addConnection({{fxNode->nodeID, 0}, {outputNode->nodeID, 0}});
     graph->addConnection({{fxNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    graph->addConnection({{auxNode->nodeID, 0}, {outputNode->nodeID, 0}});
+    graph->addConnection({{auxNode->nodeID, 1}, {outputNode->nodeID, 1}});
     graph->prepareToPlay(c.setupSr, c.setupBuf);
     auto* player = new GraphPlayer();
     player->setProcessor(graph);
@@ -848,6 +864,578 @@ static int runFxEchoSync() {
     return failures;
 }
 
+//==============================================================================
+// Aux node: metronome, backing track, analysis.
+
+// Renders `total` samples of `aux` in blocks cycled from `blocks`, advancing `transport` per block
+// as the synth does. Allocations / frees counted inside each block. Left channel into `outL`.
+static void renderAux(AuxProcessor& aux, TransportEngine& transport, double sr, int total,
+                      const std::vector<int>& blocks, std::vector<float>& outL, std::vector<float>* outR = nullptr,
+                      const std::function<void(int)>& beforeBlock = {}) {
+    juce::AudioBuffer<float> buf(2, 4096);
+    juce::MidiBuffer midi;
+    outL.assign((size_t)total, 0.0f);
+    if (outR) outR->assign((size_t)total, 0.0f);
+    size_t bi = 0;
+    for (int done = 0; done < total;) {
+        const int n = std::min(blocks[bi++ % blocks.size()], total - done);
+        if (beforeBlock) beforeBlock(done);
+        buf.setSize(2, n, false, false, true);
+        tCountAllocs = true;
+        transport.advanceBlock(n, sr);
+        aux.processBlock(buf, midi);
+        tCountAllocs = false;
+        std::memcpy(&outL[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+        if (outR) std::memcpy(&(*outR)[(size_t)done], buf.getReadPointer(1), (size_t)n * sizeof(float));
+        done += n;
+    }
+}
+
+// Metronome onsets: every beat's click starts exactly on the first sample whose beat position is
+// >= the beat (ceil(k × 60 × sr / bpm)), waveform equal to the pre-rendered click (accent on bar
+// beat 1), silence between clicks, L == R; odd block sizes so clicks straddle block boundaries.
+static int runMetronome() {
+    struct Cfg { double bpm, sr, start; std::vector<int> blocks; };
+    const std::vector<Cfg> cfgs = {
+        {120.0, 48000.0, 0.0, {471, 127, 1024}},
+        {137.0, 48000.0, 0.0, {333, 64}},     // non-integer samples per beat
+        {100.0, 44100.0, 0.5, {471}},         // starts mid-beat: first click on beat 1
+        {173.0, 48000.0, 2.25, {1, 7, 4096, 129}},
+    };
+    int failures = 0;
+    for (const Cfg& cfg : cfgs) {
+        int clicksChecked = 0, mismatches = 0, styleRuns = 0;
+        uint64_t allocs = 0, frees = 0;
+        for (int style = 0; style < kMetronomeStyleCount; ++style, ++styleRuns) {
+            TransportEngine transport;
+            transport.setTempo(cfg.bpm);
+            transport.setPosition(cfg.start);
+            transport.start();
+            AuxProcessor aux;
+            aux.setTransport(&transport);
+            aux.auxSettings().setMetronomeEnabled(true);
+            aux.auxSettings().setMetronomeStyle(style);
+            aux.auxSettings().setMetronomeLevel(1.0);
+            aux.auxSettings().setBeatsPerBar(4);
+            aux.setRateAndBufferSizeDetails(cfg.sr, 512);
+            aux.prepareToPlay(cfg.sr, 512);
+            const double spb = 60.0 * cfg.sr / cfg.bpm;
+            const int total = (int)(9 * spb);
+            std::vector<float> l, r;
+            gRenderAllocs.store(0); gRenderFrees.store(0);
+            renderAux(aux, transport, cfg.sr, total, cfg.blocks, l, &r);
+            allocs += gRenderAllocs.load(); frees += gRenderFrees.load();
+            std::vector<char> covered((size_t)total, 0);
+            for (int64_t k = (int64_t)std::ceil(cfg.start); ; ++k) {
+                const int64_t onset = (int64_t)std::ceil((k - cfg.start) * spb - 1e-6);
+                const std::vector<float>& click = aux.clickBuffer(style, k % 4 == 0);
+                if (onset + (int64_t)click.size() >= total) break;
+                for (size_t j = 0; j < click.size(); ++j) {
+                    covered[(size_t)onset + j] = 1;
+                    if (l[(size_t)onset + j] != click[j]) { ++mismatches; break; }
+                }
+                ++clicksChecked;
+            }
+            for (int i = 0; i < total; ++i) {
+                if (!covered[(size_t)i] && l[(size_t)i] != 0.0f) { ++mismatches; break; }
+                if (l[(size_t)i] != r[(size_t)i]) { ++mismatches; break; }
+            }
+        }
+        const bool pass = mismatches == 0 && clicksChecked >= 8 * styleRuns && allocs == 0 && frees == 0;
+        failures += pass ? 0 : 1;
+        std::printf("met   metronome %.0f bpm @ %.0f Hz from beat %.2f, 5 styles, blocks", cfg.bpm, cfg.sr, cfg.start);
+        for (int b : cfg.blocks) std::printf(" %d", b);
+        std::printf("  %-4s %d clicks on the beat sample, %d mismatches, allocs %llu frees %llu\n", pass ? "PASS" : "FAIL",
+                    clicksChecked, mismatches, (unsigned long long)allocs, (unsigned long long)frees);
+        std::fflush(stdout);
+    }
+    return failures;
+}
+
+// A synthetic track (distinct values per sample) at `rate`.
+static std::unique_ptr<DecodedBackingTrack> makeTrack(int length, double rate, double salt = 0.0) {
+    auto t = std::make_unique<DecodedBackingTrack>();
+    t->sampleRate = rate;
+    t->audio.setSize(2, length);
+    for (int i = 0; i < length; ++i) {
+        const float v = 0.4f * (float)std::sin(i * 0.0123 + salt) + 0.001f * (float)(i % 97);
+        t->audio.setSample(0, i, v);
+        t->audio.setSample(1, i, -v);
+    }
+    t->info.sampleRate = rate;
+    t->info.channels = 2;
+    t->info.loopSamples = length;
+    t->info.decodedSamples = length;
+    t->info.durationSec = length / rate;
+    return t;
+}
+
+// Backing track follows the transport: plays from the top, loops, seeks with setTransportPosition
+// (5 ms crossfade, then sample-exact), starts in the bar the transport started on, stops (fade,
+// then silence), no loop → silent past the end, follows a device-rate change by resampling.
+static bool runBackingTrackPlayback() {
+    const double sr = 48000.0;
+    const int L = 30000;
+    const int fade = (int)(AuxProcessor::kFadeSeconds * sr);
+    const std::vector<int> blocks = {471, 127, 1024, 333};
+    const auto expected = [&](const DecodedBackingTrack& t, int64_t p) { return t.audio.getSample(0, (int)(((p % L) + L) % L)); };
+    int bad = 0;
+    uint64_t allocs = 0, frees = 0;
+    std::string detail;
+
+    // 1. loop from the top, then seek to beat 10.25 (= 246000 → 6000 in the loop), then stop.
+    {
+        BackingTrack holder;
+        auto ref = makeTrack(L, sr);
+        DecodedBackingTrack refCopy; refCopy.audio.makeCopyOf(ref->audio); refCopy.sampleRate = sr;
+        AuxProcessor aux;
+        TransportEngine transport;
+        transport.setTempo(120);
+        aux.setBackingTrack(&holder);
+        aux.setTransport(&transport);
+        aux.auxSettings().setTrackLevel(1.0);
+        aux.setRateAndBufferSizeDetails(sr, 512);
+        aux.prepareToPlay(sr, 512);
+        holder.install(std::move(ref), holder.beginLoad());
+        transport.start();
+        const int seekAt = 80000, stopAt = 140000, total = 150000;
+        int seekBlock = -1, stopBlock = -1;
+        std::vector<float> l;
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        renderAux(aux, transport, sr, total, blocks, l, nullptr, [&](int done) {
+            if (seekBlock < 0 && done >= seekAt) { transport.setPosition(10.25); seekBlock = done; }
+            if (stopBlock < 0 && done >= stopAt) { transport.stop(); stopBlock = done; }
+        });
+        allocs += gRenderAllocs.load(); frees += gRenderFrees.load();
+        int b1 = 0, b2 = 0, b3 = 0;
+        for (int i = 0; i < seekBlock; ++i) b1 += l[(size_t)i] == expected(refCopy, i) ? 0 : 1;
+        for (int i = seekBlock + fade; i < stopBlock; ++i) b2 += l[(size_t)i] == expected(refCopy, 246000 + (i - seekBlock)) ? 0 : 1;
+        for (int i = stopBlock + fade; i < total; ++i) b3 += l[(size_t)i] == 0.0f ? 0 : 1;
+        bad += b1 + b2 + b3;
+        detail += " loop/seek/stop mismatches " + std::to_string(b1) + "/" + std::to_string(b2) + "/" + std::to_string(b3) + ";";
+    }
+    // 2. start at beat 5.5 with 4 beats per bar: anchor = beat 4, track at 1.5 beats (36000 → 6000).
+    {
+        BackingTrack holder;
+        auto ref = makeTrack(L, sr);
+        DecodedBackingTrack refCopy; refCopy.audio.makeCopyOf(ref->audio);
+        AuxProcessor aux;
+        TransportEngine transport;
+        transport.setTempo(120);
+        transport.setPosition(5.5);
+        aux.setBackingTrack(&holder);
+        aux.setTransport(&transport);
+        aux.auxSettings().setTrackLevel(1.0);
+        aux.setRateAndBufferSizeDetails(sr, 512);
+        aux.prepareToPlay(sr, 512);
+        holder.install(std::move(ref), holder.beginLoad());
+        transport.start();
+        std::vector<float> l;
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        renderAux(aux, transport, sr, 40000, blocks, l);
+        allocs += gRenderAllocs.load(); frees += gRenderFrees.load();
+        int b = 0;
+        for (int i = fade; i < 40000; ++i) b += l[(size_t)i] == expected(refCopy, 36000 + i) ? 0 : 1;
+        bad += b;
+        detail += " bar anchor " + std::to_string(b) + ";";
+    }
+    // 3. no loop: the track plays once, then silence.
+    {
+        BackingTrack holder;
+        auto ref = makeTrack(L, sr);
+        DecodedBackingTrack refCopy; refCopy.audio.makeCopyOf(ref->audio);
+        AuxProcessor aux;
+        TransportEngine transport;
+        aux.setBackingTrack(&holder);
+        aux.setTransport(&transport);
+        aux.auxSettings().setTrackLevel(1.0);
+        aux.auxSettings().setTrackLoop(false);
+        aux.setRateAndBufferSizeDetails(sr, 512);
+        aux.prepareToPlay(sr, 512);
+        holder.install(std::move(ref), holder.beginLoad());
+        transport.start();
+        std::vector<float> l;
+        renderAux(aux, transport, sr, 45000, blocks, l);
+        int b = 0;
+        for (int i = 0; i < 45000; ++i) b += l[(size_t)i] == (i < L ? expected(refCopy, i) : 0.0f) ? 0 : 1;
+        bad += b;
+        detail += " no-loop " + std::to_string(b) + ";";
+    }
+    // 4. device rate change: prepare at 44.1 kHz → listener resamples → the 44.1 kHz buffer plays.
+    bool rateOk = false;
+    {
+        BackingTrack holder;
+        holder.setRateListener([&holder](double) { holder.resampleToWanted(); }); // the app posts this to a queue
+        AuxProcessor aux;
+        TransportEngine transport;
+        aux.setBackingTrack(&holder);
+        aux.setTransport(&transport);
+        aux.setRateAndBufferSizeDetails(sr, 512);
+        aux.prepareToPlay(sr, 512);
+        holder.install(makeTrack(L, sr), holder.beginLoad());
+        const BackingTrackBuffer* before = holder.acquire();
+        aux.setRateAndBufferSizeDetails(44100, 512);
+        aux.prepareToPlay(44100, 512);
+        const BackingTrackBuffer* after = holder.acquire();
+        rateOk = before != nullptr && before->sampleRate == sr && after != nullptr && after->sampleRate == 44100
+              && after->length == (int)std::llround(L * 44100.0 / sr);
+        transport.start();
+        std::vector<float> l;
+        renderAux(aux, transport, 44100, 8000, blocks, l);
+        float peak = 0.0f;
+        for (float v : l) peak = std::max(peak, std::fabs(v));
+        rateOk = rateOk && peak > 0.1f;
+        detail += std::string(" rate change ") + (rateOk ? "ok" : "FAILED") + ";";
+    }
+    const bool pass = bad == 0 && rateOk && allocs == 0 && frees == 0;
+    std::printf("bt    backing track: loop, seek, bar anchor, stop, no-loop, rate change  %-4s%s allocs %llu frees %llu\n",
+                pass ? "PASS" : "FAIL", detail.c_str(), (unsigned long long)allocs, (unsigned long long)frees);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Loop region from the MP3 fixture (44.1 kHz stereo, LAME/Xing gapless tag) with the JUCE MP3
+// decoder (the harness has no CoreAudio): which length it yields and which region the rule picks,
+// then the resample to 48 kHz. Also the rule itself on the three lengths it distinguishes.
+static bool runBackingTrackRegion() {
+    const BackingTrackGapless g{682839, 4561, 1496};
+    const BackingTrackRegion honoured = backingTrackRegion(682839, &g);
+    const BackingTrackRegion ignored = backingTrackRegion(1152 + 4561 + 682839 + 1496, &g);
+    const BackingTrackRegion other = backingTrackRegion(4561 + 682839 + 1496, &g);
+    const BackingTrackRegion none = backingTrackRegion(5000, nullptr);
+    const bool ruleOk = honoured.start == 0 && honoured.length == 682839 && ignored.start == 1152 + 4561
+        && ignored.length == 682839 && other.start == 0 && other.length == 4561 + 682839 + 1496
+        && none.start == 0 && none.length == 5000;
+
+    const juce::File file(juce::String(HARNESS_FIXTURES) + "/loop-124bpm-44k.mp3");
+    std::string error;
+    auto decoded = BackingTrack::decode(file, &g, {}, error);
+    bool decodeOk = decoded != nullptr;
+    std::string path = "none";
+    int64_t resampled = 0, expectedResampled = 0;
+    double seamJump = 0.0, meanStep = 0.0;
+    if (decodeOk) {
+        const BackingTrackInfo& info = decoded->info;
+        const int64_t d = info.decodedSamples;
+        if (d == g.loopSamples) path = "honoured the tag (== loopSamples)";
+        else if (d == 1152 + g.leadingSamples + g.loopSamples + g.trailingSamples) path = "ignored the tag, tag frame decoded (== 1152 + lead + loop + trail)";
+        else if (d == g.leadingSamples + g.loopSamples + g.trailingSamples) path = "skipped the tag frame but ignored the gapless values (== lead + loop + trail): rule falls back to the whole file";
+        else path = "other length";
+        const BackingTrackRegion want = backingTrackRegion(d, &g);
+        decodeOk = info.sampleRate == 44100.0 && info.channels == 2 && info.loopStartSample == want.start
+                && info.loopSamples == want.length && decoded->audio.getNumSamples() == (int)want.length;
+        const float* x = decoded->audio.getReadPointer(0);
+        const int n = decoded->audio.getNumSamples();
+        for (int i = 1; i < n; ++i) meanStep += std::fabs(x[i] - x[i - 1]);
+        meanStep /= std::max(1, n - 1);
+        seamJump = std::fabs(x[n - 1] - x[0]);
+        auto buf = BackingTrack::resample(*decoded, 48000.0);
+        resampled = buf->length;
+        expectedResampled = std::llround((double)n * 48000.0 / 44100.0);
+        decodeOk = decodeOk && resampled == expectedResampled && buf->audio.getNumSamples() == resampled;
+        std::printf("btr   MP3 fixture via %s: decoded %lld samples (loop %lld + lead %lld + trail %lld) -> %s;"
+                    " region [%lld, +%lld); seam |x[end]-x[0]| %.4f vs mean step %.4f\n",
+                    info.formatName.c_str(), (long long)d, (long long)g.loopSamples, (long long)g.leadingSamples,
+                    (long long)g.trailingSamples, path.c_str(), (long long)info.loopStartSample,
+                    (long long)info.loopSamples, seamJump, meanStep);
+    } else {
+        std::printf("btr   MP3 fixture decode failed: %s\n", error.c_str());
+    }
+    const bool pass = ruleOk && decodeOk;
+    std::printf("btr   loop-region rule (3 lengths) + fixture decode + resample 44.1k->48k  %-4s rule %d, decode %d,"
+                " resampled %lld (expect %lld)\n", pass ? "PASS" : "FAIL", ruleOk, decodeOk, (long long)resampled,
+                (long long)expectedResampled);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Swap stress: an audio thread renders the aux node non-stop (transport playing) while this
+// thread loads / unloads 300 tracks (44.1 kHz → resampled to 48 kHz) and collects retired buffers.
+// The render never allocates or frees; every replaced buffer is freed here; nothing leaks.
+static bool runBackingTrackSwapStress() {
+    BackingTrack holder;
+    TransportEngine transport;
+    transport.setTempo(128);
+    transport.start();
+    std::atomic<bool> stopAudio{false};
+    std::atomic<uint64_t> blocksRendered{0};
+    std::atomic<int> nonFinite{0};
+    uint64_t allocs = 0, frees = 0;
+    int pendingMax = 0;
+    {
+        AuxProcessor aux;
+        aux.setBackingTrack(&holder);
+        aux.setTransport(&transport);
+        aux.auxSettings().setMetronomeEnabled(true);
+        aux.setRateAndBufferSizeDetails(48000, 512);
+        aux.prepareToPlay(48000, 512);
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        std::thread audio([&] {
+            juce::AudioBuffer<float> buf(2, 1024);
+            juce::MidiBuffer midi;
+            const int sizes[3] = {128, 471, 1024};
+            for (uint64_t b = 0; !stopAudio.load(); ++b) {
+                const int n = sizes[b % 3];
+                buf.setSize(2, n, false, false, true);
+                tCountAllocs = true;
+                transport.advanceBlock(n, 48000);
+                aux.processBlock(buf, midi);
+                tCountAllocs = false;
+                for (int i = 0; i < n; ++i) if (!std::isfinite(buf.getSample(0, i))) nonFinite.fetch_add(1);
+                blocksRendered.fetch_add(1);
+            }
+        });
+        for (int i = 0; i < 300; ++i) {
+            if (i % 7 == 6) holder.unload();
+            else holder.install(makeTrack(2000 + 37 * i, 44100.0, i), holder.beginLoad());
+            if (i % 3 == 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
+            pendingMax = std::max(pendingMax, holder.collect());
+        }
+        // A load superseded before it installs must not publish.
+        const uint64_t stale = holder.beginLoad();
+        holder.beginLoad();
+        const bool staleRejected = !holder.install(makeTrack(1000, 44100.0), stale);
+        if (!staleRejected) pendingMax = 1000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stopAudio.store(true);
+        audio.join();
+        allocs = gRenderAllocs.load();
+        frees = gRenderFrees.load();
+    } // aux destroyed: releases the reader
+    holder.collect();
+    const int liveWithTrack = BackingTrackBuffer::live.load();
+    holder.unload();
+    const int pendingAfter = holder.collect();
+    const int liveAfter = BackingTrackBuffer::live.load();
+    const bool pass = allocs == 0 && frees == 0 && nonFinite.load() == 0 && liveWithTrack <= 1 && liveAfter == 0
+                   && pendingAfter == 0 && pendingMax < 1000 && blocksRendered.load() > 50;
+    std::printf("bts   swap stress: 300 load/unload while rendering (%llu blocks)  %-4s render allocs %llu frees %llu,"
+                " max retired waiting %d, live after unload %d, superseded load rejected %d\n",
+                (unsigned long long)blocksRendered.load(), pass ? "PASS" : "FAIL", (unsigned long long)allocs, (unsigned long long)frees,
+                pendingMax, liveAfter, pendingMax < 1000);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Aux with nothing to play adds exactly 0: its output is all zeros (transport playing, metronome
+// off, track loaded but disabled), and a graph with the aux node renders the same values as one
+// without it.
+static bool runAuxSilent() {
+    bool zeros = true;
+    {
+        BackingTrack holder;
+        TransportEngine transport;
+        transport.start();
+        AuxProcessor aux;
+        aux.setBackingTrack(&holder);
+        aux.setTransport(&transport);
+        aux.auxSettings().setTrackEnabled(false);
+        aux.setRateAndBufferSizeDetails(48000, 512);
+        aux.prepareToPlay(48000, 512);
+        holder.install(makeTrack(5000, 48000), holder.beginLoad());
+        std::vector<float> l, r;
+        renderAux(aux, transport, 48000, 20000, {471, 64}, l, &r);
+        for (int i = 0; i < 20000; ++i) zeros = zeros && l[(size_t)i] == 0.0f && r[(size_t)i] == 0.0f;
+    }
+    int differ = 0;
+    {
+        auto build = [](bool withAux, TransportEngine& t, FxParamStore& fs, AuxSettingsStore& as, BackingTrack& bt,
+                        PolySynthProcessor*& synthOut) {
+            auto* g = new juce::AudioProcessorGraph();
+            g->setPlayConfigDetails(0, 2, 48000, 256);
+            auto s = std::make_unique<PolySynthProcessor>();
+            synthOut = s.get();
+            s->setTransport(&t);
+            auto sn = g->addNode(std::move(s));
+            auto f = std::make_unique<FxChainProcessor>();
+            f->setParamStore(&fs); f->setTransport(&t);
+            auto fn = g->addNode(std::move(f));
+            auto on = g->addNode(std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
+                juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
+            for (int ch = 0; ch < 2; ++ch) {
+                g->addConnection({{sn->nodeID, ch}, {fn->nodeID, ch}});
+                g->addConnection({{fn->nodeID, ch}, {on->nodeID, ch}});
+            }
+            if (withAux) {
+                auto a = std::make_unique<AuxProcessor>();
+                a->setSettings(&as); a->setBackingTrack(&bt); a->setTransport(&t);
+                auto an = g->addNode(std::move(a));
+                for (int ch = 0; ch < 2; ++ch) g->addConnection({{an->nodeID, ch}, {on->nodeID, ch}});
+            }
+            g->prepareToPlay(48000, 256);
+            return g;
+        };
+        TransportEngine ta, tb;
+        FxParamStore fa, fb;
+        AuxSettingsStore aa, ab;
+        BackingTrack ba, bb;
+        PolySynthProcessor *sa = nullptr, *sb = nullptr;
+        juce::AudioProcessorGraph* ga = build(true, ta, fa, aa, ba, sa);
+        juce::AudioProcessorGraph* gb = build(false, tb, fb, ab, bb, sb);
+        ta.start(); tb.start();
+        sa->noteOn(60, 110); sb->noteOn(60, 110);
+        juce::AudioBuffer<float> xa(2, 256), xb(2, 256);
+        juce::MidiBuffer midi;
+        float peak = 0.0f;
+        for (int blk = 0; blk < 200; ++blk) {
+            xa.clear(); xb.clear();
+            ga->processBlock(xa, midi);
+            gb->processBlock(xb, midi);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 256; ++i) {
+                    differ += xa.getSample(ch, i) == xb.getSample(ch, i) ? 0 : 1;
+                    peak = std::max(peak, std::fabs(xa.getSample(ch, i)));
+                }
+        }
+        if (peak < 1e-3f) differ += 1000000; // the comparison must be over real signal
+        delete ga;
+        delete gb;
+    }
+    const bool pass = zeros && differ == 0;
+    std::printf("aux0  aux with nothing to play adds exactly 0  %-4s aux output all zero %d; graph with aux vs without:"
+                " %d differing samples\n", pass ? "PASS" : "FAIL", zeros, differ);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Aux settings and the backing track survive a rebuild: settings round-trip through
+// snapshot / apply and two processors render the metronome identically; a new processor on
+// the same (process-lifetime) holder plays the track the old one played.
+static bool runAuxRebuildState() {
+    AuxSettingsStore a;
+    a.setMetronomeEnabled(true);
+    bool apiOk = a.setMetronomeStyle("cowbell") && !a.setMetronomeStyle("nope");
+    a.setMetronomeLevel(1.7);   // clamped to 1
+    a.setMetronomeAccent(false);
+    a.setBeatsPerBar(3.4);      // rounded to 3
+    a.setTrackLevel(0.25);
+    a.setTrackLoop(false);
+    a.setTrackEnabled(false);
+    const AuxSettings s = a.snapshot();
+    apiOk = apiOk && s.metronomeStyle == kMetronomeCowbell && s.metronomeLevel == 1.0f && s.beatsPerBar == 3
+         && !s.metronomeAccent && s.trackLevel == 0.25f && !s.trackLoop && !s.trackEnabled && !(s == AuxSettings::defaults());
+    AuxSettingsStore b;
+    b.apply(s);
+    const bool stateOk = apiOk && b.snapshot() == s;
+    bool renderOk = true;
+    {
+        TransportEngine ta, tb;
+        ta.start(); tb.start();
+        AuxProcessor pa, pb;
+        pa.setSettings(&a); pa.setTransport(&ta);
+        pb.setSettings(&b); pb.setTransport(&tb);
+        for (AuxProcessor* p : {&pa, &pb}) { p->setRateAndBufferSizeDetails(48000, 512); p->prepareToPlay(48000, 512); }
+        std::vector<float> la, lb;
+        renderAux(pa, ta, 48000, 60000, {471}, la);
+        renderAux(pb, tb, 48000, 60000, {471}, lb);
+        float peak = 0.0f;
+        for (float v : la) peak = std::max(peak, std::fabs(v));
+        renderOk = la == lb && peak > 0.1f;
+    }
+    bool trackOk = false;
+    {
+        BackingTrack holder; // process-lifetime in the engine
+        TransportEngine t;
+        t.start();
+        std::vector<float> l1, l2;
+        {
+            AuxProcessor oldAux;
+            oldAux.setBackingTrack(&holder); oldAux.setTransport(&t);
+            oldAux.setRateAndBufferSizeDetails(48000, 512); oldAux.prepareToPlay(48000, 512);
+            holder.install(makeTrack(20000, 48000), holder.beginLoad());
+            renderAux(oldAux, t, 48000, 5000, {471}, l1);
+        }
+        const int live = BackingTrackBuffer::live.load();
+        AuxProcessor newAux;
+        newAux.setBackingTrack(&holder); newAux.setTransport(&t);
+        newAux.setRateAndBufferSizeDetails(48000, 512); newAux.prepareToPlay(48000, 512);
+        renderAux(newAux, t, 48000, 5000, {471}, l2);
+        float peak = 0.0f;
+        for (float v : l2) peak = std::max(peak, std::fabs(v));
+        trackOk = live == 1 && peak > 0.1f && holder.hasTrack();
+    }
+    const bool pass = stateOk && renderOk && trackOk;
+    std::printf("rsa   aux rebuild carry-over (metronome + track options, track holder)  %-4s state %d render %d track %d\n",
+                pass ? "PASS" : "FAIL", stateOk, renderOk, trackOk);
+    std::fflush(stdout);
+    return pass;
+}
+
+// getAnalysis: GraphPlayer writes the device output into the AnalysisRing; with a known sine the
+// scope points are the sine at the expected sample indices (stride 16, newest last), peak / rms
+// of the last block match, and the callback still does not allocate.
+class SineSource : public juce::AudioProcessor {
+public:
+    SineSource() : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)) {}
+    double index = 0.0;
+    static float value(double i) { return 0.5f * (float)std::sin(juce::MathConstants<double>::twoPi * i / 400.0); }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& b, juce::MidiBuffer&) override {
+        for (int i = 0; i < b.getNumSamples(); ++i, index += 1.0)
+            for (int ch = 0; ch < b.getNumChannels(); ++ch) b.setSample(ch, i, value(index));
+    }
+    const juce::String getName() const override { return "Sine"; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+};
+
+static bool runAnalysis() {
+    SineSource sine;
+    AnalysisRing ring;
+    GraphPlayer player;
+    player.setProcessor(&sine);
+    player.setAnalysis(&ring);
+    FakeDevice device(48000, 256);
+    player.audioDeviceAboutToStart(&device);
+    juce::AudioBuffer<float> out(2, 1024);
+    juce::AudioIODeviceCallbackContext ctx{};
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    int total = 0;
+    const int sizes[3] = {256, 471, 100};
+    for (int b = 0; b < 30; ++b) {
+        const int n = sizes[b % 3];
+        out.clear();
+        tCountAllocs = true;
+        player.audioDeviceIOCallbackWithContext(nullptr, 0, out.getArrayOfWritePointers(), 2, n, ctx);
+        tCountAllocs = false;
+        total += n;
+    }
+    float scope[AnalysisRing::kScopePoints];
+    ring.readScope(scope);
+    double maxErr = 0.0;
+    for (int j = 0; j < AnalysisRing::kScopePoints; ++j) {
+        const double idx = (double)(total - 1 - (AnalysisRing::kScopePoints - 1 - j) * 16);
+        maxErr = std::max(maxErr, (double)std::fabs(scope[j] - SineSource::value(idx)));
+    }
+    // Last block: 100 samples starting at total - 100.
+    float wantPeak = 0.0f;
+    double sum = 0.0;
+    for (int i = total - 100; i < total; ++i) {
+        const float v = SineSource::value(i);
+        wantPeak = std::max(wantPeak, std::fabs(v));
+        sum += 2.0 * v * v;
+    }
+    const double wantRms = std::sqrt(sum / 200.0);
+    const bool pass = maxErr < 1e-6 && std::fabs(ring.peak() - wantPeak) < 1e-6 && std::fabs(ring.rms() - wantRms) < 1e-5
+                   && ring.samplesWritten() == (uint32_t)total && gRenderAllocs.load() == 0 && gRenderFrees.load() == 0;
+    std::printf("an    analysis ring: scope of a known sine, peak / rms of the last block  %-4s scope max err %.2g,"
+                " peak %.4f (want %.4f), rms %.4f (want %.4f), allocs %llu\n", pass ? "PASS" : "FAIL", maxErr,
+                ring.peak(), wantPeak, ring.rms(), wantRms, (unsigned long long)gRenderAllocs.load());
+    std::fflush(stdout);
+    return pass;
+}
+
 int main() {
     // App: MessageManager::getInstance() in a static constructor on the main thread, then
     // juce::initialiseJuce_GUI() at doSetup step 0. Same thread here.
@@ -914,6 +1502,13 @@ int main() {
     unexpected += runFxBypass() ? 0 : 1;
     unexpected += runFxEchoSync();
     unexpected += runFxPumpAndLimiter() ? 0 : 1;
+    unexpected += runMetronome();
+    unexpected += runBackingTrackPlayback() ? 0 : 1;
+    unexpected += runBackingTrackRegion() ? 0 : 1;
+    unexpected += runBackingTrackSwapStress() ? 0 : 1;
+    unexpected += runAuxSilent() ? 0 : 1;
+    unexpected += runAuxRebuildState() ? 0 : 1;
+    unexpected += runAnalysis() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

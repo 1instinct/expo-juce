@@ -52,6 +52,19 @@
 }
 + (NSDictionary<NSString *, id> *)getEffectsState { return [[ExpoJuceAudioEngine sharedInstance] effectsState]; }
 
+// ── Metronome / backing track / analysis ──
++ (void)setMetronome:(NSDictionary<NSString *, id> *)options { [[ExpoJuceAudioEngine sharedInstance] setMetronome:options]; }
++ (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options {
+    [[ExpoJuceAudioEngine sharedInstance] setBackingTrackOptions:options];
+}
++ (void)loadBackingTrack:(NSString *)uri
+                 gapless:(NSDictionary<NSString *, id> *)gapless
+              completion:(void (^)(NSDictionary<NSString *, id> *, NSString *, NSString *))completion {
+    [[ExpoJuceAudioEngine sharedInstance] loadBackingTrack:uri gapless:gapless completion:completion];
+}
++ (void)unloadBackingTrack { [[ExpoJuceAudioEngine sharedInstance] unloadBackingTrack]; }
++ (NSDictionary<NSString *, id> *)getAnalysis { return [[ExpoJuceAudioEngine sharedInstance] analysis]; }
+
 // ── Transport ──
 + (void)startTransport { [[ExpoJuceAudioEngine sharedInstance] startTransport]; }
 + (void)stopTransport { [[ExpoJuceAudioEngine sharedInstance] stopTransport]; }

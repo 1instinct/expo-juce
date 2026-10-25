@@ -15,6 +15,12 @@ import {
   EffectParams,
   EffectState,
   EffectsState,
+  MetronomeStyle,
+  MetronomeOptions,
+  BackingTrackGapless,
+  BackingTrackInfo,
+  BackingTrackOptions,
+  Analysis,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
 
@@ -145,6 +151,67 @@ export function getEffectsState(): EffectsState {
   return ExpoJuceModule.getEffectsState();
 }
 
+// ── Metronome + backing track (0.6.0+) ───────────────────────────
+// Both are summed into the output after the effects chain and follow the transport. Options
+// are synchronous and lock-free, remembered natively before setup and across engine rebuilds.
+// Binaries older than 0.6.0: the setters are no-ops and loadBackingTrack rejects with
+// 'ERR_UNSUPPORTED'.
+
+// Click on every beat while the transport plays, sample-accurate; accent on beat 1 of the bar.
+export function setMetronome(options: MetronomeOptions): void {
+  if (typeof ExpoJuceModule?.setMetronome !== 'function') return;
+  ExpoJuceModule.setMetronome(options);
+}
+
+// Decodes a local audio file (file:// URI or absolute path; WAV, AIFF, FLAC, MP3, plus CoreAudio
+// formats such as M4A on iOS) off the audio thread, resamples it to the device rate and swaps it
+// in. It plays while the transport plays, from the bar the transport started on, and seeks with
+// setTransportPosition. `gapless` (MP3 LAME/Xing tag values) picks the exact loop region: decoded
+// length == loopSamples → [0, loopSamples); == 1152 + leading + loopSamples + trailing →
+// [1152 + leading, +loopSamples); otherwise the whole file. A later load or unloadBackingTrack()
+// supersedes a load in flight, which then rejects with 'ERR_BACKING_TRACK_SUPERSEDED'.
+// Other rejections: ERR_BACKING_TRACK_URI, _FILE, _FORMAT, _TOO_LONG (over 600 s).
+export async function loadBackingTrack(
+  uri: string,
+  gapless?: BackingTrackGapless
+): Promise<BackingTrackInfo> {
+  if (typeof ExpoJuceModule?.loadBackingTrack !== 'function') {
+    const error = new Error('this binary has no backing-track support (expo-juce 0.6.0+)');
+    (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';
+    throw error;
+  }
+  return ExpoJuceModule.loadBackingTrack(uri, gapless ?? null);
+}
+
+export function unloadBackingTrack(): void {
+  if (typeof ExpoJuceModule?.unloadBackingTrack !== 'function') return;
+  ExpoJuceModule.unloadBackingTrack();
+}
+
+export function setBackingTrackOptions(options: BackingTrackOptions): void {
+  if (typeof ExpoJuceModule?.setBackingTrackOptions !== 'function') return;
+  ExpoJuceModule.setBackingTrackOptions(options);
+}
+
+// ── Analysis (0.6.0+) ────────────────────────────────────────────
+
+const emptyAnalysis = (): Analysis => ({
+  peak: 0,
+  rms: 0,
+  scope: new Array(128).fill(0),
+  lastNote: -1,
+  bpm: 120,
+  beat: 0,
+  playing: false,
+});
+
+// Output level, a 128-point oscilloscope and transport state for HUDs. Synchronous and cheap
+// (call it every frame). Zeros when the engine is not running or the binary is older than 0.6.0.
+export function getAnalysis(): Analysis {
+  if (typeof ExpoJuceModule?.getAnalysis !== 'function') return emptyAnalysis();
+  return ExpoJuceModule.getAnalysis();
+}
+
 // ── Transport ────────────────────────────────────────────────────
 
 export function startTransport(): void {
@@ -205,4 +272,10 @@ export {
   EffectParams,
   EffectState,
   EffectsState,
+  MetronomeStyle,
+  MetronomeOptions,
+  BackingTrackGapless,
+  BackingTrackInfo,
+  BackingTrackOptions,
+  Analysis,
 };

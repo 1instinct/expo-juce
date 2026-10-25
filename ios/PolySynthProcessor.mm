@@ -97,6 +97,7 @@ void PolySynthProcessor::startQueuedNote(const NoteEvent& event) {
                      (double)detuneCents.load(),
                      filterCutoff.load(), filterResonance.load(),
                      masterLevel.load(), event.seq);
+    queue->lastNoteStarted.store(clampedNote, std::memory_order_relaxed);
 
     const juce::int64 nowTicks = juce::Time::getHighResolutionTicks();
     if (event.stampTicks != 0) {

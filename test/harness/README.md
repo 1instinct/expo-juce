@@ -12,7 +12,7 @@ From this directory, in WSL or any Linux shell:
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
 ```
 
-- Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`,
+- Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
   `FxChainProcessor`) are taken from `git show HEAD:ios/...`; pass `-DHARNESS_GIT_REF=WORKTREE`
   (or any ref) to change.
 - The graph cases build `synth → FxChainProcessor → output` like `doSetup` (effects off, so the
@@ -22,6 +22,20 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   off == dry bit-exact, again after re-bypass), `fxe` (synced echo returns exactly
   division × 60 / bpm later), `fxp` (pump dips right after each transport beat; limiter holds a
   2.0 sine under -0.3 dBFS); `rs` also round-trips the effect settings.
+- The graph cases also add the `AuxProcessor` node (metronome + backing track) into the output,
+  at its defaults (silent). Aux cases: `met` (every metronome style: each click starts exactly on
+  the sample `ceil(k × 60 × sr / bpm)`, equals the pre-rendered click, accent on bar beat 1,
+  silence between, over odd block sizes and mid-beat starts), `bt` (backing track plays from the
+  top sample-exact, loops, seeks with `setPosition`, starts in the bar the transport started in,
+  stops, plays once without loop, is resampled after a device-rate change), `btr` (loop-region
+  rule on its three lengths; decodes `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder and
+  prints which length it yields and the region chosen; resample 44.1 → 48 kHz), `bts` (300
+  loads / unloads while another thread renders: 0 allocations and 0 frees in the render, every
+  replaced buffer freed by `collect()`, a superseded load does not publish), `aux0` (aux with
+  nothing to play outputs exact zeros; a graph with it equals one without it, sample for
+  sample), `rsa` (aux settings and the track survive a rebuild), `an` (the `AnalysisRing` written
+  by `GraphPlayer` holds a known sine at the expected scope indices, peak / rms of the last
+  block). The `allocs` / `frees` counters also count `free()` inside render calls.
 - From a Windows checkout (`core.autocrlf=true`) `fetch_deps.sh` has CRLF line endings and bash
   rejects it: run from a copy with LF endings, or copy an existing `build/sysroot` (with its
   `.done`) and convert the script (`sed -i 's/\r$//' fetch_deps.sh`).

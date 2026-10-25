@@ -49,6 +49,18 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 + (BOOL)setEffectParam:(NSString *)effectId param:(NSString *)param value:(double)value NS_SWIFT_NAME(setEffectParam(_:param:value:));
 + (NSDictionary<NSString *, id> *)getEffectsState NS_SWIFT_NAME(getEffectsState());
 
+// ── Metronome / backing track / analysis ─────────────────────────
++ (void)setMetronome:(NSDictionary<NSString *, id> *)options NS_SWIFT_NAME(setMetronome(_:));
++ (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options NS_SWIFT_NAME(setBackingTrackOptions(_:));
+// `completion` runs on a background queue: result, or errorCode + errorMessage.
++ (void)loadBackingTrack:(NSString *)uri
+                 gapless:(nullable NSDictionary<NSString *, id> *)gapless
+              completion:(void (^)(NSDictionary<NSString *, id> *_Nullable result, NSString *_Nullable errorCode,
+                                   NSString *_Nullable errorMessage))completion
+    NS_SWIFT_NAME(loadBackingTrack(_:gapless:completion:));
++ (void)unloadBackingTrack;
++ (NSDictionary<NSString *, id> *)getAnalysis NS_SWIFT_NAME(getAnalysis());
+
 // ── Transport ────────────────────────────────────────────────────
 + (void)startTransport;
 + (void)stopTransport;
