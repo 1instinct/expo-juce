@@ -19,6 +19,7 @@ class JucePadView: ExpoView {
       if !enabled {
         releaseAllTouches()
       }
+      isUserInteractionEnabled = enabled
     }
   }
 
