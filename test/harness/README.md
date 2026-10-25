@@ -46,9 +46,10 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   sample), `rsa` (aux settings and the track survive a rebuild), `an` (the `AnalysisRing` written
   by `GraphPlayer` holds a known sine at the expected scope indices, peak / rms since the
   last read, mono RMS, the transport published by the aux node). The `allocs` / `frees` counters also count `free()` inside render calls.
-- From a Windows checkout (`core.autocrlf=true`) `fetch_deps.sh` has CRLF line endings and bash
-  rejects it: run from a copy with LF endings, or copy an existing `build/sysroot` (with its
-  `.done`) and convert the script (`sed -i 's/\r$//' fetch_deps.sh`).
+- `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
+  before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
+  an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the
+  `.git` pointer, so `git show HEAD:...` fails: pass `-DHARNESS_GIT_REF=WORKTREE` there.
 - `GraphPlayer` is the shipped class from `ios/GraphPlayer.h` (same git ref). Cases `k`/`k2` deliver
   blocks larger than its preallocated capacity and check the chunked render (graph calls = ceil(n/cap)
   per block, no silent block tails, no buffer growth).
