@@ -45,7 +45,7 @@ export type ExpoJuceNativeModule = {
   getEffectsState?(): EffectsState;
 
   // Metronome, backing track, analysis (0.6.0+)
-  setMetronome?(options: MetronomeOptions): void;
+  setMetronome?(options: MetronomeOptions): boolean;
   setBackingTrackOptions?(options: BackingTrackOptions): void;
   loadBackingTrack?(uri: string, gapless: BackingTrackGapless | null): Promise<BackingTrackInfo>;
   unloadBackingTrack?(): void;

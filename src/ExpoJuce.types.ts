@@ -113,6 +113,9 @@ export type BackingTrackGapless = {
   trailingSamples: number;
 };
 
+/** Loop region chosen by `loadBackingTrack()` (see `BackingTrackInfo.regionRule`). */
+export type BackingTrackRegionRule = 'tag' | 'padded' | 'paddedNoTagFrame' | 'whole';
+
 /** Resolved by `loadBackingTrack()`. Sample counts are frames at the file's own rate. */
 export type BackingTrackInfo = {
   /** Length of the loop region in seconds. */
@@ -124,8 +127,14 @@ export type BackingTrackInfo = {
   loopStartSample: number;
   /** Length of the loop region. */
   loopSamples: number;
-  /** Frames the decoder produced before the region was cut (absent on web). */
+  /** Frames the decoder produced before the region was cut. */
   decodedSamples?: number;
+  /**
+   * Which loop region was used (0.6.0-rc.1+): 'tag' (the decoder honoured the gapless tag),
+   * 'padded' (tag frame decoded as silence, padding cut), 'paddedNoTagFrame' (tag frame skipped,
+   * padding cut), 'whole' (no gapless info, or a length matching no case: the whole file).
+   */
+  regionRule?: BackingTrackRegionRule;
   /** Decoder used (e.g. "CoreAudio", "MP3 file", "WAV file"). */
   decoder?: string;
 };
@@ -142,16 +151,16 @@ export type BackingTrackOptions = {
 
 /** Returned by `getAnalysis()`: the device output (synth, effects, metronome, backing track). */
 export type Analysis = {
-  /** Max |sample| of the last block, 0–1+. */
+  /** Max |sample| since the previous getAnalysis() call (peak hold), 0–1+. */
   peak: number;
-  /** RMS of the last block (both channels). */
+  /** RMS (both channels) since the previous getAnalysis() call. */
   rms: number;
   /** 128 points, oldest first, decimated (every 16th sample) from the last 2048 output samples (mono). */
   scope: number[];
   /** Last note the synth started; -1 if none yet. */
   lastNote: number;
+  /** Transport tempo, position (beats) and play state as of the last rendered block. */
   bpm: number;
-  /** Transport position in beats. */
   beat: number;
   playing: boolean;
 };

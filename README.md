@@ -181,12 +181,12 @@ An aux source next to the synth: its output is summed into the device output **a
 effects chain (clicks and the track are not effected). Both follow the transport.
 
 ```ts
-ExpoJuce.setMetronome({ enabled: true, style: 'wood', level: 0.7, accent: true, beatsPerBar: 4 });
+ExpoJuce.setMetronome({ enabled: true, style: 'wood', level: 0.7, accent: true, beatsPerBar: 4 }); // false: unknown style
 
 const info = await ExpoJuce.loadBackingTrack(fileUri, {   // gapless info: optional, MP3 only
   loopSamples: 682839, leadingSamples: 4561, trailingSamples: 1496,
 });
-// { durationSec, sampleRate, channels, loopStartSample, loopSamples, decodedSamples, decoder }
+// { durationSec, sampleRate, channels, loopStartSample, loopSamples, decodedSamples, regionRule, decoder }
 ExpoJuce.setBackingTrackOptions({ level: 0.8, loop: true, enabled: true });
 ExpoJuce.startTransport();                                 // the track and the clicks start
 ExpoJuce.unloadBackingTrack();
@@ -198,35 +198,42 @@ ExpoJuce.unloadBackingTrack();
   (square 1 / 2 kHz), `cowbell` (two squares 540 / 800 Hz through a band-pass), `hat`
   (high-passed noise). Clicks are rendered once when the engine prepares (no allocation while
   playing). Options: `enabled` (false), `style` ('classic'), `level` 0–1 (0.8), `accent`
-  (true), `beatsPerBar` 1–16 (4).
+  (true), `beatsPerBar` 1–16 (4). `setMetronome` returns `false` and applies nothing if
+  `style` is not one of the five.
 - **Backing track**: `loadBackingTrack(uri, gapless?)` takes a local file (`file://` URI or
   absolute path; download remote files first). It decodes WAV, AIFF, FLAC and MP3 (plus
-  CoreAudio formats such as M4A / AAC on iOS) on a background queue, resamples to the device
+  CoreAudio formats such as M4A / AAC on iOS) on a background queue straight to the device
   rate and swaps the buffer in without blocking or allocating on the audio thread; the old
-  buffer is freed on the main thread after the audio thread has let go of it. Up to 600 s.
-  A newer load or `unloadBackingTrack()` supersedes a load in flight (it rejects with
-  `ERR_BACKING_TRACK_SUPERSEDED`); other errors: `ERR_BACKING_TRACK_URI`, `_FILE`, `_FORMAT`,
-  `_TOO_LONG`.
+  buffer is freed on the main thread after the audio thread has let go of it. Only the
+  playable buffer stays in memory (after a device-rate change the file is decoded again).
+  Limit: 6 minutes (17 280 000 frames per channel at 48 kHz, about 138 MB; the same duration
+  at other rates), and the load is refused if the process has less memory available than the
+  decode needs (about twice the final buffer). A newer load or `unloadBackingTrack()`
+  supersedes a load in flight (it rejects with `ERR_BACKING_TRACK_SUPERSEDED`); other errors:
+  `ERR_BACKING_TRACK_URI`, `_FILE`, `_FORMAT`, `_TOO_LONG`, `_MEMORY`.
 - **Gapless MP3 loops**: MP3 encoders pad the start and end. With `gapless` (the LAME / Xing
-  tag values, frames at the file's rate) the loop region is: decoded length == `loopSamples`
-  (the decoder honoured the tag) → `[0, loopSamples)`; decoded length == 1152 + leading +
-  loopSamples + trailing (the decoder ignored the tag and decoded the tag frame) → `[1152 +
-  leading, +loopSamples)`; decoded length == leading + loopSamples + trailing (the decoder
-  skipped the tag frame but kept the encoder padding, as JUCE's own MP3 decoder does) →
-  `[leading, +loopSamples)`; anything else → the whole file. The region is cut before
-  resampling; `decodedSamples` / `decoder` in the result tell which case applied.
-- **Playback** follows the transport: it plays while the transport plays; its position is
-  the transport position converted to seconds at the current tempo, counted from the start
-  of the bar the transport started in. `setTransportPosition()` seeks the track (5 ms
-  crossfade), stopping fades it out (5 ms). With `loop` off it plays once and then stays
-  silent until the transport is restarted or moved back. The track is not time-stretched: a
-  tempo change while playing moves it to the position the new tempo implies (5 ms crossfade).
+  tag values, frames at the file's rate) the loop region is, by decoded length:
+  - `loopSamples` (the decoder honoured the tag) → `[0, loopSamples)`, `regionRule: 'tag'`;
+  - 1152 + leading + loopSamples + trailing (the decoder ignored the tag and decoded the tag
+    frame) → `[1152 + leading, +loopSamples)`, `'padded'`;
+  - leading + loopSamples + trailing (the decoder skipped the tag frame but kept the encoder
+    padding, as JUCE's own MP3 decoder does) → `[leading, +loopSamples)`, `'paddedNoTagFrame'`;
+  - anything else, or no `gapless` → the whole file, `'whole'` (with `gapless` given, this
+    means the fallback fired and the loop will include the padding).
+
+  The region is cut before resampling; `decodedSamples` / `decoder` tell what the decoder did.
+- **Playback** follows the transport. Track sample 0 is beat 0: when the transport starts or
+  is moved (`setTransportPosition`), the track goes to beat × 60 / bpm seconds (modulo its
+  length when looping), so pause + resume continues where it stopped and seeks land on the
+  beat grid. While playing, the track simply advances with the audio: a tempo change does not
+  move or stretch it (it keeps its own speed). Starts away from the top, seeks, stops, and
+  replacing or unloading the track while it plays are crossfaded over 5 ms. With `loop` off it
+  plays once and then stays silent until the transport is moved back.
 - Options: `level` 0–1 (0.8), `loop` (true), `enabled` (true).
 - Metronome and backing-track options and the loaded track are kept natively for the life of
-  the app: they work before `setup()` and survive engine rebuilds (after a sample-rate change
-  the track is resampled again off the audio thread).
-- Binaries older than 0.6.0: the setters are no-ops and `loadBackingTrack` rejects with
-  `ERR_UNSUPPORTED`. Web: the same.
+  the app: they work before `setup()` and survive engine rebuilds.
+- Binaries older than 0.6.0: the setters are no-ops (`setMetronome` returns `false`) and
+  `loadBackingTrack` rejects with `ERR_UNSUPPORTED`. Web: the same.
 
 ### Analysis (0.6.0+)
 
@@ -235,10 +242,12 @@ const a = ExpoJuce.getAnalysis();
 // { peak, rms, scope: number[128], lastNote, bpm, beat, playing }
 ```
 
-Synchronous and cheap enough to call every animation frame. `peak` / `rms` are of the last
-output block (synth, effects, metronome and backing track as sent to the device); `scope` is
-128 points, oldest first, taken every 16th sample from the last 2048 output samples (mono, may
-tear across a block; it is for display). `lastNote` is the last note the synth started (-1 if
+Synchronous and lock-free, cheap enough to call every animation frame (from one place: each
+call consumes the levels). `peak` (peak hold) and `rms` (both channels) cover the output
+since the previous call (synth, effects, metronome and backing track as sent to the device);
+`scope` is 128 points, oldest first, taken every 16th sample from the last 2048 output samples
+(mono, may tear across a block; it is for display). `bpm` / `beat` / `playing` are the
+transport as of the last rendered block. `lastNote` is the last note the synth started (-1 if
 none). Zeros when the engine is not running.
 
 ### `JucePadView` (0.5.2+)

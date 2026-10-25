@@ -31,7 +31,9 @@ export default {
     return defaultEffectsState();
   },
   // No metronome / backing track / analysis on web either.
-  setMetronome(_options: MetronomeOptions): void {},
+  setMetronome(_options: MetronomeOptions): boolean {
+    return false;
+  },
   setBackingTrackOptions(_options: BackingTrackOptions): void {},
   async loadBackingTrack(_uri: string, _gapless: BackingTrackGapless | null): Promise<BackingTrackInfo> {
     const error = new Error('backing tracks are not supported on web');

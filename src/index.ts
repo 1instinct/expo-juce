@@ -19,6 +19,7 @@ import {
   MetronomeOptions,
   BackingTrackGapless,
   BackingTrackInfo,
+  BackingTrackRegionRule,
   BackingTrackOptions,
   Analysis,
 } from './ExpoJuce.types';
@@ -159,20 +160,23 @@ export function getEffectsState(): EffectsState {
 // 'ERR_UNSUPPORTED'.
 
 // Click on every beat while the transport plays, sample-accurate; accent on beat 1 of the bar.
-export function setMetronome(options: MetronomeOptions): void {
-  if (typeof ExpoJuceModule?.setMetronome !== 'function') return;
-  ExpoJuceModule.setMetronome(options);
+// Returns false (nothing applied) for an unknown style, or if the binary has no metronome.
+export function setMetronome(options: MetronomeOptions): boolean {
+  if (typeof ExpoJuceModule?.setMetronome !== 'function') return false;
+  return ExpoJuceModule.setMetronome(options) !== false;
 }
 
 // Decodes a local audio file (file:// URI or absolute path; WAV, AIFF, FLAC, MP3, plus CoreAudio
-// formats such as M4A on iOS) off the audio thread, resamples it to the device rate and swaps it
-// in. It plays while the transport plays, from the bar the transport started on, and seeks with
-// setTransportPosition. `gapless` (MP3 LAME/Xing tag values) picks the exact loop region: decoded
-// length == loopSamples → [0, loopSamples); == 1152 + leading + loopSamples + trailing →
-// [1152 + leading, +loopSamples); == leading + loopSamples + trailing → [leading, +loopSamples);
-// otherwise the whole file. A later load or unloadBackingTrack()
-// supersedes a load in flight, which then rejects with 'ERR_BACKING_TRACK_SUPERSEDED'.
-// Other rejections: ERR_BACKING_TRACK_URI, _FILE, _FORMAT, _TOO_LONG (over 600 s).
+// formats such as M4A on iOS) off the audio thread at the device rate and swaps it in (5 ms
+// crossfade). It plays while the transport plays; track sample 0 is beat 0, so starts, resumes
+// and setTransportPosition place it at beat x 60 / bpm, and a tempo change does not move it.
+// `gapless` (MP3 LAME/Xing tag values) picks the exact loop region: decoded length ==
+// loopSamples -> [0, loopSamples) ('tag'); == 1152 + leading + loopSamples + trailing ->
+// [1152 + leading, +loopSamples) ('padded'); == leading + loopSamples + trailing ->
+// [leading, +loopSamples) ('paddedNoTagFrame'); otherwise the whole file ('whole'); the result's
+// regionRule says which. A later load or unloadBackingTrack() supersedes a load in flight, which
+// then rejects with 'ERR_BACKING_TRACK_SUPERSEDED'. Other rejections: ERR_BACKING_TRACK_URI,
+// _FILE, _FORMAT, _TOO_LONG (over 6 min), _MEMORY (not enough memory available).
 export async function loadBackingTrack(
   uri: string,
   gapless?: BackingTrackGapless
@@ -207,8 +211,8 @@ const emptyAnalysis = (): Analysis => ({
   playing: false,
 });
 
-// Output level, a 128-point oscilloscope and transport state for HUDs. Synchronous and cheap
-// (call it every frame). Zeros when the engine is not running or the binary is older than 0.6.0.
+// Output level (peak hold and RMS since the previous call), a 128-point oscilloscope and the
+// transport for HUDs. Synchronous, lock-free and cheap: call it every frame, from one place. Zeros when the engine is not running or the binary is older than 0.6.0.
 export function getAnalysis(): Analysis {
   if (typeof ExpoJuceModule?.getAnalysis !== 'function') return emptyAnalysis();
   return ExpoJuceModule.getAnalysis();
@@ -278,6 +282,7 @@ export {
   MetronomeOptions,
   BackingTrackGapless,
   BackingTrackInfo,
+  BackingTrackRegionRule,
   BackingTrackOptions,
   Analysis,
 };
