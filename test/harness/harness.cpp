@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -674,8 +675,9 @@ static int runFxEffects() {
     return failures;
 }
 
-// Bypass: chain all off == dry synth, bit-exact; on again (reverb + echo) it differs; off
-// again, once the 10 ms crossfade is over, bit-exact again. 0 allocations throughout.
+// Bypass: chain all off == dry synth, bit-exact; on again (reverb + echo) it differs; turned
+// off, their tails keep playing (output != dry right after), and once both tails have ended
+// (at most kMaxTailSeconds) the output is bit-exact again. 0 allocations throughout.
 static bool runFxBypass() {
     FxRig rig(48000);
     rig.synth.setWaveform(Waveform::Saw);
@@ -686,10 +688,11 @@ static bool runFxBypass() {
     int done = 0;
     size_t bi = 0;
     int mismatchOff = 0, comparedOff = 0, mismatchAfter = 0, comparedAfter = 0;
-    double diffOn = 0.0;
+    double diffOn = 0.0, diffTail = 0.0;
     float dryPeak = 0.0f;
-    const int onAt = 24000, offAt = 48000, settleAt = offAt + 1024 + 480 /* 10 ms */, end = 96000;
-    gRenderAllocs.store(0);
+    const int onAt = 24000, offAt = 48000, end = offAt + (int)(FxChainProcessor::kMaxTailSeconds * 48000) + 96000;
+    int tailEnd = -1; // first block start at which neither echo nor reverb runs any more
+    gRenderAllocs.store(0); gRenderFrees.store(0);
     while (done < end) {
         const int n = kFxBlocks[bi++ % kFxBlocks.size()];
         if (done >= onAt && done < offAt) { rig.store.setEnabled("reverb", true); rig.store.setEnabled("echo", true); }
@@ -701,6 +704,8 @@ static bool runFxBypass() {
         tCountAllocs = false;
         for (int ch = 0; ch < 2; ++ch) dry.copyFrom(ch, 0, buf, ch, 0, n);
         dryPeak = std::max(dryPeak, dry.getMagnitude(0, n));
+        const bool tailsOver = done >= offAt && !rig.fx.isEffectRunning(kFxEcho) && !rig.fx.isEffectRunning(kFxReverb);
+        if (tailsOver && tailEnd < 0) tailEnd = done;
         tCountAllocs = true;
         rig.fx.processBlock(buf, midi);
         tCountAllocs = false;
@@ -708,19 +713,157 @@ static bool runFxBypass() {
         for (int ch = 0; ch < 2; ++ch)
             if (std::memcmp(buf.getReadPointer(ch), dry.getReadPointer(ch), (size_t)n * sizeof(float)) != 0) same = false;
         if (done + n <= onAt) { ++comparedOff; mismatchOff += same ? 0 : 1; }
-        else if (done >= settleAt) { ++comparedAfter; mismatchAfter += same ? 0 : 1; }
+        else if (tailsOver) { ++comparedAfter; mismatchAfter += same ? 0 : 1; }
         else if (done >= onAt && done + n <= offAt) {
             for (int i = 0; i < n; ++i) { const double d = buf.getSample(0, i) - dry.getSample(0, i); diffOn += d * d; }
+        } else if (done >= offAt + 960 && done + n <= offAt + 9600) { // 20–200 ms after off: the tail
+            for (int i = 0; i < n; ++i) { const double d = buf.getSample(0, i) - dry.getSample(0, i); diffTail += d * d; }
         }
         done += n;
     }
-    const uint64_t allocs = gRenderAllocs.load();
+    const uint64_t allocs = gRenderAllocs.load() + gRenderFrees.load();
+    const double tailSec = tailEnd < 0 ? -1.0 : (tailEnd - offAt) / 48000.0;
     const bool pass = comparedOff > 10 && mismatchOff == 0 && comparedAfter > 10 && mismatchAfter == 0
-                   && diffOn > 1e-3 && allocs == 0;
-    std::printf("fxb   chain off == dry bit-exact; on (reverb+echo) differs; off again == dry  %-4s off %d/%d blocks equal,"
-                " after re-bypass %d/%d equal, on-diff %.4f, dry peak %.4f, allocs %llu\n", pass ? "PASS" : "FAIL",
-                comparedOff - mismatchOff, comparedOff, comparedAfter - mismatchAfter, comparedAfter, diffOn, dryPeak,
-                (unsigned long long)allocs);
+                   && diffOn > 1e-3 && diffTail > 1e-4 && tailEnd > 0
+                   && tailSec <= FxChainProcessor::kMaxTailSeconds + 0.03 && allocs == 0;
+    std::printf("fxb   chain off == dry bit-exact; on (reverb+echo) differs; off: tail spills, then == dry  %-4s off %d/%d"
+                " blocks equal, tail %.3f s (diff %.4f), after tail %d/%d equal, on-diff %.4f, dry peak %.4f, allocs %llu\n",
+                pass ? "PASS" : "FAIL", comparedOff - mismatchOff, comparedOff, tailSec, diffTail,
+                comparedAfter - mismatchAfter, comparedAfter, diffOn, dryPeak, (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Renders `fx` alone on `input(i)` (both channels) for `total` samples in 471-sample blocks;
+// `control(done)` runs before each block.
+static void renderFxAlone(FxChainProcessor& fx, int total, const std::function<float(int)>& input,
+                          const std::function<void(int)>& control, std::vector<float>& outL, std::vector<float>& outR) {
+    juce::AudioBuffer<float> buf(2, 512);
+    juce::MidiBuffer midi;
+    outL.assign((size_t)total, 0.0f);
+    outR.assign((size_t)total, 0.0f);
+    for (int done = 0; done < total;) {
+        const int n = std::min(471, total - done);
+        control(done);
+        buf.setSize(2, n, false, false, true);
+        for (int i = 0; i < n; ++i) { const float v = input(done + i); buf.setSample(0, i, v); buf.setSample(1, i, v); }
+        tCountAllocs = true;
+        fx.processBlock(buf, midi);
+        tCountAllocs = false;
+        std::memcpy(&outL[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+        std::memcpy(&outR[(size_t)done], buf.getReadPointer(1), (size_t)n * sizeof(float));
+        done += n;
+    }
+}
+
+// Echo tail cap + clean restart without clearing the line: echo at feedback 0.95 (a tail far
+// longer than 5 s) on a noise burst, turned off: the tail plays on, is faded out and bypassed
+// at kMaxTailSeconds; the output is then exactly 0 (silent input). Turned on again with a
+// silent input: still exactly 0 (the old line content is never read back, without a memset).
+// Then a non-finite input with the reverb on: silenced, and the effects are not reset per chunk.
+static bool runFxTails() {
+    const double sr = 48000.0;
+    FxParamStore store;
+    FxChainProcessor fx;
+    fx.setParamStore(&store);
+    fx.setRateAndBufferSizeDetails(sr, 512);
+    fx.prepareToPlay(sr, 512);
+    store.setParam("echo", "sync", 0);
+    store.setParam("echo", "time", 0.25);
+    store.setParam("echo", "feedback", 0.95);
+    store.setParam("echo", "tone", 1);
+    store.setParam("echo", "mix", 1);
+    store.setEnabled("echo", true);
+    const int offAt = (int)(0.3 * sr), onAgainAt = (int)(6.0 * sr), total = (int)(7.0 * sr);
+    uint32_t rng = 12345u;
+    std::vector<float> l, r;
+    int endedAt = -1;
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    renderFxAlone(fx, total, [&](int i) {
+        if (i >= (int)(0.2 * sr)) return 0.0f;
+        rng = rng * 1664525u + 1013904223u;
+        return 0.3f * ((float)(rng >> 8) / 8388608.0f - 1.0f);
+    }, [&](int done) {
+        if (done >= offAt && done < onAgainAt) store.setEnabled("echo", false);
+        if (done >= onAgainAt) store.setEnabled("echo", true);
+        if (done >= offAt && done < onAgainAt && endedAt < 0 && !fx.isEffectRunning(kFxEcho)) endedAt = done;
+    }, l, r);
+    float tailPeak = 0.0f, lateTail = 0.0f;
+    int nonZeroAfter = 0, nonZeroOnAgain = 0;
+    for (int i = offAt + 4800; i < offAt + 48000; ++i) tailPeak = std::max(tailPeak, std::fabs(l[(size_t)i]));
+    for (int i = offAt + (int)(4.5 * sr); i < offAt + (int)(4.9 * sr); ++i) lateTail = std::max(lateTail, std::fabs(l[(size_t)i]));
+    if (endedAt > 0)
+        for (int i = endedAt; i < onAgainAt; ++i) nonZeroAfter += (l[(size_t)i] != 0.0f || r[(size_t)i] != 0.0f) ? 1 : 0;
+    for (int i = onAgainAt; i < total; ++i) nonZeroOnAgain += (l[(size_t)i] != 0.0f || r[(size_t)i] != 0.0f) ? 1 : 0;
+    const double endedSec = endedAt < 0 ? -1.0 : (endedAt - offAt) / sr;
+    const bool tailOk = tailPeak > 0.05f && lateTail > 1e-3f && endedAt > 0
+                     && std::fabs(endedSec - FxChainProcessor::kMaxTailSeconds) < 0.03 && nonZeroAfter == 0;
+    const bool restartOk = nonZeroOnAgain == 0 && fx.isEffectRunning(kFxEcho);
+
+    // Non-finite input with the reverb on.
+    FxChainProcessor fx2;
+    FxParamStore store2;
+    fx2.setParamStore(&store2);
+    fx2.setRateAndBufferSizeDetails(sr, 512);
+    fx2.prepareToPlay(sr, 512);
+    store2.setEnabled("reverb", true);
+    std::vector<float> l2, r2;
+    renderFxAlone(fx2, 48000, [](int i) {
+        if (i >= 12000 && i < 24000) return std::numeric_limits<float>::quiet_NaN();
+        return 0.3f * (float)std::sin(i * 0.05);
+    }, [](int) {}, l2, r2);
+    int nonFiniteOut = 0, nonZeroDuringNaN = 0;
+    for (int i = 0; i < 48000; ++i) nonFiniteOut += std::isfinite(l2[(size_t)i]) && std::isfinite(r2[(size_t)i]) ? 0 : 1;
+    for (int i = 12256; i < 23552; ++i) nonZeroDuringNaN += l2[(size_t)i] != 0.0f ? 1 : 0; // whole chunks of NaN input
+    const uint64_t resets = fx2.diag.nonFiniteResets.load();
+    float recovered = 0.0f;
+    for (int i = 36000; i < 48000; ++i) recovered = std::max(recovered, std::fabs(l2[(size_t)i]));
+    const bool nanOk = nonFiniteOut == 0 && nonZeroDuringNaN == 0 && resets <= 1 && recovered > 0.05f;
+    const uint64_t allocs = gRenderAllocs.load() + gRenderFrees.load();
+    const bool pass = tailOk && restartOk && nanOk && allocs == 0;
+    std::printf("fxt   echo tail (fb 0.95) peak %.4f, capped at %.3f s (want %.1f), then %d non-zero; re-enabled on silence:"
+                " %d non-zero; NaN input: %d non-finite out, %llu resets (<= 1), recovers %.3f  %-4s allocs %llu\n",
+                tailPeak, endedSec, FxChainProcessor::kMaxTailSeconds, nonZeroAfter, nonZeroOnAgain, nonFiniteOut,
+                (unsigned long long)resets, recovered, pass ? "PASS" : "FAIL", (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
+// src/effectDefaults.ts (used on web and with older binaries) must list the same effects,
+// parameters (same order) and default values as kFxSpecs.
+static bool runFxDefaultsMatchJs() {
+    const juce::File file(juce::String(HARNESS_JS_SRC) + "/effectDefaults.ts");
+    juce::StringArray lines;
+    file.readLines(lines);
+    int effectsSeen = 0, mismatches = 0;
+    std::string detail;
+    for (int fx = 0; fx < kFxCount; ++fx) {
+        const FxSpec& spec = kFxSpecs[fx];
+        const juce::String prefix = juce::String("  ") + spec.id + ": {";
+        juce::String body;
+        for (const juce::String& line : lines)
+            if (line.startsWith(prefix))
+                body = line.fromFirstOccurrenceOf("{", false, false).upToLastOccurrenceOf("}", false, false);
+        if (body.isEmpty()) { ++mismatches; detail += std::string(" missing ") + spec.id; continue; }
+        ++effectsSeen;
+        juce::StringArray pairs;
+        pairs.addTokens(body, ",", "");
+        pairs.trim();
+        pairs.removeEmptyStrings();
+        if (pairs.size() != spec.numParams) { ++mismatches; detail += std::string(" count:") + spec.id; continue; }
+        for (int p = 0; p < spec.numParams; ++p) {
+            const juce::String name = pairs[p].upToFirstOccurrenceOf(":", false, false).trim();
+            const double value = pairs[p].fromFirstOccurrenceOf(":", false, false).trim().getDoubleValue();
+            const double want = (double)spec.params[p].defaultValue;
+            if (name != spec.params[p].name || std::fabs(value - want) > 1e-6 * std::max(1.0, std::fabs(want))) {
+                ++mismatches;
+                detail += std::string(" ") + spec.id + "." + spec.params[p].name;
+            }
+        }
+    }
+    const bool pass = file.existsAsFile() && effectsSeen == kFxCount && mismatches == 0;
+    std::printf("fxd   src/effectDefaults.ts == kFxSpecs defaults (%d effects)  %-4s %d mismatches%s\n", effectsSeen,
+                pass ? "PASS" : "FAIL", mismatches, detail.c_str());
     std::fflush(stdout);
     return pass;
 }
@@ -1502,6 +1645,8 @@ int main() {
     unexpected += runFxBypass() ? 0 : 1;
     unexpected += runFxEchoSync();
     unexpected += runFxPumpAndLimiter() ? 0 : 1;
+    unexpected += runFxTails() ? 0 : 1;
+    unexpected += runFxDefaultsMatchJs() ? 0 : 1;
     unexpected += runMetronome();
     unexpected += runBackingTrackPlayback() ? 0 : 1;
     unexpected += runBackingTrackRegion() ? 0 : 1;

@@ -129,6 +129,7 @@ void FxChainProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/)
         t.level.reset(sr, kToggleRampSeconds);
         t.level.setCurrentAndTargetValue(0.0f);
         t.running = false;
+        t.tailSamples = t.quietSamples = 0;
     }
     for (Smoothed* s : { &drivePre, &drivePost, &driveMix, &crushNoise, &crushMix, &eqLowDb, &eqMidDb,
                          &eqMidFreq, &eqHighDb, &echoFeedback, &echoMix, &pumpDepth, &compMakeup })
@@ -216,6 +217,12 @@ void FxChainProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Midi
 
 void FxChainProcessor::processChunk(float* left, float* right, int n, double beatStart, double beatsPerSample,
                                     bool playing) {
+    // Whether the chain's input is finite: a non-finite input (from upstream) is silenced below
+    // but does not reset the effects, so a source stuck on NaN cannot reset them every chunk.
+    bool inputFinite = true;
+    for (int i = 0; i < n && inputFinite; ++i)
+        inputFinite = std::isfinite(left[i]) && std::isfinite(right[i]);
+
     bool anyRunning = false;
     for (int fx = 0; fx < kFxCount; ++fx) {
         Toggle& t = toggles[fx];
@@ -227,12 +234,19 @@ void FxChainProcessor::processChunk(float* left, float* right, int n, double bea
             t.running = true;
             t.level.setCurrentAndTargetValue(0.0f);
             t.level.setTargetValue(1.0f);
+            t.tailSamples = t.quietSamples = 0;
         } else if (t.running) {
             t.level.setTargetValue(want ? 1.0f : 0.0f);
             loadTargets(fx, false);
+            if (want) t.tailSamples = t.quietSamples = 0;
         }
         if (!t.running) continue; // bypassed: the signal is not touched
         anyRunning = true;
+
+        if (spillsOver(fx)) {
+            runSpilling(fx, t, left, right, n, beatStart, beatsPerSample, playing);
+            continue;
+        }
 
         const bool fullyIn = !t.level.isSmoothing() && t.level.getCurrentValue() >= 1.0f;
         if (!fullyIn) {
@@ -251,7 +265,8 @@ void FxChainProcessor::processChunk(float* left, float* right, int n, double bea
     }
 
     // A feedback path that blew up must not keep the chain stuck on NaN: silence the chunk and
-    // clear the running effects.
+    // clear the running effects (once: only when the input was finite, so the effects are what
+    // went wrong; a non-finite input is just silenced).
     if (anyRunning) {
         bool finite = true;
         for (int i = 0; i < n && finite; ++i)
@@ -259,10 +274,68 @@ void FxChainProcessor::processChunk(float* left, float* right, int n, double bea
         if (!finite) {
             std::fill(left, left + n, 0.0f);
             std::fill(right, right + n, 0.0f);
-            for (int fx = 0; fx < kFxCount; ++fx)
-                if (toggles[fx].running) resetEffect(fx);
-            diag.nonFiniteResets.fetch_add(1, std::memory_order_relaxed);
+            if (inputFinite) {
+                for (int fx = 0; fx < kFxCount; ++fx)
+                    if (toggles[fx].running) resetEffect(fx);
+                diag.nonFiniteResets.fetch_add(1, std::memory_order_relaxed);
+            }
         }
+    }
+}
+
+// Echo / reverb. Their toggle level scales their INPUT: output = (1 - g)·dry + effect(g·dry),
+// which equals effect(dry) at g = 1 and dry + tail at g = 0 (both are linear in the dry path,
+// and their dry output for a silent input is 0). Turned off (g reached 0): they run on silence
+// and add their tail until it has stayed under kTailFloor for one echo period (reverb: 100 ms)
+// or kMaxTailSeconds have passed, then they are bypassed.
+void FxChainProcessor::runSpilling(int fx, Toggle& t, float* left, float* right, int n, double beatStart,
+                                   double beatsPerSample, bool playing) {
+    const bool fullyIn = !t.level.isSmoothing() && t.level.getCurrentValue() >= 1.0f;
+    if (fullyIn) {
+        runEffect(fx, left, right, n, beatStart, beatsPerSample, playing);
+        return;
+    }
+    std::memcpy(dryL, left, sizeof(float) * (size_t)n);
+    std::memcpy(dryR, right, sizeof(float) * (size_t)n);
+    const bool muted = !t.level.isSmoothing() && t.level.getCurrentValue() <= 0.0f;
+    if (muted) {
+        std::fill(left, left + n, 0.0f);
+        std::fill(right, right + n, 0.0f);
+    } else {
+        for (int i = 0; i < n; ++i) {
+            const float g = t.level.getNextValue();
+            fadeGain[i] = g;
+            left[i] *= g;
+            right[i] *= g;
+        }
+    }
+    runEffect(fx, left, right, n, beatStart, beatsPerSample, playing);
+    if (!muted) {
+        for (int i = 0; i < n; ++i) {
+            left[i] += (1.0f - fadeGain[i]) * dryL[i];
+            right[i] += (1.0f - fadeGain[i]) * dryR[i];
+        }
+        return;
+    }
+    // Tail: left / right hold the wet output only.
+    const int64_t maxTail = (int64_t)(kMaxTailSeconds * sr);
+    const int64_t fadeLen = std::max<int64_t>(1, (int64_t)(kTailFadeSeconds * sr));
+    float peak = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const int64_t remaining = maxTail - (t.tailSamples + i);
+        const float cap = remaining >= fadeLen ? 1.0f : (float)std::max<int64_t>(0, remaining) / (float)fadeLen;
+        const float wl = left[i] * cap, wr = right[i] * cap;
+        peak = std::max(peak, std::max(std::fabs(wl), std::fabs(wr)));
+        left[i] = dryL[i] + wl;
+        right[i] = dryR[i] + wr;
+    }
+    t.tailSamples += n;
+    t.quietSamples = (peak < kTailFloor) ? t.quietSamples + n : 0;
+    const int64_t quietNeeded = fx == kFxEcho ? (int64_t)echoDelay.getTargetValue() + 2 * kChunk
+                                              : (int64_t)(0.1 * sr);
+    if (t.tailSamples >= maxTail || t.quietSamples >= quietNeeded) {
+        t.running = false;
+        t.tailSamples = t.quietSamples = 0;
     }
 }
 
@@ -277,7 +350,8 @@ void FxChainProcessor::resetEffect(int fx) {
             break;
         case kFxChorus: chorus.reset(); break;
         case kFxPhaser: phaser.reset(); break;
-        case kFxEcho: echoLine.reset(); echoLp[0] = echoLp[1] = 0.0f; echoSnap = true; break;
+        // No echoLine.reset() (a memset of the whole 2 s line): echoFilled = 0 makes it read as cleared.
+        case kFxEcho: echoFilled = 0; echoLp[0] = echoLp[1] = 0.0f; echoSnap = true; break;
         case kFxReverb: reverb.reset(); break;
         case kFxPump: break; // stateless: the phase comes from the transport
         case kFxCompressor: compressor.reset(); break;
@@ -460,8 +534,13 @@ void FxChainProcessor::runEcho(float* left, float* right, int n, double bpm) {
         const float feedback = echoFeedback.getNextValue();
         const float mix = echoMix.getNextValue();
         // Read before write: with a delay of d >= 1 sample, sample i reads input i - d.
-        const float yL = echoLine.popSample(0, d);
-        const float yR = echoLine.popSample(1, d);
+        // Linear interpolation reads the samples pushed floor(d) and floor(d) + 1 pushes ago;
+        // anything pushed before the last reset counts as silence.
+        const bool filled = (int)d + 1 <= echoFilled;
+        float yL = echoLine.popSample(0, d); // always popped: it advances the read position
+        float yR = echoLine.popSample(1, d);
+        if (!filled) yL = yR = 0.0f;
+        if (echoFilled <= echoMaxDelaySamples) ++echoFilled;
         echoLp[0] += echoToneCoeff * (yL - echoLp[0]);
         echoLp[1] += echoToneCoeff * (yR - echoLp[1]);
         const float xL = left[i], xR = right[i];

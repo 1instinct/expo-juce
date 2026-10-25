@@ -1,5 +1,12 @@
 #pragma once
 
+// Apple's AssertMacros.h (pulled in via CoreServices / AudioToolbox) otherwise defines
+// un-prefixed macros such as check(), verify() and require(), which collide with C++ and JUCE
+// identifiers. Must come before any system header.
+#ifndef __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES
+#define __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES 0
+#endif
+
 // Xcode 16+ clang no longer implicitly includes these —
 // JUCE uses FLT_MAX, FLT_MIN, INT_MAX, etc. throughout.
 // Use C headers (not C++ <cfloat> etc.) since this header is included

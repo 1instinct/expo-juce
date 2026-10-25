@@ -150,8 +150,11 @@ const fx = ExpoJuce.getEffectsState();                // { reverb: { enabled, pa
 - Settings are remembered natively whether or not the engine is running: calls made before
   `setup()`, or during an automatic engine rebuild, take effect when the chain runs.
 - Turning an effect on or off crossfades it (10 ms); a disabled effect is skipped entirely and
-  an effect turned on starts clean (no stale echo or reverb tail). With every effect off the
-  output is the synth output, bit for bit (while it stays under the limiter ceiling).
+  an effect turned on starts clean (no stale echo or reverb tail). Echo and reverb spill over:
+  turning them off stops feeding them, and their tail keeps ringing out until it has faded
+  below -90 dBFS (at most 5 s, faded out over the last 50 ms); only then are they bypassed.
+  With every effect off (and tails ended) the output is the synth output, bit for bit (while
+  it stays under the limiter ceiling).
 - Parameter changes are smoothed where they would click (mix, gains, delay time, EQ bands).
 - Echo `sync` and `pump` follow the transport tempo; pump is locked to the transport beat
   while it plays and free-runs at the tempo while it is stopped.

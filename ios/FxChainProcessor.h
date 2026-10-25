@@ -144,8 +144,12 @@ struct FxDiagnostics {
 //
 // Bypass: a disabled effect is skipped entirely (the signal is not touched). Turning an
 // effect on or off crossfades it over kToggleRampSeconds; an effect that is turned on starts
-// from a cleared state (no stale echo or reverb tail). With every effect off and the signal
-// below the limiter ceiling, the output is bit-exact equal to the input.
+// from a cleared state (no stale echo or reverb tail). Echo and reverb spill over: turning
+// them off fades their INPUT out instead, and they keep running on silence, adding their tail
+// to the passing signal, until the tail has stayed under kTailFloor (-90 dBFS) for a while
+// (one echo period, or 100 ms for the reverb) or kMaxTailSeconds have passed (the last
+// kTailFadeSeconds fade it out); only then are they bypassed. With every effect off (tails
+// ended) and the signal below the limiter ceiling, the output is bit-exact equal to the input.
 //
 // Limiter: a stereo-linked peak limiter with instant attack and a 50 ms release, ceiling
 // -0.3 dBFS. Its gain is exactly 1 (no multiply) while the signal stays under the ceiling.
@@ -158,6 +162,9 @@ public:
     static constexpr double kParamRampSeconds = 0.050;
     static constexpr double kMaxEchoSeconds = 2.0;
     static constexpr float kLimiterCeilingDb = -0.3f;
+    static constexpr float kTailFloor = 3.1623e-5f;    // -90 dBFS
+    static constexpr double kMaxTailSeconds = 5.0;
+    static constexpr double kTailFadeSeconds = 0.050;
 
     FxChainProcessor();
     ~FxChainProcessor() override = default;
@@ -191,13 +198,23 @@ public:
 
     FxDiagnostics diag;
 
+    // Audio thread (or a test driving processBlock): the effect is processed (on, fading, or
+    // playing out its tail after being turned off).
+    bool isEffectRunning(int fx) const { return fx >= 0 && fx < kFxCount && toggles[fx].running; }
+
 private:
     using Smoothed = juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear>;
 
     struct Toggle {
-        Smoothed level;       // 0 = bypassed, 1 = fully in
-        bool running = false; // processed this chunk (on, or fading out)
+        Smoothed level;       // 0 = bypassed, 1 = fully in (echo / reverb: their input gain)
+        bool running = false; // processed this chunk (on, fading out, or playing its tail)
+        int64_t tailSamples = 0;  // echo / reverb: samples rendered with the input muted
+        int64_t quietSamples = 0; // … of which the latest run under kTailFloor
     };
+
+    static bool spillsOver(int fx) { return fx == kFxEcho || fx == kFxReverb; }
+    void runSpilling(int fx, Toggle& t, float* left, float* right, int n, double beatStart, double beatsPerSample,
+                     bool playing);
 
     void processChunk(float* left, float* right, int n, double beatStart, double beatsPerSample, bool playing);
     void resetEffect(int fx);
@@ -222,7 +239,7 @@ private:
     double sr = 48000.0;
     bool prepared = false;
     Toggle toggles[kFxCount];
-    float dryL[kChunk], dryR[kChunk];
+    float dryL[kChunk], dryR[kChunk], fadeGain[kChunk];
 
     // drive
     Smoothed drivePre, drivePost, driveMix;
@@ -244,6 +261,10 @@ private:
     // echo
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> echoLine;
     int echoMaxDelaySamples = 0;
+    // Samples pushed since the echo was last reset. Enabling the echo does not clear the line
+    // (a memset of up to 2 s × 96 kHz per channel on the audio thread); reads older than this
+    // return silence instead, which is what a cleared line would give.
+    int echoFilled = 0;
     Smoothed echoDelay, echoFeedback, echoMix;
     float echoToneCoeff = 1.0f, echoLp[2] = { 0.0f, 0.0f };
     bool echoSnap = true; // jump to the delay time on the next chunk (set on enable)

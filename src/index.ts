@@ -127,7 +127,8 @@ export function setMasterLevel(level: number): void {
 // Binaries older than 0.6.0 have no chain: the setters return false and getEffectsState
 // returns the defaults.
 
-// Turns an effect on or off (short crossfade; an effect starts from a clear state).
+// Turns an effect on or off (short crossfade; an effect starts from a clear state; echo and
+// reverb tails ring out after they are turned off).
 // Returns false for an unknown effect, or if the binary has no effects chain.
 export function setEffectEnabled(id: EffectId, enabled: boolean): boolean {
   if (typeof ExpoJuceModule?.setEffectEnabled !== 'function') return false;
