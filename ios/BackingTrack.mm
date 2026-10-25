@@ -7,6 +7,8 @@ BackingTrackRegion backingTrackRegion(int64_t decoded, const BackingTrackGapless
         if (decoded == g->loopSamples) return { 0, g->loopSamples };
         if (decoded == 1152 + g->leadingSamples + g->loopSamples + g->trailingSamples)
             return { 1152 + g->leadingSamples, g->loopSamples };
+        if (decoded == g->leadingSamples + g->loopSamples + g->trailingSamples)
+            return { g->leadingSamples, g->loopSamples };
     }
     return { 0, decoded };
 }

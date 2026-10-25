@@ -1247,7 +1247,7 @@ static bool runBackingTrackRegion() {
     const BackingTrackRegion other = backingTrackRegion(4561 + 682839 + 1496, &g);
     const BackingTrackRegion none = backingTrackRegion(5000, nullptr);
     const bool ruleOk = honoured.start == 0 && honoured.length == 682839 && ignored.start == 1152 + 4561
-        && ignored.length == 682839 && other.start == 0 && other.length == 4561 + 682839 + 1496
+        && ignored.length == 682839 && other.start == 4561 && other.length == 682839
         && none.start == 0 && none.length == 5000;
 
     const juce::File file(juce::String(HARNESS_FIXTURES) + "/loop-124bpm-44k.mp3");
@@ -1262,7 +1262,7 @@ static bool runBackingTrackRegion() {
         const int64_t d = info.decodedSamples;
         if (d == g.loopSamples) path = "honoured the tag (== loopSamples)";
         else if (d == 1152 + g.leadingSamples + g.loopSamples + g.trailingSamples) path = "ignored the tag, tag frame decoded (== 1152 + lead + loop + trail)";
-        else if (d == g.leadingSamples + g.loopSamples + g.trailingSamples) path = "skipped the tag frame but ignored the gapless values (== lead + loop + trail): rule falls back to the whole file";
+        else if (d == g.leadingSamples + g.loopSamples + g.trailingSamples) path = "skipped the tag frame, kept the padding (== lead + loop + trail)";
         else path = "other length";
         const BackingTrackRegion want = backingTrackRegion(d, &g);
         decodeOk = info.sampleRate == 44100.0 && info.channels == 2 && info.loopStartSample == want.start
@@ -1274,7 +1274,8 @@ static bool runBackingTrackRegion() {
         seamJump = std::fabs(x[n - 1] - x[0]);
         auto buf = BackingTrack::resample(*decoded, 48000.0);
         resampled = buf->length;
-        expectedResampled = std::llround((double)n * 48000.0 / 44100.0);
+        expectedResampled = 743226; // round(682839 × 48000 / 44100 = 743226.12): the exact loop
+        decodeOk = decodeOk && n == 682839 && std::llround((double)n * 48000.0 / 44100.0) == expectedResampled;
         decodeOk = decodeOk && resampled == expectedResampled && buf->audio.getNumSamples() == resampled;
         std::printf("btr   MP3 fixture via %s: decoded %lld samples (loop %lld + lead %lld + trail %lld) -> %s;"
                     " region [%lld, +%lld); seam |x[end]-x[0]| %.4f vs mean step %.4f\n",

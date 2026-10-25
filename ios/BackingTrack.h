@@ -43,7 +43,8 @@ struct BackingTrackInfo {
 // Loop region rule for MP3 seeds with a LAME/Xing gapless tag. The decoder honoured the tag
 // (decoded == loopSamples) → [0, loopSamples); it ignored the tag and decoded the tag frame as
 // silence (decoded == 1152 + leading + loopSamples + trailing) → [1152 + leading, +loopSamples);
-// anything else (or no gapless info) → the whole file.
+// it skipped the tag frame but kept the padding (decoded == leading + loopSamples + trailing, e.g.
+// JUCE's MP3 decoder) → [leading, +loopSamples); anything else (or no gapless info) → the whole file.
 struct BackingTrackRegion { int64_t start; int64_t length; };
 BackingTrackRegion backingTrackRegion(int64_t decodedSamples, const BackingTrackGapless* gapless);
 

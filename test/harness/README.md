@@ -33,7 +33,7 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   silence between, over odd block sizes and mid-beat starts), `bt` (backing track plays from the
   top sample-exact, loops, seeks with `setPosition`, starts in the bar the transport started in,
   stops, plays once without loop, is resampled after a device-rate change), `btr` (loop-region
-  rule on its three lengths; decodes `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder and
+  rule on its lengths; decodes `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder and
   prints which length it yields and the region chosen; resample 44.1 → 48 kHz), `bts` (300
   loads / unloads while another thread renders: 0 allocations and 0 frees in the render, every
   replaced buffer freed by `collect()`, a superseded load does not publish), `aux0` (aux with

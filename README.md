@@ -211,7 +211,9 @@ ExpoJuce.unloadBackingTrack();
   tag values, frames at the file's rate) the loop region is: decoded length == `loopSamples`
   (the decoder honoured the tag) → `[0, loopSamples)`; decoded length == 1152 + leading +
   loopSamples + trailing (the decoder ignored the tag and decoded the tag frame) → `[1152 +
-  leading, +loopSamples)`; anything else → the whole file. The region is cut before
+  leading, +loopSamples)`; decoded length == leading + loopSamples + trailing (the decoder
+  skipped the tag frame but kept the encoder padding, as JUCE's own MP3 decoder does) →
+  `[leading, +loopSamples)`; anything else → the whole file. The region is cut before
   resampling; `decodedSamples` / `decoder` in the result tell which case applied.
 - **Playback** follows the transport: it plays while the transport plays; its position is
   the transport position converted to seconds at the current tempo, counted from the start

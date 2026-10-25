@@ -169,7 +169,8 @@ export function setMetronome(options: MetronomeOptions): void {
 // in. It plays while the transport plays, from the bar the transport started on, and seeks with
 // setTransportPosition. `gapless` (MP3 LAME/Xing tag values) picks the exact loop region: decoded
 // length == loopSamples → [0, loopSamples); == 1152 + leading + loopSamples + trailing →
-// [1152 + leading, +loopSamples); otherwise the whole file. A later load or unloadBackingTrack()
+// [1152 + leading, +loopSamples); == leading + loopSamples + trailing → [leading, +loopSamples);
+// otherwise the whole file. A later load or unloadBackingTrack()
 // supersedes a load in flight, which then rejects with 'ERR_BACKING_TRACK_SUPERSEDED'.
 // Other rejections: ERR_BACKING_TRACK_URI, _FILE, _FORMAT, _TOO_LONG (over 600 s).
 export async function loadBackingTrack(
