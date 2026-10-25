@@ -52,10 +52,12 @@ void Voice::startNote(int note, float velocity) {
     filter.reset();
 
     updateADSR();
+    held = true;
     adsr.noteOn();
 }
 
 void Voice::stopNote() {
+    held = false;
     adsr.noteOff();
 }
 
@@ -88,6 +90,7 @@ void Voice::captureAndRelease(Waveform waveform, double frequency,
     }
 
     noteNumber = -1;
+    held = false;
     currentLevel = 0.0f;
 }
 

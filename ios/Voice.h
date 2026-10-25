@@ -22,6 +22,11 @@ public:
     void startNote(int note, float velocity);
     void stopNote();
 
+    // Held: between startNote and stopNote (a voice in its release stage is not held).
+    bool isHeld() const { return held && noteNumber >= 0; }
+    // NoteEventQueue sequence number of the note-on that started this voice (0 = none).
+    uint64_t startSeq = 0;
+
     void captureAndRelease(Waveform waveform, double frequency,
                            float filterCutoff, float filterResonance,
                            float masterLevel);
@@ -36,7 +41,7 @@ public:
     int fadeOutTailPos = 0;
     bool hasFadeOutTail() const { return fadeOutTailPos < fadeOutTailLength; }
 
-    std::atomic<float> attackMs{10.0f};
+    std::atomic<float> attackMs{2.0f};
     std::atomic<float> decayMs{1.0f};
     std::atomic<float> sustainLevel{1.0f};
     std::atomic<float> releaseMs{200.0f};
@@ -52,6 +57,7 @@ private:
     juce::ADSR adsr;
 
     int noteNumber = -1;
+    bool held = false;
     float velocityGain = 0.0f;
     float currentLevel = 0.0f;
     double cachedSampleRate = 44100.0;

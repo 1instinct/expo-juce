@@ -1,17 +1,58 @@
 import { NativeModulesProxy, EventEmitter, Subscription } from 'expo-modules-core';
 
 import ExpoJuceModule from './ExpoJuceModule';
-import ExpoJuceView from './ExpoJuceView';
-import { ChangeEventPayload, BeatEventPayload, ExpoJuceViewProps } from './ExpoJuce.types';
+import JucePadView from './JucePadView';
+import {
+  ChangeEventPayload,
+  BeatEventPayload,
+  AudioDiagnostics,
+  EngineState,
+  SetupOptions,
+  JucePadViewProps,
+  PadNoteOnEvent,
+  PadNoteOffEvent,
+} from './ExpoJuce.types';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
-export async function setup(): Promise<void> {
-  return ExpoJuceModule.setup();
+// Rejects with code 'ERR_AUDIO_SETUP' and message "step N: <error>" if native setup fails.
+// options: preferred buffer size (samples, default 128) and sample rate (Hz, default 48000).
+// No effect if the engine is already set up.
+// Binary compatibility: binaries older than 0.5.2 export a zero-argument native setup and reject
+// an options argument; 0.5.2+ binaries (detected by hasJucePadView) require the options argument
+// (the native signature is setup(options, promise), so its required-argument count is 1).
+export async function setup(options?: SetupOptions): Promise<void> {
+  if (typeof ExpoJuceModule?.hasJucePadView !== 'function') {
+    return ExpoJuceModule.setup();
+  }
+  const nativeOptions: { bufferSize?: number; sampleRate?: number } = {};
+  if (options?.bufferSize !== undefined) nativeOptions.bufferSize = options.bufferSize;
+  if (options?.sampleRate !== undefined) nativeOptions.sampleRate = options.sampleRate;
+  return ExpoJuceModule.setup(nativeOptions);
+}
+
+// True if the native binary includes JucePadView (false on older binaries and on web).
+export function isJucePadViewAvailable(): boolean {
+  return (
+    typeof ExpoJuceModule?.hasJucePadView === 'function' && ExpoJuceModule.hasJucePadView() === true
+  );
 }
 
 export async function shutdown(): Promise<void> {
   return ExpoJuceModule.shutdown();
+}
+
+// ── Diagnostics ──────────────────────────────────────────────────
+
+export function getDiagnostics(): AudioDiagnostics {
+  return ExpoJuceModule.getDiagnostics();
+}
+
+// Mixes a 440 Hz sine directly into the device output (bypassing graph + synth).
+// Returns true if the tone was queued; false if the engine is not ready or the
+// audio device is not running (nothing is played in that case).
+export function playTestTone(durationMs: number): boolean {
+  return ExpoJuceModule.playTestTone(durationMs);
 }
 
 // ── Polyphonic Synth (MIDI-style) ────────────────────────────────
@@ -114,4 +155,14 @@ export function addBeatListener(listener: (event: BeatEventPayload) => void): Su
   return emitter.addListener<BeatEventPayload>('onBeat', listener);
 }
 
-export { ExpoJuceView, ExpoJuceViewProps, ChangeEventPayload, BeatEventPayload };
+export {
+  JucePadView,
+  JucePadViewProps,
+  PadNoteOnEvent,
+  PadNoteOffEvent,
+  SetupOptions,
+  ChangeEventPayload,
+  BeatEventPayload,
+  AudioDiagnostics,
+  EngineState,
+};

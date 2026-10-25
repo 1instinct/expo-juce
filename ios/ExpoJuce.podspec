@@ -12,7 +12,7 @@ Pod::Spec.new do |s|
   s.homepage       = package['homepage']
   s.platforms      = { :ios => '13.4' }
   s.swift_version  = '5.4'
-  s.source         = { git: 'https://github.com/Beeper-buzz/expo-juce' }
+  s.source         = { git: 'https://github.com/1instinct/expo-juce' }
   s.static_framework = true
 
   s.dependency 'ExpoModulesCore'
@@ -23,9 +23,9 @@ Pod::Spec.new do |s|
   # manual retain/release. Only files listed here get ARC enabled.
   s.requires_arc = [
     'ExpoJuceModule.swift',
-    'ExpoJuceView.swift',
+    'JucePadView.swift',
     'ExpoJuceBridge.m',
-    'BeeperAudioEngine.mm',
+    'ExpoJuceAudioEngine.mm',
     'PolySynthProcessor.mm',
     'Voice.mm',
     'VoiceAllocator.mm',
@@ -41,6 +41,8 @@ Pod::Spec.new do |s|
     "VoiceAllocator.h",
     "PolySynthProcessor.h",
     "TransportEngine.h",
+    "GraphPlayer.h",
+    "NoteEventQueue.h",
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)

@@ -133,7 +133,7 @@ export default function App() {
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
-      <Text style={styles.title}>Beeper Polysynth</Text>
+      <Text style={styles.title}>expo-juce Polysynth</Text>
       <Text style={styles.subtitle}>8-voice polyphonic synthesizer</Text>
 
       {/* Waveform selector */}

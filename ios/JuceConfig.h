@@ -17,7 +17,7 @@
 #define JUCE_USE_CUSTOM_PLUGIN_STANDALONE_APP 0
 
 // App identity (required by some JUCE modules)
-#define JUCE_APPLICATION_NAME "Beeper"
+#define JUCE_APPLICATION_NAME "ExpoJuce"
 #define JUCE_APPLICATION_VERSION "0.4.0"
 
 // Disable JUCE splash screen and analytics

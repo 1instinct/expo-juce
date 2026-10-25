@@ -2,6 +2,13 @@
 
 #include <atomic>
 
+// Tempo, position and play state; carried across an engine rebuild, which replaces the transport.
+struct TransportState {
+    double bpm;
+    double position; // beats
+    bool playing;
+};
+
 class TransportEngine {
 public:
     TransportEngine();
@@ -15,6 +22,11 @@ public:
     void start();
     void stop();
     bool isPlaying();
+
+    // Any thread. getState includes a seek the audio thread has not applied yet.
+    TransportState getState();
+    // Restores tempo, position and play state; getPosition reports the position at once.
+    void restoreState(const TransportState& s);
 
     bool advanceBlock(int numSamples, double sampleRate);
 

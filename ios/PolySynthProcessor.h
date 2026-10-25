@@ -5,6 +5,10 @@
 #include "Voice.h"
 #include "VoiceAllocator.h"
 #include "TransportEngine.h"
+#include "NoteEventQueue.h"
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 
 struct BeatState {
     std::atomic<bool> crossed{false};
@@ -12,12 +16,30 @@ struct BeatState {
     std::atomic<double> bpm{120.0};
 };
 
-// Lock-free SPSC note event queue
-struct NoteEvent {
-    enum Type : uint8_t { NoteOn, NoteOff, AllNotesOff };
-    Type type;
-    int note;
-    int velocity;
+// Diagnostics counters. Written on the audio thread, read from any thread (relaxed loads
+// only). The note counters live in the NoteEventQueue.
+struct SynthDiagnostics {
+    std::atomic<uint64_t> processCount{0};
+    std::atomic<float> peak{0.0f};                // decaying hold of block max |x|
+    std::atomic<int> activeVoices{0};
+    std::atomic<double> lastNoteToRenderMs{-1.0}; // -1 = no NoteOn consumed yet
+    std::atomic<double> lastTouchToRenderMs{-1.0}; // -1 = no touch-stamped NoteOn consumed yet
+};
+
+// Per-block decay factor for peak holds: halves roughly every 300 ms
+// regardless of block size. Real-time safe (no allocation, no locks).
+inline float diagPeakDecay(int numSamples, double sampleRate) {
+    if (sampleRate <= 0.0) return 0.0f;
+    return (float)std::exp(-(double)numSamples / (0.43 * sampleRate));
+}
+
+// Every user-settable synth parameter, as stored (after clamping). getSettings / applySettings
+// carry the configuration across an engine rebuild, which replaces the processor.
+struct SynthSettings {
+    int waveform;
+    float filterCutoff, filterResonance;
+    float attackMs, decayMs, sustainLevel, releaseMs;
+    float detuneCents, masterLevel;
 };
 
 class PolySynthProcessor : public juce::AudioProcessor {
@@ -44,10 +66,17 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
-    // Thread-safe: called from main thread, queued for audio thread
-    void noteOn(int note, int velocity);
-    void noteOff(int note);
-    void allNotesOff();
+    // Thread-safe, any number of threads: forwarded to the note queue (see NoteEventQueue).
+    // touchTicks: originating UITouch timestamp in juce::Time high-resolution ticks
+    // (mach_absolute_time on Apple), or 0 when the note did not come from a touch.
+    void noteOn(int note, int velocity, juce::int64 touchTicks = 0) { queue->pushNoteOn(note, velocity, touchTicks); }
+    void noteOff(int note) { queue->pushNoteOff(note); }
+    void allNotesOff() { queue->pushAllNotesOff(); }
+
+    // The queue this synth reads its notes from: its own by default; the engine passes its
+    // process-lifetime queue (before the synth is attached to a device). nullptr = own queue.
+    void setNoteQueue(NoteEventQueue* q) { queue = q ? q : &ownQueue; }
+    NoteEventQueue& noteQueue() { return *queue; }
 
     void setWaveform(Waveform wf);
     void setFilterCutoff(double hz);
@@ -59,11 +88,16 @@ public:
     void setDetune(double cents);
     void setMasterLevel(double level);
 
+    // Any thread (atomic loads / stores, same as the setters).
+    SynthSettings getSettings() const;
+    void applySettings(const SynthSettings& s);
+
     void setTransport(TransportEngine* t) { transport = t; }
     BeatState beatState;
+    SynthDiagnostics diag;
 
 private:
-    void processNoteEvent(const NoteEvent& event);
+    void startQueuedNote(const NoteEvent& event);
 
     Voice voices[MAX_VOICES];
     VoiceAllocator allocator;
@@ -75,9 +109,6 @@ private:
     std::atomic<float> detuneCents{0.0f};
     std::atomic<float> masterLevel{0.5f};
 
-    // SPSC ring buffer for note events (main thread → audio thread)
-    static constexpr int EVENT_QUEUE_SIZE = 256;
-    NoteEvent eventQueue[EVENT_QUEUE_SIZE];
-    std::atomic<int> eventWritePos{0};
-    std::atomic<int> eventReadPos{0};
+    NoteEventQueue ownQueue;
+    NoteEventQueue* queue = &ownQueue;
 };

@@ -19,14 +19,14 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                        juce::MidiBuffer& /*midiMessages*/) {
     buffer.clear();
 
-    // Drain note event FIFO (audio thread side)
-    int rp = eventReadPos.load(std::memory_order_relaxed);
-    int wp = eventWritePos.load(std::memory_order_acquire);
-    while (rp != wp) {
-        processNoteEvent(eventQueue[rp]);
-        rp = (rp + 1) % EVENT_QUEUE_SIZE;
+    // Note-ons waiting in the queue, then releases: every held voice whose note-on is at or
+    // below its release mark stops (see NoteEventQueue). Applied every block, so a release sent
+    // while the device was stopped or reopening takes effect on the first block after it.
+    queue->drainNoteOns([this](const NoteEvent& event) { startQueuedNote(event); });
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (voices[v].isHeld() && queue->isReleased(voices[v].getNoteNumber(), voices[v].startSeq))
+            voices[v].stopNote();
     }
-    eventReadPos.store(rp, std::memory_order_release);
 
     int numSamples = buffer.getNumSamples();
     double sr = getSampleRate();
@@ -67,6 +67,18 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
     }
 
+    // ── Diagnostics (relaxed atomics only; no locks/allocation) ──
+    {
+        const float blockPeak = numSamples > 0 ? buffer.getMagnitude(0, 0, numSamples) : 0.0f;
+        const float held = diag.peak.load(std::memory_order_relaxed) * diagPeakDecay(numSamples, sr);
+        diag.peak.store(std::max(blockPeak, held), std::memory_order_relaxed);
+        int active = 0;
+        for (int v = 0; v < MAX_VOICES; v++)
+            if (voices[v].isActive()) ++active;
+        diag.activeVoices.store(active, std::memory_order_relaxed);
+        diag.processCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (transport) {
         if (transport->advanceBlock(numSamples, sr)) {
             beatState.crossed.store(true);
@@ -76,53 +88,27 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
 }
 
-// Called on audio thread from processBlock
-void PolySynthProcessor::processNoteEvent(const NoteEvent& event) {
-    switch (event.type) {
-        case NoteEvent::NoteOn: {
-            int clampedNote = std::clamp(event.note, 0, 127);
-            int clampedVel = std::clamp(event.velocity, 0, 127);
-            allocator.noteOn(clampedNote, (float)clampedVel, voices,
-                             static_cast<Waveform>(waveform.load()),
-                             (double)detuneCents.load(),
-                             filterCutoff.load(), filterResonance.load(),
-                             masterLevel.load());
-            break;
-        }
-        case NoteEvent::NoteOff: {
-            int clampedNote = std::clamp(event.note, 0, 127);
-            allocator.noteOff(clampedNote, voices);
-            break;
-        }
-        case NoteEvent::AllNotesOff:
-            allocator.allNotesOff(voices);
-            break;
+// Audio thread (processBlock): start a queued note-on and record its latency.
+void PolySynthProcessor::startQueuedNote(const NoteEvent& event) {
+    const int clampedNote = std::clamp(event.note, 0, 127);
+    const int clampedVel = std::clamp(event.velocity, 0, 127);
+    allocator.noteOn(clampedNote, (float)clampedVel, voices,
+                     static_cast<Waveform>(waveform.load()),
+                     (double)detuneCents.load(),
+                     filterCutoff.load(), filterResonance.load(),
+                     masterLevel.load(), event.seq);
+
+    const juce::int64 nowTicks = juce::Time::getHighResolutionTicks();
+    if (event.stampTicks != 0) {
+        const juce::int64 elapsed = nowTicks - event.stampTicks;
+        diag.lastNoteToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
+                                      std::memory_order_relaxed);
     }
-}
-
-// Called from main thread — pushes event to lock-free FIFO
-void PolySynthProcessor::noteOn(int note, int velocity) {
-    int wp = eventWritePos.load(std::memory_order_relaxed);
-    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
-    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return; // full, drop event
-    eventQueue[wp] = { NoteEvent::NoteOn, note, velocity };
-    eventWritePos.store(nextWp, std::memory_order_release);
-}
-
-void PolySynthProcessor::noteOff(int note) {
-    int wp = eventWritePos.load(std::memory_order_relaxed);
-    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
-    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::NoteOff, note, 0 };
-    eventWritePos.store(nextWp, std::memory_order_release);
-}
-
-void PolySynthProcessor::allNotesOff() {
-    int wp = eventWritePos.load(std::memory_order_relaxed);
-    int nextWp = (wp + 1) % EVENT_QUEUE_SIZE;
-    if (nextWp == eventReadPos.load(std::memory_order_acquire)) return;
-    eventQueue[wp] = { NoteEvent::AllNotesOff, 0, 0 };
-    eventWritePos.store(nextWp, std::memory_order_release);
+    if (event.touchTicks != 0 && nowTicks >= event.touchTicks) {
+        const juce::int64 elapsed = nowTicks - event.touchTicks;
+        diag.lastTouchToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
+                                       std::memory_order_relaxed);
+    }
 }
 
 void PolySynthProcessor::setWaveform(Waveform wf) { waveform.store(static_cast<int>(wf)); }
@@ -161,4 +147,24 @@ void PolySynthProcessor::setDetune(double cents) {
 
 void PolySynthProcessor::setMasterLevel(double level) {
     masterLevel.store((float)std::clamp(level, 0.0, 1.0));
+}
+
+SynthSettings PolySynthProcessor::getSettings() const {
+    // The envelope is stored per voice but always set on all of them; voice 0 holds it.
+    return { waveform.load(), filterCutoff.load(), filterResonance.load(),
+             voices[0].attackMs.load(), voices[0].decayMs.load(),
+             voices[0].sustainLevel.load(), voices[0].releaseMs.load(),
+             detuneCents.load(), masterLevel.load() };
+}
+
+void PolySynthProcessor::applySettings(const SynthSettings& s) {
+    setWaveform(static_cast<Waveform>(s.waveform));
+    setFilterCutoff(s.filterCutoff);
+    setFilterResonance(s.filterResonance);
+    setAttack(s.attackMs);
+    setDecay(s.decayMs);
+    setSustain(s.sustainLevel);
+    setRelease(s.releaseMs);
+    setDetune(s.detuneCents);
+    setMasterLevel(s.masterLevel);
 }
