@@ -50,7 +50,7 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 + (NSDictionary<NSString *, id> *)getEffectsState NS_SWIFT_NAME(getEffectsState());
 
 // ── Metronome / backing track / analysis ─────────────────────────
-+ (void)setMetronome:(NSDictionary<NSString *, id> *)options NS_SWIFT_NAME(setMetronome(_:));
++ (BOOL)setMetronome:(NSDictionary<NSString *, id> *)options NS_SWIFT_NAME(setMetronome(_:)); // NO: unknown style
 + (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options NS_SWIFT_NAME(setBackingTrackOptions(_:));
 // `completion` runs on a background queue: result, or errorCode + errorMessage.
 + (void)loadBackingTrack:(NSString *)uri

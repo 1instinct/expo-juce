@@ -1,7 +1,9 @@
+// JuceConfig.h first: it is only macros + C headers, valid before any Objective-C import, and it
+// must precede Apple's headers for __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES to apply.
+#include "JuceConfig.h"
 #import "ExpoJuceAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
-#include "JuceConfig.h"
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
 #include <juce_audio_devices/juce_audio_devices.h>
@@ -125,9 +127,11 @@ static FxParamStore sFxParams;
 // decoded and resampled on sBackingTrackQueue (serial, never the audio or main thread); buffers
 // it replaces are freed on the main thread once the audio thread has moved past them
 // (BackingTrack::collect, scheduleBackingTrackCollect).
-static AuxSettingsStore sAuxSettings;
-static BackingTrack sBackingTrack;
-static AnalysisRing sAnalysis;
+static AuxSettingsStore sAuxSettings; // atomics only
+// Holds JUCE buffers: heap-allocated and never freed, like the other JUCE objects here (nothing
+// JUCE is destroyed by static destruction, after JUCE has shut down).
+static BackingTrack& sBackingTrack = *new BackingTrack();
+static AnalysisRing sAnalysis;        // atomics only
 
 static dispatch_queue_t backingTrackQueue() {
     static dispatch_queue_t queue;
@@ -205,10 +209,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
         _requestedBufferSize = kDefaultBufferSize;
         _requestedSampleRate = kDefaultSampleRate;
         // The aux node asks for the track at the device rate when it is prepared (setup, rebuild,
-        // device restart with a new rate): resample off that thread, then free the old buffer.
+        // device restart with a new rate): decode the file again at that rate off that thread,
+        // then free the old buffer.
         sBackingTrack.setRateListener([](double) {
             dispatch_async(backingTrackQueue(), ^{
-                sBackingTrack.resampleToWanted();
+                sBackingTrack.reload();
                 [[ExpoJuceAudioEngine sharedInstance] scheduleBackingTrackCollect];
             });
         });
@@ -403,6 +408,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sAux->setSettings(&sAuxSettings);
     sAux->setBackingTrack(&sBackingTrack);
     sAux->setTransport(sTransport);
+    sAux->setAnalysis(&sAnalysis);
     auto auxNode = sGraph->addNode(std::move(auxProcessor));
 
     self.setupStep = 8;
@@ -446,6 +452,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sDeviceManager->addAudioCallback(sPlayer);
 
     self.isReady = true;
+    sAnalysis.setActive(true);
     NSLog(@"[ExpoJuceAudioEngine] DONE — audio stack initialized (sr=%.0f, buf=%d)", sr, bufSize);
 }
 
@@ -499,6 +506,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     NSLog(@"[ExpoJuceAudioEngine] Tearing down engine...");
     sAcceptingNotes.store(false, std::memory_order_release);
     self.isReady = false;
+    sAnalysis.setActive(false);
     if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
     delete sPlayer; sPlayer = nullptr;
     sSynth = nullptr;
@@ -1085,13 +1093,21 @@ static NSNumber *numberFrom(NSDictionary<NSString *, id> *options, NSString *key
     return std::isfinite([(NSNumber *)value doubleValue]) ? (NSNumber *)value : nil;
 }
 
-- (void)setMetronome:(NSDictionary<NSString *, id> *)options {
-    if (NSNumber *v = numberFrom(options, @"enabled")) sAuxSettings.setMetronomeEnabled(v.boolValue);
+- (BOOL)setMetronome:(NSDictionary<NSString *, id> *)options {
+    // An unknown style rejects the whole call (nothing applied), like an unknown effect id.
     id style = options[@"style"];
-    if ([style isKindOfClass:[NSString class]]) sAuxSettings.setMetronomeStyle(((NSString *)style).UTF8String);
+    int styleIndex = -1;
+    if (style != nil) {
+        if (![style isKindOfClass:[NSString class]]) return NO;
+        styleIndex = metronomeStyleIndex(((NSString *)style).UTF8String);
+        if (styleIndex < 0) return NO;
+    }
+    if (NSNumber *v = numberFrom(options, @"enabled")) sAuxSettings.setMetronomeEnabled(v.boolValue);
+    if (styleIndex >= 0) sAuxSettings.setMetronomeStyle(styleIndex);
     if (NSNumber *v = numberFrom(options, @"level")) sAuxSettings.setMetronomeLevel(v.doubleValue);
     if (NSNumber *v = numberFrom(options, @"accent")) sAuxSettings.setMetronomeAccent(v.boolValue);
     if (NSNumber *v = numberFrom(options, @"beatsPerBar")) sAuxSettings.setBeatsPerBar(v.doubleValue);
+    return YES;
 }
 
 - (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options {
@@ -1121,29 +1137,28 @@ static NSString *backingTrackPath(NSString *uri) {
         completion(nil, @"ERR_BACKING_TRACK_URI", [NSString stringWithFormat:@"not a local file URI: %@", uri ?: @"(nil)"]);
         return;
     }
-    BackingTrackGapless g;
-    bool hasGapless = false;
+    BackingTrackSource source;
+    source.path = path.UTF8String;
     if (gapless != nil) {
         NSNumber *loop = numberFrom(gapless, @"loopSamples");
         NSNumber *leading = numberFrom(gapless, @"leadingSamples");
         NSNumber *trailing = numberFrom(gapless, @"trailingSamples");
         if (loop != nil && leading != nil && trailing != nil) {
-            g.loopSamples = loop.longLongValue;
-            g.leadingSamples = leading.longLongValue;
-            g.trailingSamples = trailing.longLongValue;
-            hasGapless = g.loopSamples > 0;
+            source.gapless.loopSamples = loop.longLongValue;
+            source.gapless.leadingSamples = leading.longLongValue;
+            source.gapless.trailingSamples = trailing.longLongValue;
+            source.hasGapless = source.gapless.loopSamples > 0;
         }
     }
     // A newer load or an unload supersedes this one (checked while decoding and before publishing).
     const uint64_t generation = sBackingTrack.beginLoad();
-    std::string utf8Path(path.UTF8String);
     dispatch_async(backingTrackQueue(), ^{
         std::string error;
-        BackingTrackGapless region = g;
-        auto decoded = BackingTrack::decode(juce::File(juce::String::fromUTF8(utf8Path.c_str())),
-                                            hasGapless ? &region : nullptr,
-                                            [generation] { return !sBackingTrack.isCurrent(generation); }, error);
-        if (decoded == nullptr) {
+        BackingTrackInfo info;
+        // Decoded straight at the device rate (known once the engine has been prepared).
+        auto buffer = BackingTrack::load(source, sBackingTrack.wantedSampleRate(),
+                                         [generation] { return !sBackingTrack.isCurrent(generation); }, info, error);
+        if (buffer == nullptr) {
             NSString *full = [NSString stringWithUTF8String:error.c_str()] ?: @"ERR_BACKING_TRACK: decode failed";
             NSRange colon = [full rangeOfString:@": "];
             NSString *code = colon.location != NSNotFound ? [full substringToIndex:colon.location] : @"ERR_BACKING_TRACK";
@@ -1151,8 +1166,7 @@ static NSString *backingTrackPath(NSString *uri) {
             completion(nil, code, message);
             return;
         }
-        const BackingTrackInfo info = decoded->info;
-        if (!sBackingTrack.install(std::move(decoded), generation)) {
+        if (!sBackingTrack.install(std::move(buffer), source, generation)) {
             completion(nil, @"ERR_BACKING_TRACK_SUPERSEDED", @"a newer load or unload replaced this one");
             return;
         }
@@ -1164,6 +1178,7 @@ static NSString *backingTrackPath(NSString *uri) {
             @"loopStartSample": @((double)info.loopStartSample),
             @"loopSamples": @((double)info.loopSamples),
             @"decodedSamples": @((double)info.decodedSamples),
+            @"regionRule": [NSString stringWithUTF8String:backingTrackRegionRuleName(info.regionRule)],
             @"decoder": [NSString stringWithUTF8String:info.formatName.c_str()] ?: @"",
         }, nil, nil);
     });
@@ -1175,7 +1190,8 @@ static NSString *backingTrackPath(NSString *uri) {
 }
 
 // Main thread. Frees replaced backing-track buffers the audio thread no longer uses; retries
-// every 100 ms while some are still in use (e.g. the device is stopped mid-swap).
+// every 100 ms while some are still in use (e.g. the device is stopped mid-swap) or the holder
+// is busy (collect never blocks the main thread).
 - (void)scheduleBackingTrackCollect {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self scheduleBackingTrackCollect]; });
@@ -1191,34 +1207,27 @@ static NSString *backingTrackPath(NSString *uri) {
 }
 
 // ── Analysis ──
-// Any thread, cheap: the ring / peak / rms are lock-free reads of the process-lifetime
-// sAnalysis; tempo / position / play state are read under the engine lock (try_lock off the
-// main thread). Not ready: zeros.
+// Any thread, no lock: everything is read from the process-lifetime sAnalysis (levels and scope
+// written by GraphPlayer, transport as of the last block written by the aux node). Zeros while
+// the engine is not running.
 - (NSDictionary<NSString *, id> *)analysis {
-    bool ready = false;
-    double bpm = 120.0, beat = 0.0;
-    bool playing = false;
-    {
-        std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
-        if (acquireUserLock(lock) && self.isReady && sTransport != nullptr) {
-            ready = true;
-            bpm = sTransport->getTempo();
-            beat = sTransport->getPosition();
-            playing = sTransport->isPlaying();
-        }
-    }
+    const bool active = sAnalysis.isActive();
     float scope[AnalysisRing::kScopePoints] = {};
-    if (ready) sAnalysis.readScope(scope);
+    AnalysisRing::Levels levels{0.0f, 0.0f};
+    if (active) {
+        sAnalysis.readScope(scope);
+        levels = sAnalysis.readLevels();
+    }
     NSMutableArray<NSNumber *> *points = [NSMutableArray arrayWithCapacity:AnalysisRing::kScopePoints];
     for (int i = 0; i < AnalysisRing::kScopePoints; ++i) [points addObject:@(scope[i])];
     return @{
-        @"peak": @(ready ? sAnalysis.peak() : 0.0f),
-        @"rms": @(ready ? sAnalysis.rms() : 0.0f),
+        @"peak": @(levels.peak),
+        @"rms": @(levels.rms),
         @"scope": points,
         @"lastNote": @(sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed)),
-        @"bpm": @(bpm),
-        @"beat": @(beat),
-        @"playing": @(playing ? YES : NO),
+        @"bpm": @(active ? sAnalysis.bpm() : 120.0),
+        @"beat": @(active ? sAnalysis.beat() : 0.0),
+        @"playing": @(active && sAnalysis.playing() ? YES : NO),
     };
 }
 

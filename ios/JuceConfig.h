@@ -2,7 +2,9 @@
 
 // Apple's AssertMacros.h (pulled in via CoreServices / AudioToolbox) otherwise defines
 // un-prefixed macros such as check(), verify() and require(), which collide with C++ and JUCE
-// identifiers. Must come before any system header.
+// identifiers. It only takes effect in translation units where this header is included before
+// any Apple system header (the JuceModule_*.mm units and ExpoJuceAudioEngine.mm include it
+// first); where an Apple header comes first, AssertMacros.h has already been processed.
 #ifndef __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES
 #define __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES 0
 #endif

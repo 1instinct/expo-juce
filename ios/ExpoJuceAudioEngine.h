@@ -58,7 +58,7 @@ typedef void(^BeatCallback)(double beat, double bpm);
 // lock-free, any thread, remembered before setup and across rebuilds; absent keys unchanged.
 // metronome: enabled, style ("classic" | "wood" | "beep" | "cowbell" | "hat"), level 0–1,
 // accent, beatsPerBar 1–16. Backing track: level 0–1, loop, enabled.
-- (void)setMetronome:(NSDictionary<NSString *, id> *)options;
+- (BOOL)setMetronome:(NSDictionary<NSString *, id> *)options; // NO (nothing applied): unknown style
 - (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options;
 // Decodes `uri` (file:// URL or absolute path) on a background queue, cuts the loop region
 // (gapless: loopSamples / leadingSamples / trailingSamples, optional), resamples to the device

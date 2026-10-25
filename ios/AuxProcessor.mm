@@ -109,16 +109,15 @@ struct Noise {
 double square(double phase) { return std::fmod(phase, 1.0) < 0.5 ? 1.0 : -1.0; }
 
 // Peak-normalises to `peak` and fades the last millisecond to exactly 0.
-void finishClick(std::vector<float>& c, double fs, double peak) {
+void finishClick(float* c, int n, double fs, double peak) {
     float maxAbs = 0.0f;
-    for (float v : c) maxAbs = std::max(maxAbs, std::fabs(v));
+    for (int i = 0; i < n; ++i) maxAbs = std::max(maxAbs, std::fabs(c[i]));
     const float scale = maxAbs > 0.0f ? (float)(peak / maxAbs) : 0.0f;
-    const int fade = std::max(1, (int)(0.001 * fs));
-    const int n = (int)c.size();
+    const int fade = std::max(1, std::min(n, (int)(0.001 * fs)));
     for (int i = 0; i < n; ++i) {
         float g = scale;
         if (i >= n - fade) g *= (float)(n - 1 - i) / (float)fade;
-        c[(size_t)i] *= g;
+        c[i] *= g;
     }
 }
 } // namespace
@@ -128,7 +127,7 @@ void AuxProcessor::renderClicks() {
     const double loudness[kMetronomeStyleCount] = { 1.0, 1.0, 0.5, 0.8, 0.7 };
     for (int style = 0; style < kMetronomeStyleCount; ++style) {
         for (int accent = 0; accent < 2; ++accent) {
-            std::vector<float>& c = clicks[style][accent];
+            float* c = clickSlot(style, accent);
             double seconds = 0.03;
             switch (style) {
                 case kMetronomeClassic: seconds = 0.030; break;
@@ -138,8 +137,8 @@ void AuxProcessor::renderClicks() {
                 case kMetronomeHat: seconds = 0.025; break;
                 default: break;
             }
-            const int n = std::max(1, (int)std::lround(std::min(seconds, kMaxClickSeconds) * fs));
-            c.assign((size_t)n, 0.0f);
+            const int n = std::clamp((int)std::lround(std::min(seconds, kMaxClickSeconds) * fs), 1, kMaxClickSamples);
+            std::fill(c, c + n, 0.0f);
             Noise noise(0x1234567u + (uint32_t)(style * 2 + accent));
             switch (style) {
                 case kMetronomeClassic: { // sine blip 1.5 kHz / accent 2.5 kHz
@@ -191,7 +190,8 @@ void AuxProcessor::renderClicks() {
                 }
                 default: break;
             }
-            finishClick(c, fs, loudness[style] * (accent ? 1.0 : 0.75));
+            finishClick(c, n, fs, loudness[style] * (accent ? 1.0 : 0.75));
+            clickLengths[style][accent].store(n, std::memory_order_release);
         }
     }
 }
@@ -199,7 +199,8 @@ void AuxProcessor::renderClicks() {
 // ── Processor ──
 
 AuxProcessor::AuxProcessor()
-    : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)) {
+    : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      clickStore(new float[(size_t)kMetronomeStyleCount * 2 * kMaxClickSamples]()) {
 }
 
 AuxProcessor::~AuxProcessor() {
@@ -207,10 +208,18 @@ AuxProcessor::~AuxProcessor() {
     track->releaseReader();
 }
 
+std::vector<float> AuxProcessor::clickBuffer(int style, bool accent) const {
+    style = std::clamp(style, 0, kMetronomeStyleCount - 1);
+    const int a = accent ? 1 : 0;
+    const float* c = clickSlot(style, a);
+    return std::vector<float>(c, c + clickLengths[style][a].load(std::memory_order_acquire));
+}
+
 void AuxProcessor::setBackingTrack(BackingTrack* t) {
     track->releaseReader();
     track = t ? t : &ownTrack;
     lastTrack = nullptr;
+    tailActive = trackActive = tailProtected = false;
 }
 
 void AuxProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/) {
@@ -223,12 +232,15 @@ void AuxProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/) {
     trackGain.reset(sr, kLevelRampSeconds);
     trackGain.setCurrentAndTargetValue(settings->trackLevel.load(std::memory_order_relaxed));
     wasPlaying = false;
+    havePrevBlock = false;
     trackActive = false;
-    nextTrackPos = 0;
+    tailActive = false;
+    trackPos = 0;
     lastClickedBeat = 0;
     lastTrack = nullptr;
+    if (tailProtected) { track->releaseTail(); tailProtected = false; }
     prepared = true;
-    // Ask the holder for a buffer at this rate (re-resampled off this thread if needed).
+    // Ask the holder for a buffer at this rate (loaded again off this thread if needed).
     if (sampleRate > 0.0) track->requestRate(sampleRate);
 }
 
@@ -243,20 +255,31 @@ void AuxProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
     }
     // Block-start transport snapshot, see TransportEngine::getBlockStartBeat.
     double beatStart = 0.0, bpm = 120.0;
-    bool playing = false;
+    bool playing = false, seekFlag = false;
     if (transport != nullptr) {
         beatStart = transport->getBlockStartBeat();
         bpm = transport->getBlockBpm();
         playing = transport->isBlockPlaying();
+        seekFlag = transport->wasBlockSeeked();
     }
     const double beatsPerSample = bpm / (60.0 * sr);
+    // A move of the transport: its seek flag, or a block that does not start where the previous
+    // one ended (e.g. another node advanced it differently). Tempo changes alone are not moves.
+    const double expected = prevBeatStart + prevBeatsAdvanced;
+    const bool seeked = seekFlag || (havePrevBlock && wasPlaying
+                                     && std::fabs(beatStart - expected) > 1e-7 * std::max(1.0, std::fabs(expected)));
     float* left = buffer.getWritePointer(0);
     float* right = buffer.getWritePointer(1);
 
     renderMetronome(left, right, n, beatStart, beatsPerSample, playing);
-    renderTrack(left, right, n, beatStart, bpm, playing);
+    renderTrack(left, right, n, beatStart, bpm, playing, seeked);
 
+    const double advanced = playing ? beatsPerSample * n : 0.0;
+    prevBeatStart = beatStart;
+    prevBeatsAdvanced = advanced;
+    havePrevBlock = true;
     wasPlaying = playing;
+    if (analysis != nullptr) analysis->publishTransport(beatStart + advanced, bpm, playing);
     diag.processCount.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -297,69 +320,84 @@ void AuxProcessor::renderMetronome(float* left, float* right, int n, double beat
         if (eventAt >= n) break;
         // Click on `beat`; accent on beat 1 of the bar.
         const int64_t inBar = ((beat % bpb) + bpb) % bpb;
-        const std::vector<float>& c = clicks[style][accent && inBar == 0 ? 1 : 0];
-        clickData = c.data();
-        clickLength = (int)c.size();
+        const int a = accent && inBar == 0 ? 1 : 0;
+        clickData = clickSlot(style, a);
+        clickLength = std::clamp(clickLengths[style][a].load(std::memory_order_acquire), 0, kMaxClickSamples);
         clickPos = 0;
+        if (clickLength == 0) clickData = nullptr;
         lastClickedBeat = beat;
         diag.clicks.fetch_add(1, std::memory_order_relaxed);
         pos = eventAt;
     }
 }
 
-void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStart, double bpm, bool playing) {
+// The voice at `position` in `buffer` fades out over kFadeSeconds (replacing an earlier tail).
+void AuxProcessor::startTail(BackingTrackBuffer* buffer, int64_t position) {
+    tailActive = buffer != nullptr;
+    tailBuffer = buffer;
+    tailPos = position;
+    tailLeft = std::max(1, (int)(kFadeSeconds * sr));
+}
+
+void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStart, double bpm, bool playing,
+                               bool seeked) {
     const auto r = std::memory_order_relaxed;
-    BackingTrackBuffer* t = track->acquire();
-    if (t != lastTrack) {
-        // Another buffer (load, unload or resample): the old one may be freed now, so nothing
-        // continues from it; the new one starts with a fade.
+    BackingTrackBuffer* const previous = lastTrack;
+    BackingTrackBuffer* const t = track->acquire(); // keeps `previous` alive for its fade-out
+    const bool swapped = t != previous;
+    if (swapped) {
+        // A tail still on an even older buffer lost its protection inside acquire(): drop it
+        // (it is not read again). Then fade the old buffer out where it was playing.
+        if (tailActive && tailBuffer != previous) tailActive = false;
+        if (trackActive && previous != nullptr) startTail(previous, trackPos);
+        tailProtected = previous != nullptr;
         lastTrack = t;
         trackActive = false;
-        tailActive = false;
     }
     const bool loop = settings->trackLoop.load(r);
     const bool enabled = settings->trackEnabled.load(r);
     trackGain.setTargetValue(settings->trackLevel.load(r));
     const bool playable = t != nullptr && t->sampleRate == sr && t->length > 0;
-    if (!playable) {
-        trackActive = tailActive = false;
-        diag.trackPositionSec.store(-1.0, r);
-        return;
-    }
-    const int64_t len = t->length;
-    const float* srcL = t->audio.getReadPointer(0);
-    const float* srcR = t->audio.getReadPointer(1);
     const int fadeLen = std::max(1, (int)(kFadeSeconds * sr));
 
-    if (playing && !wasPlaying) {
-        const int64_t bpb = std::max(1, settings->beatsPerBar.load(r));
-        anchorBeat = std::floor(beatStart / (double)bpb) * (double)bpb;
-    }
-    const bool sounding = playing && enabled;
-    if (sounding) {
-        const int64_t pos = (int64_t)std::llround((beatStart - anchorBeat) * 60.0 / bpm * sr);
-        const bool continuous = trackActive && std::llabs(pos - nextTrackPos) <= 2;
-        if (!continuous) {
-            if (trackActive) { // seek / tempo jump: fade the old position out
-                tailActive = true; tailPos = nextTrackPos; tailLeft = fadeLen;
+    if (playable) {
+        const int64_t len = t->length;
+        const bool sounding = playing && enabled;
+        // Beat → track position: sample 0 is beat 0, at the current tempo.
+        const int64_t mapped = (int64_t)std::llround(beatStart * 60.0 / std::max(bpm, 1e-6) * sr);
+        if (sounding) {
+            if (!trackActive) { // start, resume, or a new buffer
+                trackPos = loop ? ((mapped % len) + len) % len : mapped;
+                mainFadeLeft = (trackPos == 0 && !tailActive) ? 0 : fadeLen;
+                trackActive = true;
+            } else if (seeked) {
+                startTail(t, trackPos);
+                trackPos = loop ? ((mapped % len) + len) % len : mapped;
+                mainFadeLeft = fadeLen;
             }
-            const int64_t wrapped = loop ? ((pos % len) + len) % len : pos;
-            mainPos = pos;
-            mainFadeLeft = (!trackActive && wrapped == 0) ? 0 : fadeLen; // a start at the top needs no fade
-            trackActive = true;
-        } else {
-            mainPos = nextTrackPos;
+            // otherwise continue: the position advances by the samples rendered
+        } else if (trackActive) { // stopped / disabled: fade out where it was
+            startTail(t, trackPos);
+            trackActive = false;
         }
-    } else if (trackActive) { // stopped / disabled: fade out where it was
-        tailActive = true; tailPos = nextTrackPos; tailLeft = fadeLen;
+    } else if (trackActive) {
+        // Not playable (no buffer, or one at another rate): nothing to continue.
         trackActive = false;
     }
+    // A tail on the current buffer no longer needs the protected previous one.
+    if (tailActive && tailBuffer == t && tailProtected) { track->releaseTail(); tailProtected = false; }
+
     if (!trackActive && !tailActive) {
+        if (tailProtected) { track->releaseTail(); tailProtected = false; }
         diag.trackPositionSec.store(-1.0, r);
         return;
     }
 
-    auto read = [&](int64_t p, const float* src) -> float {
+    const bool tailPlayable = tailActive && tailBuffer->sampleRate == sr && tailBuffer->length > 0;
+    if (tailActive && !tailPlayable) tailActive = false;
+    auto read = [loop](const BackingTrackBuffer* b, int64_t p, int ch) -> float {
+        const int64_t len = b->length;
+        const float* src = b->audio.getReadPointer(ch);
         if (loop) return src[((p % len) + len) % len];
         return (p >= 0 && p < len) ? src[p] : 0.0f;
     };
@@ -368,14 +406,14 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
         if (trackActive) {
             float g = 1.0f;
             if (mainFadeLeft > 0) { g = 1.0f - (float)mainFadeLeft / (float)fadeLen; --mainFadeLeft; }
-            l += read(mainPos, srcL) * g;
-            rr += read(mainPos, srcR) * g;
-            ++mainPos;
+            l += read(t, trackPos, 0) * g;
+            rr += read(t, trackPos, 1) * g;
+            ++trackPos;
         }
         if (tailActive) {
             const float g = (float)tailLeft / (float)fadeLen;
-            l += read(tailPos, srcL) * g;
-            rr += read(tailPos, srcR) * g;
+            l += read(tailBuffer, tailPos, 0) * g;
+            rr += read(tailBuffer, tailPos, 1) * g;
             ++tailPos;
             if (--tailLeft <= 0) tailActive = false;
         }
@@ -383,6 +421,11 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
         left[i] += l * level;
         right[i] += rr * level;
     }
-    if (trackActive) nextTrackPos = mainPos;
-    diag.trackPositionSec.store(trackActive ? (double)(loop ? ((mainPos % len) + len) % len : mainPos) / sr : -1.0, r);
+    if (!tailActive && tailProtected) { track->releaseTail(); tailProtected = false; }
+    if (trackActive) {
+        const int64_t len = t->length;
+        diag.trackPositionSec.store((double)(loop ? ((trackPos % len) + len) % len : trackPos) / sr, r);
+    } else {
+        diag.trackPositionSec.store(-1.0, r);
+    }
 }

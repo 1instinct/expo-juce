@@ -37,7 +37,8 @@ void TransportEngine::restoreState(const TransportState& s) {
 
 bool TransportEngine::advanceBlock(int numSamples, double sampleRate) {
     double pending = pendingPosition.exchange(std::numeric_limits<double>::quiet_NaN());
-    if (!std::isnan(pending)) {
+    blockSeeked = !std::isnan(pending);
+    if (blockSeeked) {
         beatPosition = pending;
         lastBeatInt = (int)beatPosition;
     }

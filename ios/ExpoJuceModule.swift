@@ -160,8 +160,9 @@ public class ExpoJuceModule: Module {
     // ── Metronome / backing track / analysis ───────────────────────
     // Options are lock-free and remembered before setup and across rebuilds.
 
-    Function("setMetronome") { (options: [String: Any]) in
-      ExpoJuceBridge.setMetronome(options)
+    // false (nothing applied) for an unknown style.
+    Function("setMetronome") { (options: [String: Any]) -> Bool in
+      return ExpoJuceBridge.setMetronome(options)
     }
 
     Function("setBackingTrackOptions") { (options: [String: Any]) in

@@ -39,6 +39,8 @@ public:
     double getBlockStartBeat() const { return blockStartBeat; }
     double getBlockBpm() const { return blockBpm; }
     bool isBlockPlaying() const { return blockPlaying; }
+    // A seek (setPosition / restoreState) was applied at the start of that block.
+    bool wasBlockSeeked() const { return blockSeeked; }
 
 private:
     std::atomic<double> bpm;
@@ -54,6 +56,7 @@ private:
     double blockStartBeat = 0.0;
     double blockBpm = 120.0;
     bool blockPlaying = false;
+    bool blockSeeked = false;
 
     std::atomic<double> positionSnapshot;
 

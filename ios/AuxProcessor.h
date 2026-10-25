@@ -9,8 +9,10 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "TransportEngine.h"
 #include "BackingTrack.h"
+#include "AnalysisRing.h"
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 enum MetronomeStyle : int {
@@ -77,16 +79,28 @@ struct AuxDiagnostics {
 // synth node runs first in the same graph pass). Clicks are pre-rendered per style (normal +
 // accent) in prepareToPlay; accent on beat 1 of each bar (beatsPerBar).
 //
-// Backing track: plays while the transport plays. Position = (transport beat − anchor) beats at
-// the current tempo, where the anchor is the first beat of the bar the transport started on;
-// seeks (setTransportPosition) therefore seek the track. Loops if `loop`, else silent past its
-// end. A start away from the track's start, a seek or a stop is declicked with a 5 ms fade.
-// A published buffer whose rate is not this node's rate is not played (it is being resampled).
+// Backing track: plays while the transport plays; its sample position advances with the
+// samples rendered, so a tempo change does not move it. When the transport starts or is moved
+// (setTransportPosition, detected from the transport's seek flag or a block-start beat that is
+// not where the previous block ended) the position is set from the beat: track sample 0 is beat
+// 0, position = beat × 60 / bpm × rate (modulo the length when looping). Pausing and resuming
+// therefore continues where it stopped, and seeks land on the beat grid. Loops if `loop`, else
+// silent past its end. A start away from sample 0, a seek, a stop, and a swap to another buffer
+// (load, unload, resample) are declicked with a 5 ms fade (the old buffer fades out while the
+// new one fades in; the holder keeps the old one alive for that). A published buffer whose rate
+// is not this node's rate is not played (it is being reloaded).
+//
+// Prepare: JUCE never runs prepareToPlay concurrently with processBlock (the graph renders
+// nothing while its nodes are prepared, see AudioProcessorGraph NodeStates::applySettings; the
+// iOS device calls audioDeviceAboutToStart under its callback lock or before the callback is
+// installed). Defensively, the clicks live in fixed storage sized for 192 kHz from the
+// constructor, so a prepare can only rewrite their contents, never move them.
 class AuxProcessor : public juce::AudioProcessor {
 public:
     static constexpr double kMaxClickSeconds = 0.08;
     static constexpr double kFadeSeconds = 0.005;
     static constexpr double kLevelRampSeconds = 0.030;
+    static constexpr int kMaxClickSamples = (int)(kMaxClickSeconds * 192000.0) + 1;
 
     AuxProcessor();
     ~AuxProcessor() override;
@@ -116,8 +130,10 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
-    // Pre-rendered click (tests compare the output with it). Valid after prepareToPlay.
-    const std::vector<float>& clickBuffer(int style, bool accent) const { return clicks[style][accent ? 1 : 0]; }
+    // Copy of a pre-rendered click (tests compare the output with it). Valid after prepareToPlay.
+    std::vector<float> clickBuffer(int style, bool accent) const;
+    // Transport state as of the last rendered block, for getAnalysis (nullptr = none).
+    void setAnalysis(AnalysisRing* a) { analysis = a; }
 
     AuxDiagnostics diag;
 
@@ -126,19 +142,23 @@ private:
 
     void renderClicks();
     void renderMetronome(float* left, float* right, int n, double beatStart, double beatsPerSample, bool playing);
-    void renderTrack(float* left, float* right, int n, double beatStart, double bpm, bool playing);
+    void renderTrack(float* left, float* right, int n, double beatStart, double bpm, bool playing, bool seeked);
+    void startTail(BackingTrackBuffer* buffer, int64_t position);
 
     AuxSettingsStore ownSettings;
     AuxSettingsStore* settings = &ownSettings;
     BackingTrack ownTrack;
     BackingTrack* track = &ownTrack;
     TransportEngine* transport = nullptr;
+    AnalysisRing* analysis = nullptr;
 
     double sr = 48000.0;
     bool prepared = false;
 
     // metronome
-    std::vector<float> clicks[kMetronomeStyleCount][2];
+    std::unique_ptr<float[]> clickStore; // [style][accent][kMaxClickSamples], allocated once
+    std::atomic<int> clickLengths[kMetronomeStyleCount][2] = {};
+    float* clickSlot(int style, int accent) const { return clickStore.get() + ((size_t)style * 2 + (size_t)accent) * kMaxClickSamples; }
     const float* clickData = nullptr;
     int clickLength = 0, clickPos = 0;
     int64_t lastClickedBeat = 0; // last integer beat clicked (or skipped)
@@ -146,14 +166,16 @@ private:
 
     // backing track
     bool wasPlaying = false;
-    double anchorBeat = 0.0;
-    int64_t nextTrackPos = 0;   // where playback continues if nothing jumps
-    bool trackActive = false;   // main voice playing
-    int64_t mainPos = 0;
-    int mainFadeLeft = 0;       // fade-in samples left
-    bool tailActive = false;    // old position fading out after a seek / stop
+    bool havePrevBlock = false;       // prevBeatStart / prevBeatsAdvanced valid
+    double prevBeatStart = 0.0, prevBeatsAdvanced = 0.0;
+    bool trackActive = false;         // main voice playing
+    int64_t trackPos = 0;             // main voice position (samples at sr, not wrapped)
+    int mainFadeLeft = 0;             // fade-in samples left
+    bool tailActive = false;          // a voice fading out (seek / stop / swap)
+    BackingTrackBuffer* tailBuffer = nullptr;
     int64_t tailPos = 0;
     int tailLeft = 0;
+    bool tailProtected = false;       // the holder keeps a previous buffer for us
     Smoothed trackGain;
     BackingTrackBuffer* lastTrack = nullptr;
 

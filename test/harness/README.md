@@ -31,16 +31,21 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   at its defaults (silent). Aux cases: `met` (every metronome style: each click starts exactly on
   the sample `ceil(k × 60 × sr / bpm)`, equals the pre-rendered click, accent on bar beat 1,
   silence between, over odd block sizes and mid-beat starts), `bt` (backing track plays from the
-  top sample-exact, loops, seeks with `setPosition`, starts in the bar the transport started in,
-  stops, plays once without loop, is resampled after a device-rate change), `btr` (loop-region
-  rule on its lengths; decodes `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder and
-  prints which length it yields and the region chosen; resample 44.1 → 48 kHz), `bts` (300
+  top sample-exact, loops, seeks with `setPosition` to beat × 60 / bpm, starts mid-bar at the
+  beat's position, pause + resume continues where it stopped, stops, plays once without loop,
+  is decoded again from its file after a device-rate change), `btt` (a tempo ramp 120 → 124 bpm
+  while playing leaves the track sample-continuous), `bsf` (replacing and unloading the track
+  while it plays are crossfaded, never a step above one fade increment; the old buffer survives
+  `collect()` until its fade-out ends), `btr` (loop-region rule on all its cases; decodes
+  `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder, prints which length it yields and
+  the rule chosen; the exact loop resampled 44.1 → 48 kHz is 743226 frames), `btl` (frame cap
+  and available-memory refusals), `bts` (300
   loads / unloads while another thread renders: 0 allocations and 0 frees in the render, every
   replaced buffer freed by `collect()`, a superseded load does not publish), `aux0` (aux with
   nothing to play outputs exact zeros; a graph with it equals one without it, sample for
   sample), `rsa` (aux settings and the track survive a rebuild), `an` (the `AnalysisRing` written
-  by `GraphPlayer` holds a known sine at the expected scope indices, peak / rms of the last
-  block). The `allocs` / `frees` counters also count `free()` inside render calls.
+  by `GraphPlayer` holds a known sine at the expected scope indices, peak / rms since the
+  last read, mono RMS, the transport published by the aux node). The `allocs` / `frees` counters also count `free()` inside render calls.
 - From a Windows checkout (`core.autocrlf=true`) `fetch_deps.sh` has CRLF line endings and bash
   rejects it: run from a copy with LF endings, or copy an existing `build/sysroot` (with its
   `.done`) and convert the script (`sed -i 's/\r$//' fetch_deps.sh`).

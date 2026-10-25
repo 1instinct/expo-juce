@@ -53,7 +53,7 @@
 + (NSDictionary<NSString *, id> *)getEffectsState { return [[ExpoJuceAudioEngine sharedInstance] effectsState]; }
 
 // ── Metronome / backing track / analysis ──
-+ (void)setMetronome:(NSDictionary<NSString *, id> *)options { [[ExpoJuceAudioEngine sharedInstance] setMetronome:options]; }
++ (BOOL)setMetronome:(NSDictionary<NSString *, id> *)options { return [[ExpoJuceAudioEngine sharedInstance] setMetronome:options]; }
 + (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options {
     [[ExpoJuceAudioEngine sharedInstance] setBackingTrackOptions:options];
 }
