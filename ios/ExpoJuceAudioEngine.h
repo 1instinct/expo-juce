@@ -70,8 +70,18 @@ typedef void(^BeatCallback)(double beat, double bpm);
                                    NSString *errorMessage))completion;
 - (void)unloadBackingTrack;
 
-// Output analysis for HUDs: { peak, rms, scope: [128 numbers], lastNote, bpm, beat, playing }.
-// Cheap, any thread; zeros when the engine is not running.
+// Arpeggiator between the note queue and the voices (0.7.0+). Options are lock-free, any thread,
+// remembered before setup and across rebuilds; absent keys unchanged, numbers clamped. Keys:
+// enabled, mode ("up" | "down" | "upDown" | "played" | "random" | "chord"), rate ("1/4" | "1/8" |
+// "1/8T" | "1/8D" | "1/16" | "1/16T" | "1/32"), octaves 1–4, gate 0.05–1.5, swing 0–0.5, latch,
+// pattern (1–16 booleans), accent 0–1, ratchet 1–4, transposeSteps 0–8, transposeDistance −12..12.
+- (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options; // NO (nothing applied): unknown mode / rate
+// Every option as stored (pattern as an array of `length` booleans).
+- (NSDictionary<NSString *, id> *)arpeggiatorState;
+
+// Output analysis for HUDs: { peak, rms, scope: [128 numbers], bands: [24 numbers], sampleRate,
+// lastNote, bpm, beat, playing, arp: { active, step, steps, note } }. Any thread; one 2048-point
+// FFT per call (about 50 µs); zeros when the engine is not running.
 - (NSDictionary<NSString *, id> *)analysis;
 
 // Transport

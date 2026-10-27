@@ -2340,12 +2340,16 @@ static bool runSpectrum() {
     return pass;
 }
 
-// Only the case named on the command line runs (none: every case).
-static const char* gOnlyCase = nullptr;
-static bool want(const char* id) { return gOnlyCase == nullptr || std::strcmp(gOnlyCase, id) == 0; }
+// Only the cases named on the command line run (none: every case).
+static std::vector<std::string> gOnlyCases;
+static bool want(const char* id) {
+    if (gOnlyCases.empty()) return true;
+    for (const std::string& c : gOnlyCases) if (c == id) return true;
+    return false;
+}
 
 int main(int argc, char** argv) {
-    if (argc > 1) gOnlyCase = argv[1];
+    for (int i = 1; i < argc; ++i) gOnlyCases.emplace_back(argv[i]);
     // App: MessageManager::getInstance() in a static constructor on the main thread, then
     // juce::initialiseJuce_GUI() at doSetup step 0. Same thread here.
     juce::MessageManager::getInstance();

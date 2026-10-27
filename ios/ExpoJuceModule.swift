@@ -189,6 +189,18 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.getAnalysis()
     }
 
+    // ── Arpeggiator (0.7.0+) ───────────────────────────────────────
+    // Options are lock-free and remembered before setup and across rebuilds. false (nothing
+    // applied) for an unknown mode / rate.
+
+    Function("setArpeggiator") { (options: [String: Any]) -> Bool in
+      return ExpoJuceBridge.setArpeggiator(options)
+    }
+
+    Function("getArpeggiatorState") { () -> [String: Any] in
+      return ExpoJuceBridge.getArpeggiatorState()
+    }
+
     // ── Transport ──────────────────────────────────────────────────
 
     Function("startTransport") {

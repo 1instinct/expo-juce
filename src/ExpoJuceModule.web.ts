@@ -2,6 +2,7 @@ import { EventEmitter } from 'expo-modules-core';
 
 import type {
   Analysis,
+  ArpOptions,
   BackingTrackGapless,
   BackingTrackInfo,
   BackingTrackOptions,
@@ -9,6 +10,7 @@ import type {
   MetronomeOptions,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
+import { arpDefaults } from './arpDefaults';
 
 const emitter = new EventEmitter({} as any);
 
@@ -54,5 +56,12 @@ export default {
       playing: false,
       arp: { active: false, step: 0, steps: 16, note: -1 },
     };
+  },
+  // No arpeggiator on web: nothing applied, defaults reported.
+  setArpeggiator(_options: Partial<ArpOptions>): boolean {
+    return false;
+  },
+  getArpeggiatorState(): ArpOptions {
+    return arpDefaults();
   },
 };

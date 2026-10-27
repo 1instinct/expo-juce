@@ -2,6 +2,7 @@ import { requireNativeModule } from 'expo-modules-core';
 
 import type {
   Analysis,
+  ArpOptions,
   AudioDiagnostics,
   BackingTrackGapless,
   BackingTrackInfo,
@@ -50,6 +51,10 @@ export type ExpoJuceNativeModule = {
   loadBackingTrack?(uri: string, gapless: BackingTrackGapless | null): Promise<BackingTrackInfo>;
   unloadBackingTrack?(): void;
   getAnalysis?(): Analysis;
+
+  // Arpeggiator (0.7.0+)
+  setArpeggiator?(options: Partial<ArpOptions>): boolean;
+  getArpeggiatorState?(): ArpOptions;
 
   // Transport
   startTransport(): void;
