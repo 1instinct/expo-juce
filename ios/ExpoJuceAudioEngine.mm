@@ -143,9 +143,10 @@ static std::atomic_flag sSpectrumBusy = ATOMIC_FLAG_INIT;
 static float sLastBands[SpectrumAnalyser::kBands] = {};
 
 // ── Arpeggiator options ──
-// Same pattern as the aux settings: the process-lifetime copy every setArpeggiator writes (lock-
-// free, remembered before setup and across rebuilds); the running synth's arpeggiator is set from
-// it when the engine is built, and updated alongside it while the engine runs.
+// Same pattern as the aux settings: the process-lifetime store every setArpeggiator writes (no
+// lock, no engine needed), attached to each synth the engine builds, whose audio thread snapshots
+// it once per block. Nothing is copied into the synth, so a setArpeggiator during a rebuild (the
+// window withSynth would drop) is seen by the next block like any other.
 static ArpSettingsStore sArpOptions;
 
 static dispatch_queue_t backingTrackQueue() {
@@ -405,7 +406,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sNoteQueue.discardPending();
     sSynth->setNoteQueue(&sNoteQueue);
     sSynth->setAnalysis(&sAnalysis);
-    sSynth->arp().setSettings(sArpOptions.get()); // set before setup / kept across rebuilds
+    sSynth->arp().setSettingsStore(&sArpOptions); // the live options, before and across rebuilds
 
     self.setupStep = 7;
     NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth, fx chain)");
@@ -551,10 +552,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 // released, so no caller ever sees the defaults. Held notes are not replayed.
 - (void)restoreRecoveryStateLocked {
     if (!self.hasRecoveryState || !sSynth || !sTransport) return;
-    sSynth->applySettings(self.recoverySynthSettings);
     // The snapshot's arp options may predate a setArpeggiator made while a failed rebuild waited
-    // for its retry: sArpOptions always holds the latest.
-    sSynth->arp().setSettings(sArpOptions.get());
+    // for its retry; sArpOptions (which applySettings would write) always holds the latest.
+    SynthSettings settings = self.recoverySynthSettings;
+    settings.arp = sArpOptions.get();
+    sSynth->applySettings(settings);
     sTransport->restoreState(self.recoveryTransportState);
     self.hasRecoveryState = NO;
 }
@@ -1227,9 +1229,10 @@ static NSString *backingTrackPath(NSString *uri) {
 }
 
 // ── Arpeggiator ──
-// Options: sArpOptions (process-lifetime atomics) plus the running synth's copy under the user
-// lock. Absent keys and keys of the wrong number type are left unchanged; an unknown `mode` /
-// `rate` (or a non-string / non-array where one is expected) rejects the whole call.
+// Options: sArpOptions, the process-lifetime store the running synth reads every block (no lock,
+// works before setup). Absent keys and keys of the wrong number type are left unchanged; an
+// unknown `mode` / `rate`, a non-string / non-array where one is expected, or a `pattern` that is
+// not 1–16 booleans rejects the whole call (NO, nothing applied).
 
 - (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options {
     ArpSettings s = sArpOptions.get();
@@ -1251,17 +1254,16 @@ static NSString *backingTrackPath(NSString *uri) {
     if (pattern != nil) {
         if (![pattern isKindOfClass:[NSArray class]]) return NO;
         NSArray *steps = (NSArray *)pattern;
-        const int length = (int)std::min<NSUInteger>(steps.count, 16);
-        if (length > 0) {
-            uint16_t mask = 0;
-            for (int i = 0; i < length; ++i) {
-                id step = steps[(NSUInteger)i];
-                const bool on = [step isKindOfClass:[NSNumber class]] ? [(NSNumber *)step boolValue] : false;
-                if (on) mask |= (uint16_t)(1u << i);
-            }
-            s.patternMask = mask;
-            s.patternLength = length;
+        if (steps.count < 1 || steps.count > 16) return NO;
+        const int length = (int)steps.count;
+        uint16_t mask = 0;
+        for (int i = 0; i < length; ++i) {
+            id step = steps[(NSUInteger)i];
+            if (![step isKindOfClass:[NSNumber class]]) return NO;
+            if ([(NSNumber *)step boolValue]) mask |= (uint16_t)(1u << i);
         }
+        s.patternMask = mask;
+        s.patternLength = length;
     }
     if (NSNumber *v = numberFrom(options, @"enabled")) s.enabled = v.boolValue;
     if (NSNumber *v = numberFrom(options, @"latch")) s.latch = v.boolValue;
@@ -1272,9 +1274,7 @@ static NSString *backingTrackPath(NSString *uri) {
     if (NSNumber *v = numberFrom(options, @"ratchet")) s.ratchet = (int)std::lround(v.doubleValue);
     if (NSNumber *v = numberFrom(options, @"transposeSteps")) s.transposeSteps = (int)std::lround(v.doubleValue);
     if (NSNumber *v = numberFrom(options, @"transposeDistance")) s.transposeDistance = (int)std::lround(v.doubleValue);
-    sArpOptions.set(s); // clamps
-    const ArpSettings stored = sArpOptions.get();
-    withSynth(self, ^(PolySynthProcessor *synth) { synth->arp().setSettings(stored); });
+    sArpOptions.set(s); // clamps; the synth's next block reads it
     return YES;
 }
 

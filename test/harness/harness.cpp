@@ -546,6 +546,32 @@ static bool runRebuildState() {
     newSynth.processBlock(buf, midi);
     const bool continuesOk = newTransport.getPosition() > 7.5 && newTransport.getPosition() < 7.6;
 
+    // The note queue outlives the synth. After an allNotesOff on it, a synth built later and
+    // attached to it must take the queue's current all-released mark as already applied, not as
+    // new: otherwise its first enabled block flushes the chord it drained in that same block.
+    bool arpRebuildOk = false;
+    {
+        NoteEventQueue sharedQueue;
+        ArpSettings a = ArpSettings::defaults();
+        a.enabled = true; a.mode = ArpMode::Chord; a.gate = 1.0f;
+        TransportEngine t1;
+        PolySynthProcessor s1;
+        s1.setTransport(&t1); s1.setNoteQueue(&sharedQueue);
+        s1.setRateAndBufferSizeDetails(48000, 256); s1.prepareToPlay(48000, 256);
+        s1.arp().setSettings(a);
+        s1.noteOn(60, 100); s1.processBlock(buf, midi);
+        s1.allNotesOff(); s1.processBlock(buf, midi); // the mark advances, the list is cleared
+        const bool clearedOk = !s1.arp().isActive() && s1.arp().heldCount() == 0;
+        TransportEngine t2;
+        PolySynthProcessor s2;
+        s2.setTransport(&t2); s2.setNoteQueue(&sharedQueue);
+        s2.setRateAndBufferSizeDetails(48000, 256); s2.prepareToPlay(48000, 256);
+        s2.arp().setSettings(a);
+        s2.noteOn(60, 100); s2.noteOn(64, 100); s2.noteOn(67, 100);
+        for (int b = 0; b < 4; ++b) s2.processBlock(buf, midi);
+        arpRebuildOk = clearedOk && s2.arp().isActive() && s2.arp().heldCount() == 3 && s2.diag.activeVoices.load() == 3;
+    }
+
     // Effects: the engine keeps one FxParamStore for the process and attaches it to each new
     // FxChainProcessor, so a rebuilt chain renders exactly like the old one did. Checked: the
     // string API (clamping, rounding, unknown id / param / NaN rejected), snapshot / apply
@@ -589,10 +615,10 @@ static bool runRebuildState() {
         }
     }
     const bool fxOk = fxStateOk && fxRenderOk;
-    const bool ok = synthOk && transportOk && continuesOk && fxOk;
-    std::printf("rs    rebuild carry-over (settings + arp, tempo 90, playing, pending seek, fx)  %-4s synth %d transport %d"
-                " continues %d (pos %.4f) fx state %d fx render %d\n", ok ? "PASS" : "FAIL",
-                synthOk, transportOk, continuesOk, newTransport.getPosition(), fxStateOk, fxRenderOk);
+    const bool ok = synthOk && transportOk && continuesOk && fxOk && arpRebuildOk;
+    std::printf("rs    rebuild carry-over (settings + arp, tempo 90, playing, pending seek, fx, arp + shared queue)  %-4s synth %d"
+                " transport %d continues %d (pos %.4f) fx state %d fx render %d arp rebuild %d\n", ok ? "PASS" : "FAIL",
+                synthOk, transportOk, continuesOk, newTransport.getPosition(), fxStateOk, fxRenderOk, arpRebuildOk);
     std::fflush(stdout);
     return ok;
 }
@@ -2083,6 +2109,19 @@ static bool runArp() {
         const auto rec = runArpBlocks(arp, 12100, b256, 120.0, false, 0.0, allocs);
         check(arpOnTimes(rec) == std::vector<int64_t>{0, 6000, 12000} && arpOffTimes(rec).empty(),
               "legato: offs " + arpList(arpOffTimes(rec)));
+    }
+    // Swing while the transport plays, across block boundaries: 1/32 at 200 bpm (L = 1800), swing
+    // 0.45 (odd steps + 810), in 1024- and 471-sample blocks. Every step fires exactly once, in
+    // order, the odd ones at the swung offset: a grid line that passed near the end of a block
+    // while its swung offset lies in the next block is still due there, not a transport jump.
+    for (int blockSize : {1024, 471}) {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.rate = ArpRate::ThirtySecond; s.swing = 0.45f; s.gate = 0.3f;
+        settle(arp, s, {60});
+        const auto on = arpOnTimes(runArpBlocks(arp, 40 * 1800 + 100, std::vector<int>{blockSize}, 200.0, true, 0.0, allocs));
+        std::vector<int64_t> want;
+        for (int k = 0; k <= 40; ++k) want.push_back((int64_t)k * 1800 + ((k & 1) ? 810 : 0));
+        check(on == want, "swing playing " + std::to_string(blockSize) + ": " + std::to_string(on.size()) + " hits " + arpList(on, 8));
     }
     // Settings: clamping, defaults, enabled/disabled reads.
     {

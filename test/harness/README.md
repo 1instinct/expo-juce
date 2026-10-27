@@ -57,14 +57,17 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   off for every sounding note in that block and clears; a tap released before the first grid
   line plays nothing; allNotesOff stops and clears a latched list; a tempo change 120 → 60 puts
   the next step 12000 after the previous; pattern bits beyond `length` are ignored; same-note
-  legato (gate 1.5) drops the superseded off; clamping / defaults / name tables; 0 allocations
+  legato (gate 1.5) drops the superseded off; playing at 1/32, 200 bpm, swing 0.45 in 1024- and
+    471-sample blocks every step fires once, in order, odd ones at the swung offset; clamping /
+    defaults / name tables; 0 allocations
   in every `process`), `arpv` (through `PolySynthProcessor`, square wave, attack / release 1 ms,
   gate 0.5, 471-sample blocks: every step's onset is on sample `k × 6000` + the attack's rise to
   0.01, the output is exactly 0 for the 1000 samples before each later step, 16 held notes in
   `chord` mode sound on 16 voices, disabling mid-gate silences the output within that block and
   a later player note-off of the arp note is harmless, enabling leaves a directly played voice
   sounding until its release; 0 allocations). `rs` also round-trips the arp settings through
-  `SynthSettings`.
+  `SynthSettings`, and checks that a synth attached to a shared note queue after an allNotesOff on it
+  keeps the chord it drains in its first block (the queue's mark counts as already applied).
 - Spectrum (`ios/SpectrumAnalyser.h`, pure C++): `sp` (a full-scale 1 kHz sine reads ≥ 0.95 in
   its band, 800–1027 Hz at 48 kHz, and ≤ 0.6 two bands away; a full-scale sine on a bin centre in
   that band reads ≥ 0.99 with both neighbours ≤ 0.6 (a tone between bins spills its Hann main

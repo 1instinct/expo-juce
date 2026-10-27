@@ -250,7 +250,8 @@ ExpoJuce.ARP_DEFAULTS;                        // the defaults below
 ```
 
 - Options (`ArpOptions`, omitted keys keep their value, numbers are clamped; `setArpeggiator`
-  returns `false` and applies nothing for an unknown `mode` / `rate`):
+  returns `false` and applies nothing for an unknown `mode` / `rate` or a `pattern` that is not
+  1–16 booleans):
   - `enabled` (false)
   - `mode` ('up'): `'up'` held notes ascending, `'down'`, `'upDown'` (up, then the interior
     reversed: `[60, 64, 72, 76]` → `60 64 72 76 72 64`), `'played'` (press order), `'random'`
@@ -262,7 +263,8 @@ ExpoJuce.ARP_DEFAULTS;                        // the defaults below
     (legato; a one-note cycle retriggers the same voice)
   - `swing` 0–0.5 of a step (0): odd steps start that much later
   - `latch` (false): the list is kept when every note is released; the next press replaces it
-  - `pattern` 1–16 booleans (16 × true): a false step is a rest and does not advance the cycle
+  - `pattern` 1–16 booleans (16 × true), all or nothing: a false step is a rest and does not
+    advance the cycle
   - `accent` 0–1 (0): steps other than the first of the pattern play at
     velocity × (1 − 0.6 × accent)
   - `ratchet` 1–4 (1): hits per step, each with `gate` of its share
@@ -277,8 +279,9 @@ ExpoJuce.ARP_DEFAULTS;                        // the defaults below
   while it plays takes effect at the next step. `allNotesOff()` stops the arp and clears its
   list (a latched list included). Disabling stops the sounding arp notes at once.
 - 16 voices (`MAX_VOICES`), so a 16-note `chord` or ratchets with long releases do not steal.
-- Options are kept natively for the life of the app: they work before `setup()` and survive
-  engine rebuilds. Binaries older than 0.7.0: `setArpeggiator` returns `false`,
+- Options are kept natively for the life of the app in one store the synth reads once per block:
+  they work before `setup()`, survive engine rebuilds and apply within a block even while a
+  rebuild is in progress. Binaries older than 0.7.0: `setArpeggiator` returns `false`,
   `getArpeggiatorState` returns `ARP_DEFAULTS`. Web: the same.
 
 ### Analysis (0.6.0+)

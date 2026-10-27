@@ -241,8 +241,8 @@ export function getAnalysis(): Analysis {
 export { ARP_DEFAULTS };
 
 // Sets any subset of the options (omitted keys keep their value; numbers are clamped; `pattern`
-// is 1–16 booleans). Returns false, applying nothing, for an unknown `mode` / `rate` or a binary
-// without an arpeggiator. Disabling stops the arp's sounding notes at once.
+// is 1–16 booleans, all or nothing). Returns false, applying nothing, for an unknown `mode` /
+// `rate`, a `pattern` that is not 1–16 booleans, or a binary without an arpeggiator. Disabling stops the arp's sounding notes at once.
 export function setArpeggiator(options: Partial<ArpOptions>): boolean {
   if (typeof ExpoJuceModule?.setArpeggiator !== 'function') return false;
   return ExpoJuceModule.setArpeggiator(options) === true;

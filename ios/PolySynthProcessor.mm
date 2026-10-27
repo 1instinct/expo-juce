@@ -5,6 +5,7 @@
 PolySynthProcessor::PolySynthProcessor()
     : AudioProcessor(BusesProperties()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)) {
+    lastAllReleasedSeen = queue->allReleasedMark();
 }
 
 void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
@@ -41,8 +42,10 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // the voices. Then releases: every held voice whose note-on is at or below its release mark
     // stops (see NoteEventQueue; arp voices have startSeq 0 and are not affected), and the arp
     // drops the held notes the player released. Applied every block, so a release sent while
-    // the device was stopped or reopening takes effect on the first block after it.
-    if (arpeggiator.isEnabled()) {
+    // the device was stopped or reopening takes effect on the first block after it. The arp's
+    // options are snapshotted once here and hold for the whole block.
+    const ArpSettings& arpNow = arpeggiator.beginBlock();
+    if (arpNow.enabled) {
         queue->drainNoteOns([this](const NoteEvent& event) {
             arpeggiator.noteOn(event.note, event.velocity, event.seq);
             recordNoteLatency(event);

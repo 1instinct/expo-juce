@@ -100,51 +100,65 @@ struct ArpSettings {
     bool operator!=(const ArpSettings& o) const { return !(*this == o); }
 };
 
-// The options as atomics: written from any thread (clamped), read by the audio thread once per
-// block. The Arpeggiator embeds one; the engine keeps another for the life of the process so
-// setArpeggiator works before setup and across rebuilds (AuxSettingsStore does the same).
+// The options as one struct behind a seqlock. Writers (control threads, never the audio thread)
+// are serialised by a spinlock and clamp; the audio thread copies the whole struct once per block
+// (Arpeggiator::beginBlock) and, if a write overlapped the copy, keeps its previous snapshot: no
+// lock, no spin and no mixed old / new fields on the audio thread. The Arpeggiator has its own;
+// the engine keeps one for the life of the process and attaches it to every synth it builds
+// (Arpeggiator::setSettingsStore), so setArpeggiator works before setup, across rebuilds and
+// while a rebuild is in progress (AuxSettingsStore does the same for the aux node).
 struct ArpSettingsStore {
     static float clampFinite(float v, float lo, float hi, float fallback) {
         return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
     }
-
-    void set(const ArpSettings& s) {
-        const auto r = std::memory_order_relaxed;
-        enabled.store(s.enabled, r);
-        mode.store(std::clamp((int)s.mode, 0, kArpModeCount - 1), r);
-        rate.store(std::clamp((int)s.rate, 0, kArpRateCount - 1), r);
-        octaves.store(std::clamp(s.octaves, 1, 4), r);
-        gate.store(clampFinite(s.gate, 0.05f, 1.5f, 0.6f), r);
-        swing.store(clampFinite(s.swing, 0.0f, 0.5f, 0.0f), r);
-        latch.store(s.latch, r);
-        patternMask.store((int)s.patternMask & 0xFFFF, r);
-        patternLen.store(std::clamp(s.patternLength, 1, 16), r);
-        accent.store(clampFinite(s.accent, 0.0f, 1.0f, 0.0f), r);
-        ratchet.store(std::clamp(s.ratchet, 1, 4), r);
-        transposeSteps.store(std::clamp(s.transposeSteps, 0, 8), r);
-        transposeDistance.store(std::clamp(s.transposeDistance, -12, 12), r);
+    static ArpSettings clamped(const ArpSettings& s) {
+        ArpSettings c = s;
+        c.mode = (ArpMode)std::clamp((int)s.mode, 0, kArpModeCount - 1);
+        c.rate = (ArpRate)std::clamp((int)s.rate, 0, kArpRateCount - 1);
+        c.octaves = std::clamp(s.octaves, 1, 4);
+        c.gate = clampFinite(s.gate, 0.05f, 1.5f, 0.6f);
+        c.swing = clampFinite(s.swing, 0.0f, 0.5f, 0.0f);
+        c.patternMask = (uint16_t)(s.patternMask & 0xFFFF);
+        c.patternLength = std::clamp(s.patternLength, 1, 16);
+        c.accent = clampFinite(s.accent, 0.0f, 1.0f, 0.0f);
+        c.ratchet = std::clamp(s.ratchet, 1, 4);
+        c.transposeSteps = std::clamp(s.transposeSteps, 0, 8);
+        c.transposeDistance = std::clamp(s.transposeDistance, -12, 12);
+        return c;
     }
 
+    // Control threads only (spins while another writer is inside; a write is a struct copy).
+    void set(const ArpSettings& in) {
+        const ArpSettings s = clamped(in);
+        bool free = false;
+        while (!writing.compare_exchange_weak(free, true, std::memory_order_acquire)) free = false;
+        seq.fetch_add(1, std::memory_order_acq_rel); // odd: a write is in progress
+        value = s;
+        seq.fetch_add(1, std::memory_order_release);
+        writing.store(false, std::memory_order_release);
+    }
+
+    // Any thread, never blocks: false if a write was in progress or overlapped the copy (`out`
+    // is then unspecified and the caller keeps what it had).
+    bool tryGet(ArpSettings& out) const {
+        const uint32_t s1 = seq.load(std::memory_order_acquire);
+        if (s1 & 1u) return false;
+        out = value;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return seq.load(std::memory_order_relaxed) == s1;
+    }
+
+    // Control threads: the current options (retries while a write is in progress).
     ArpSettings get() const {
-        const auto r = std::memory_order_relaxed;
-        return { enabled.load(r), (ArpMode)mode.load(r), (ArpRate)rate.load(r), octaves.load(r), gate.load(r),
-                 swing.load(r), latch.load(r), (uint16_t)patternMask.load(r), patternLen.load(r), accent.load(r),
-                 ratchet.load(r), transposeSteps.load(r), transposeDistance.load(r) };
+        ArpSettings s;
+        while (!tryGet(s)) {}
+        return s;
     }
 
-    std::atomic<bool> enabled{false};
-    std::atomic<int> mode{(int)ArpMode::Up};
-    std::atomic<int> rate{(int)ArpRate::Sixteenth};
-    std::atomic<int> octaves{1};
-    std::atomic<float> gate{0.6f};
-    std::atomic<float> swing{0.0f};
-    std::atomic<bool> latch{false};
-    std::atomic<int> patternMask{0xFFFF};
-    std::atomic<int> patternLen{16};
-    std::atomic<float> accent{0.0f};
-    std::atomic<int> ratchet{1};
-    std::atomic<int> transposeSteps{0};
-    std::atomic<int> transposeDistance{0};
+private:
+    ArpSettings value = ArpSettings::defaults();
+    std::atomic<uint32_t> seq{0};
+    std::atomic<bool> writing{false};
 };
 
 // One event for the processor: at `sampleOffset` of the current block, start (`on`) or stop
@@ -164,17 +178,31 @@ public:
     static constexpr int kMaxPending = 128;
     static constexpr int kMaxEvents = 1024;
 
-    // ── Options (any thread; atomics, clamped: see ArpSettingsStore) ──
+    // ── Options ──
+    // Live in a store: the arpeggiator's own by default, or the one passed to setSettingsStore
+    // (the engine's process-lifetime store; set before the synth renders). The audio thread
+    // snapshots the store once per block (beginBlock) and uses that snapshot for the whole block.
 
-    void setSettings(const ArpSettings& s) { opts.set(s); }
-    ArpSettings getSettings() const { return opts.get(); }
-    bool isEnabled() const { return opts.enabled.load(std::memory_order_relaxed); }
+    void setSettingsStore(ArpSettingsStore* s) { store = s ? s : &ownStore; }
+    void setSettings(const ArpSettings& s) { store->set(s); }
+    ArpSettings getSettings() const { return store->get(); }
 
     // ── Audio thread ──
 
-    // A drained note-on. Ignored while disabled (the processor plays those notes directly).
+    // Takes this block's settings snapshot (kept from the last block if a write is in progress)
+    // and returns it. The processor calls it first thing; process() calls it if it was not.
+    const ArpSettings& beginBlock() {
+        ArpSettings next;
+        if (store->tryGet(next)) cur = next;
+        snapshotFresh = true;
+        return cur;
+    }
+    // This block's snapshot.
+    bool isEnabled() const { return cur.enabled; }
+
+    // A drained note-on; the processor routes them here only while the block's snapshot is
+    // enabled. A 17th distinct note is dropped (counted in eventsDropped).
     void noteOn(int note, int velocity, uint64_t seq) {
-        if (!isEnabled()) return;
         note = std::clamp(note, 0, 127);
         velocity = std::clamp(velocity, 1, 127);
         if (latchedAll) { numHeld = 0; latchedAll = false; running = false; }
@@ -183,7 +211,7 @@ public:
         for (; i < numHeld; ++i)
             if (held[i].note == note) break;
         if (i == numHeld) {
-            if (numHeld >= kMaxHeld) return;
+            if (numHeld >= kMaxHeld) { eventsDropped.fetch_add(1, std::memory_order_relaxed); return; }
             ++numHeld;
         }
         held[i] = { note, velocity, seq, false };
@@ -199,7 +227,7 @@ public:
     // NoteEventQueue::isReleased). Latched: the entries stay until the next press replaces them.
     template <typename Pred>
     void releaseHeld(Pred&& isReleased) {
-        const bool latching = opts.latch.load(std::memory_order_relaxed);
+        const bool latching = cur.latch;
         int kept = 0;
         for (int i = 0; i < numHeld; ++i) {
             HeldNote h = held[i];
@@ -223,8 +251,10 @@ public:
     void process(double blockStartBeat, double bpm, bool playing, double sampleRate, int numSamples, Sink&& sink) {
         eventCount = 0;
         if (numSamples <= 0) return;
-        const auto r = std::memory_order_relaxed;
-        const bool on = opts.enabled.load(r);
+        if (!snapshotFresh) beginBlock();
+        snapshotFresh = false;
+        const ArpSettings& s = cur;
+        const bool on = s.enabled;
         if (!on || flushRequested) {
             flush();
             flushRequested = false;
@@ -232,7 +262,7 @@ public:
             emit(sink);
             return;
         }
-        if (!opts.latch.load(r) && latchedAll) {
+        if (!s.latch && latchedAll) {
             // Latch turned off while holding: the released entries go.
             int kept = 0;
             for (int i = 0; i < numHeld; ++i)
@@ -268,10 +298,10 @@ public:
         }
 
         if (running && bpm > 0.0 && sampleRate > 0.0) {
-            const int spb12 = kArpStepsPerBeat12[std::clamp(opts.rate.load(r), 0, kArpRateCount - 1)];
+            const int spb12 = kArpStepsPerBeat12[std::clamp((int)s.rate, 0, kArpRateCount - 1)];
             const double spb = spb12 / 12.0;
             const double L = 60.0 / bpm / spb * sampleRate;
-            const float sw = opts.swing.load(r);
+            const float sw = s.swing;
             if (!anchored || playing != wasPlaying) {
                 if (playing) anchorToGrid(blockStartBeat, spb12);
                 else { haveLastGrid = haveFired; lastGridIn = -samplesSinceGrid; }
@@ -280,20 +310,23 @@ public:
             wasPlaying = playing;
             bool firedThisBlock = false;
             for (int guard = 0; guard < 4096; ++guard) {
+                const double swingOff = (stepIndex & 1) ? sw * L : 0.0;
                 double g; // offset of the next grid line from the block start, samples
                 if (playing) {
                     g = (gridBeat(spb12) - blockStartBeat) * 60.0 / bpm * sampleRate;
-                    if (g < -1.0 || g > numSamples + 2.0 * L + 1.0) { // the transport moved
+                    // The transport moved. The swung offset is what must still be ahead: an odd
+                    // step whose line passed in the previous block is due here, not a jump.
+                    if (g + swingOff < -1.0 || g > numSamples + 2.0 * L + 1.0) {
                         anchorToGrid(blockStartBeat, spb12);
                         g = (gridBeat(spb12) - blockStartBeat) * 60.0 / bpm * sampleRate;
                     }
                 } else {
                     g = haveLastGrid ? lastGridIn + L : 0.0;
                 }
-                const double e = g + ((stepIndex & 1) ? sw * L : 0.0);
+                const double e = g + swingOff;
                 const long eo = std::lround(e);
                 if (eo >= numSamples) break;
-                fireStep(std::max(0.0, e), L, numSamples, r);
+                fireStep(std::max(0.0, e), L, numSamples);
                 if (playing) ++gridIndex;
                 else { lastGridIn = g; haveLastGrid = true; }
                 samplesSinceGrid = numSamples - g;
@@ -312,7 +345,7 @@ public:
     // ── State (audio thread writes; relaxed reads from the processor for the analysis publish) ──
 
     int currentStep() const { return curStep; }
-    int patternLength() const { return opts.patternLen.load(std::memory_order_relaxed); }
+    int patternLength() const { return cur.patternLength; }
     int lastNote() const { return lastNoteStarted; }
     // Enabled and holding (or latched) notes: a step is sounding or coming.
     bool isActive() const { return isEnabled() && running && numHeld > 0; }
@@ -371,25 +404,26 @@ private:
         gridIndex = (x - prev <= 0.25) ? (int64_t)prev : (int64_t)std::ceil(x - 1e-9);
     }
 
-    void fireStep(double at, double L, int numSamples, std::memory_order r) {
-        const int length = std::clamp(opts.patternLen.load(r), 1, 16);
+    void fireStep(double at, double L, int numSamples) {
+        const ArpSettings& s = cur;
+        const int length = std::clamp(s.patternLength, 1, 16);
         const int slot = (int)(stepIndex % length);
         curStep = slot;
-        const bool slotOn = ((opts.patternMask.load(r) >> slot) & 1) != 0;
+        const bool slotOn = ((s.patternMask >> slot) & 1) != 0;
         if (slotOn) {
-            const int tSteps = opts.transposeSteps.load(r);
+            const int tSteps = s.transposeSteps;
             const int64_t pass = stepIndex / length;
-            const int transpose = tSteps > 0 ? (int)(pass % (tSteps + 1)) * opts.transposeDistance.load(r) : 0;
-            const float velScale = slot != 0 ? 1.0f - 0.6f * opts.accent.load(r) : 1.0f;
-            const int hits = std::clamp(opts.ratchet.load(r), 1, 4);
+            const int transpose = tSteps > 0 ? (int)(pass % (tSteps + 1)) * s.transposeDistance : 0;
+            const float velScale = slot != 0 ? 1.0f - 0.6f * s.accent : 1.0f;
+            const int hits = std::clamp(s.ratchet, 1, 4);
             const double hitLen = L / hits;
-            const int gateSamples = std::max(1, (int)std::lround(opts.gate.load(r) * hitLen));
-            const ArpMode m = (ArpMode)opts.mode.load(r);
+            const int gateSamples = std::max(1, (int)std::lround(s.gate * hitLen));
+            const ArpMode m = s.mode;
             if (m == ArpMode::Chord) {
                 for (int i = 0; i < numHeld; ++i)
                     hit(at, hitLen, hits, gateSamples, held[i].note + transpose, held[i].velocity, velScale, numSamples);
             } else {
-                buildCycle(m, opts.octaves.load(r));
+                buildCycle(m, s.octaves);
                 if (cycleLen > 0) {
                     int idx = (int)(onSteps % cycleLen);
                     if (m == ArpMode::Random) idx = rng.nextInt(cycleLen);
@@ -497,8 +531,11 @@ private:
         eventCount = 0;
     }
 
-    // Options (any thread).
-    ArpSettingsStore opts;
+    // Options: the store (any thread) and this block's snapshot (audio thread).
+    ArpSettingsStore ownStore;
+    ArpSettingsStore* store = &ownStore;
+    ArpSettings cur = ArpSettings::defaults();
+    bool snapshotFresh = false;
 
     // Audio thread.
     HeldNote held[kMaxHeld] = {};

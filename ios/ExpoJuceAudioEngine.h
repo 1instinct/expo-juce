@@ -75,7 +75,7 @@ typedef void(^BeatCallback)(double beat, double bpm);
 // enabled, mode ("up" | "down" | "upDown" | "played" | "random" | "chord"), rate ("1/4" | "1/8" |
 // "1/8T" | "1/8D" | "1/16" | "1/16T" | "1/32"), octaves 1–4, gate 0.05–1.5, swing 0–0.5, latch,
 // pattern (1–16 booleans), accent 0–1, ratchet 1–4, transposeSteps 0–8, transposeDistance −12..12.
-- (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options; // NO (nothing applied): unknown mode / rate
+- (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options; // NO (nothing applied): unknown mode / rate, pattern not 1–16 booleans
 // Every option as stored (pattern as an array of `length` booleans).
 - (NSDictionary<NSString *, id> *)arpeggiatorState;
 
