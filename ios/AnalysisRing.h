@@ -78,6 +78,17 @@ public:
         }
     }
 
+    // Any thread: the most recent kSize samples, oldest first (the spectrum's input).
+    void readRaw(float* out) const {
+        const uint32_t end = writeCount.load(std::memory_order_acquire);
+        for (int j = 0; j < kSize; ++j)
+            out[j] = ring[(end - (uint32_t)kSize + (uint32_t)j) % kSize].load(std::memory_order_relaxed);
+    }
+
+    // Control side (GraphPlayer::audioDeviceAboutToStart): the device rate the ring is written at.
+    void setSampleRate(double rate) { sampleRateValue.store(rate, std::memory_order_relaxed); }
+    double sampleRate() const { return sampleRateValue.load(std::memory_order_relaxed); }
+
     // One reader (getAnalysis): max |x| and RMS (all channels) of everything written since the
     // previous call; 0 if nothing was written since.
     struct Levels { float peak; float rms; };
@@ -117,5 +128,6 @@ private:
     std::atomic<int> arpStepsValue{16};
     std::atomic<int> arpNoteValue{-1};
     std::atomic<bool> arpActiveValue{false};
+    std::atomic<double> sampleRateValue{48000.0};
     std::atomic<bool> active{false};
 };

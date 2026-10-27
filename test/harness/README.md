@@ -65,6 +65,14 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   a later player note-off of the arp note is harmless, enabling leaves a directly played voice
   sounding until its release; 0 allocations). `rs` also round-trips the arp settings through
   `SynthSettings`.
+- Spectrum (`ios/SpectrumAnalyser.h`, pure C++): `sp` (a full-scale 1 kHz sine reads ≥ 0.95 in
+  its band, 800–1027 Hz at 48 kHz, and ≤ 0.6 two bands away; a full-scale sine on a bin centre in
+  that band reads ≥ 0.99 with both neighbours ≤ 0.6 (a tone between bins spills its Hann main
+  lobe into the adjacent band, about 0.8, so sidelobe leakage is checked on a bin-centred tone);
+  −60 dBFS → ≤ 0.05; silence → exactly 0; 60 Hz reads ≥ 0.9 in band 0 (one bin wide) and 70 Hz
+  ≥ 0.95 in band 1; the edge table is strictly increasing with every band at least one bin wide
+  at 48000 and 44100 Hz; `AnalysisRing::readRaw` is oldest-first and `GraphPlayer` publishes the
+  device rate into the ring; `analyse` does not allocate).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

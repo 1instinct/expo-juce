@@ -13,6 +13,7 @@
 #include "BackingTrack.h"
 #include "AnalysisRing.h"
 #include "Arpeggiator.h"
+#include "SpectrumAnalyser.h"
 
 #include <atomic>
 #include <chrono>
@@ -2230,6 +2231,115 @@ static bool runArpVoices() {
     return pass;
 }
 
+//==============================================================================
+// Spectrum (ios/SpectrumAnalyser.h): 24 log-spaced bands from 2048 mono samples, 0..1 for
+// −60..0 dBFS of the loudest bin in the band. A full-scale 1 kHz sine reads ≥ 0.95 in its band
+// (800–1027 Hz at 48 kHz) and ≤ 0.6 two bands away; a full-scale sine on a bin centre inside that
+// band (914.06 Hz) reads ≥ 0.99 and ≤ 0.6 in both neighbours (a tone straddling bins spills its
+// main lobe into the adjacent band, so only sidelobes are checked there); −60 dBFS → ≤ 0.05;
+// silence → exactly 0 everywhere; 60 Hz reads ≥ 0.9 in band 0 (40–63.4 Hz) and 70 Hz ≥ 0.95 in
+// band 1 (louder than band 0), with nothing above 0.6 from band 3 up; the edge table is strictly
+// increasing, every band at least one bin wide, 40 Hz to 16 kHz, at 48000 and 44100 Hz; the
+// readRaw copy of the AnalysisRing is oldest-first; analyse() does not allocate.
+static bool runSpectrum() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    SpectrumAnalyser analyser;
+    std::vector<float> mono((size_t)SpectrumAnalyser::kSize, 0.0f);
+    float bands[SpectrumAnalyser::kBands];
+    float edges[SpectrumAnalyser::kBands + 1];
+    SpectrumAnalyser::bandEdges(sr, edges);
+    auto bandOf = [&](double hz) {
+        for (int i = 0; i < SpectrumAnalyser::kBands; ++i)
+            if (hz >= edges[i] && hz < edges[i + 1]) return i;
+        return -1;
+    };
+    auto tone = [&](double hz, double amplitude) {
+        for (int i = 0; i < SpectrumAnalyser::kSize; ++i)
+            mono[(size_t)i] = (float)(amplitude * std::sin(juce::MathConstants<double>::twoPi * hz * i / sr));
+    };
+    auto fmt = [](float v) { char b[16]; std::snprintf(b, sizeof b, "%.3f", v); return std::string(b); };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    auto analyse = [&] {
+        tCountAllocs = true;
+        analyser.analyse(mono.data(), sr, bands);
+        tCountAllocs = false;
+    };
+    // 1 kHz full scale.
+    tone(1000.0, 1.0);
+    analyse();
+    const int b1k = bandOf(1000.0);
+    check(b1k == 12 && edges[12] < 801.0 && edges[13] > 1026.0 && edges[13] < 1028.0, "1 kHz band index " + std::to_string(b1k));
+    check(bands[b1k] >= 0.95f, "1 kHz band " + fmt(bands[b1k]));
+    check(bands[b1k - 2] <= 0.6f && bands[b1k + 2] <= 0.6f, "1 kHz two bands away " + fmt(bands[b1k - 2]) + "/" + fmt(bands[b1k + 2]));
+    check(bands[b1k - 1] < bands[b1k] && bands[b1k + 1] < bands[b1k], "1 kHz neighbours below");
+    detail += " 1k:" + fmt(bands[b1k - 1]) + "/" + fmt(bands[b1k]) + "/" + fmt(bands[b1k + 1]);
+    // On a bin centre inside the same band: full scale, only sidelobes leak.
+    tone(39.0 * sr / SpectrumAnalyser::kSize, 1.0);
+    analyse();
+    check(bands[12] >= 0.99f && bands[11] <= 0.6f && bands[13] <= 0.6f,
+          "914 Hz " + fmt(bands[11]) + "/" + fmt(bands[12]) + "/" + fmt(bands[13]));
+    // −60 dBFS and silence.
+    tone(1000.0, 0.001);
+    analyse();
+    check(bands[12] <= 0.05f, "-60 dBFS " + fmt(bands[12]));
+    std::fill(mono.begin(), mono.end(), 0.0f);
+    analyse();
+    bool allZero = true;
+    for (float v : bands) allZero = allZero && v == 0.0f;
+    check(allZero, "silence");
+    // Low bands are one bin wide at 48 kHz: 60 Hz in band 0, 70 Hz in band 1.
+    tone(60.0, 1.0);
+    analyse();
+    bool quietAbove = true;
+    for (int i = 3; i < SpectrumAnalyser::kBands; ++i) quietAbove = quietAbove && bands[i] <= 0.6f;
+    check(bandOf(60.0) == 0 && bands[0] >= 0.9f && quietAbove, "60 Hz band 0 " + fmt(bands[0]) + " band 1 " + fmt(bands[1]));
+    tone(70.0, 1.0);
+    analyse();
+    quietAbove = true;
+    for (int i = 3; i < SpectrumAnalyser::kBands; ++i) quietAbove = quietAbove && bands[i] <= 0.6f;
+    check(bandOf(70.0) == 1 && bands[1] >= 0.95f && bands[0] < bands[1] && quietAbove,
+          "70 Hz band 0 " + fmt(bands[0]) + " band 1 " + fmt(bands[1]));
+    // Edge table at 48000 and 44100.
+    for (double rate : {48000.0, 44100.0}) {
+        float e[SpectrumAnalyser::kBands + 1];
+        SpectrumAnalyser::bandEdges(rate, e);
+        const double bin = rate / SpectrumAnalyser::kSize;
+        bool ok = e[0] == 40.0f && e[SpectrumAnalyser::kBands] == 16000.0f;
+        for (int i = 1; i <= SpectrumAnalyser::kBands; ++i) ok = ok && e[i] > e[i - 1] && e[i] - e[i - 1] >= bin - 1e-3;
+        // The first bands follow the bin (one bin wide) until the geometric spacing overtakes.
+        ok = ok && std::fabs(e[1] - (40.0 + bin)) < 1e-3 && e[23] > 12000.0f;
+        check(ok, "edges at " + std::to_string((int)rate));
+    }
+    // AnalysisRing::readRaw: the last kSize samples, oldest first.
+    {
+        AnalysisRing ring;
+        std::vector<float> ramp(5000);
+        for (int i = 0; i < 5000; ++i) ramp[(size_t)i] = (float)i;
+        const float* channels[1] = { ramp.data() };
+        ring.write(channels, 1, 5000);
+        std::vector<float> raw((size_t)AnalysisRing::kSize);
+        ring.readRaw(raw.data());
+        bool ok = true;
+        for (int i = 0; i < AnalysisRing::kSize; ++i) ok = ok && raw[(size_t)i] == (float)(5000 - AnalysisRing::kSize + i);
+        check(ok, "readRaw order");
+        // GraphPlayer tells the ring the device rate when the device starts.
+        GraphPlayer player;
+        player.setAnalysis(&ring);
+        FakeDevice device(44100, 256);
+        player.audioDeviceAboutToStart(&device);
+        check(ring.sampleRate() == 44100.0, "ring sample rate from the device");
+    }
+    const uint64_t allocs = gRenderAllocs.load() + gRenderFrees.load();
+    const bool pass = failures == 0 && allocs == 0;
+    std::printf("sp    spectrum: 24 bands, 1 kHz / bin-centred / -60 dBFS / silence / 60 + 70 Hz, edge table, readRaw  %-4s"
+                " %d failed checks%s allocs %llu\n", pass ? "PASS" : "FAIL", failures, detail.c_str(), (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the case named on the command line runs (none: every case).
 static const char* gOnlyCase = nullptr;
 static bool want(const char* id) { return gOnlyCase == nullptr || std::strcmp(gOnlyCase, id) == 0; }
@@ -2316,6 +2426,7 @@ int main(int argc, char** argv) {
     if (want("an")) unexpected += runAnalysis() ? 0 : 1;
     if (want("arp")) unexpected += runArp() ? 0 : 1;
     if (want("arpv")) unexpected += runArpVoices() ? 0 : 1;
+    if (want("sp")) unexpected += runSpectrum() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");
