@@ -205,10 +205,13 @@ const emptyAnalysis = (): Analysis => ({
   peak: 0,
   rms: 0,
   scope: new Array(128).fill(0),
+  bands: new Array(24).fill(0),
+  sampleRate: 0,
   lastNote: -1,
   bpm: 120,
   beat: 0,
   playing: false,
+  arp: { active: false, step: 0, steps: 16, note: -1 },
 });
 
 // Output level (peak hold and RMS since the previous call), a 128-point oscilloscope and the
