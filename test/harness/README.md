@@ -10,6 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
+./build/harness arp   # one case by its id (ctl, a … fx, mp, rs, rl, fx, fxb, …, an, arp)
 ```
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
@@ -46,6 +47,18 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   sample), `rsa` (aux settings and the track survive a rebuild), `an` (the `AnalysisRing` written
   by `GraphPlayer` holds a known sine at the expected scope indices, peak / rms since the
   last read, mono RMS, the transport published by the aux node). The `allocs` / `frees` counters also count `free()` inside render calls.
+- Arpeggiator (`ios/Arpeggiator.h`, pure C++, driven with a recording sink): `arp` (the six
+  pattern vectors of the design spec plus upDown edge cases, random membership and chord; at
+  120 bpm / `1/16` / 48 kHz every hit lands exactly on `k × 6000` over the odd `kFxBlocks` sizes,
+  note-off at `+ round(gate × 6000)`, swing 0.25 moves odd steps by 1500, ratchet 3 gives hits at
+  0 / 2000 / 4000 with 1200-sample gates, `1/8D` = 18000 and `1/8T` = 8000; playing transport
+  from beat 0.3 plays step 0 at once and step 1 on the 0.5 line, from 0.4 step 0 waits for the
+  0.5 line; latch plays on after release and the next press replaces the list; disabling emits an
+  off for every sounding note in that block and clears; a tap released before the first grid
+  line plays nothing; allNotesOff stops and clears a latched list; a tempo change 120 → 60 puts
+  the next step 12000 after the previous; pattern bits beyond `length` are ignored; same-note
+  legato (gate 1.5) drops the superseded off; clamping / defaults / name tables; 0 allocations
+  in every `process`).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the
