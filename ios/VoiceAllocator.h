@@ -2,7 +2,8 @@
 
 #include "Voice.h"
 
-inline constexpr int MAX_VOICES = 8;
+// 16: a 16-note chord through the arpeggiator, or ratchets with long releases, without stealing.
+inline constexpr int MAX_VOICES = 16;
 
 class VoiceAllocator {
 public:

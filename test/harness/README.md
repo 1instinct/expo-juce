@@ -58,7 +58,13 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   line plays nothing; allNotesOff stops and clears a latched list; a tempo change 120 → 60 puts
   the next step 12000 after the previous; pattern bits beyond `length` are ignored; same-note
   legato (gate 1.5) drops the superseded off; clamping / defaults / name tables; 0 allocations
-  in every `process`).
+  in every `process`), `arpv` (through `PolySynthProcessor`, square wave, attack / release 1 ms,
+  gate 0.5, 471-sample blocks: every step's onset is on sample `k × 6000` + the attack's rise to
+  0.01, the output is exactly 0 for the 1000 samples before each later step, 16 held notes in
+  `chord` mode sound on 16 voices, disabling mid-gate silences the output within that block and
+  a later player note-off of the arp note is harmless, enabling leaves a directly played voice
+  sounding until its release; 0 allocations). `rs` also round-trips the arp settings through
+  `SynthSettings`.
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

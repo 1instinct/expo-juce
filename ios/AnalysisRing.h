@@ -51,6 +51,18 @@ public:
         transportPlaying.store(playing, std::memory_order_relaxed);
     }
 
+    // Audio thread (PolySynthProcessor): arpeggiator state as of the block just rendered.
+    void publishArp(int step, int steps, int note, bool active) {
+        arpStepValue.store(step, std::memory_order_relaxed);
+        arpStepsValue.store(steps, std::memory_order_relaxed);
+        arpNoteValue.store(note, std::memory_order_relaxed);
+        arpActiveValue.store(active, std::memory_order_relaxed);
+    }
+    int arpStep() const { return arpStepValue.load(std::memory_order_relaxed); }
+    int arpSteps() const { return arpStepsValue.load(std::memory_order_relaxed); }
+    int arpNote() const { return arpNoteValue.load(std::memory_order_relaxed); }
+    bool arpActive() const { return arpActiveValue.load(std::memory_order_relaxed); }
+
     // Control side: the engine is running (getAnalysis returns zeros otherwise).
     void setActive(bool on) { active.store(on, std::memory_order_release); }
     bool isActive() const { return active.load(std::memory_order_acquire); }
@@ -101,5 +113,9 @@ private:
     std::atomic<double> transportBeat{0.0};
     std::atomic<double> transportBpm{120.0};
     std::atomic<bool> transportPlaying{false};
+    std::atomic<int> arpStepValue{0};
+    std::atomic<int> arpStepsValue{16};
+    std::atomic<int> arpNoteValue{-1};
+    std::atomic<bool> arpActiveValue{false};
     std::atomic<bool> active{false};
 };

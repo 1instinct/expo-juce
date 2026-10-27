@@ -24,7 +24,8 @@ public:
 
     // Held: between startNote and stopNote (a voice in its release stage is not held).
     bool isHeld() const { return held && noteNumber >= 0; }
-    // NoteEventQueue sequence number of the note-on that started this voice (0 = none).
+    // NoteEventQueue sequence number of the note-on that started this voice. 0 = not from the
+    // queue: a voice the arpeggiator started (stopped by its own note-offs, never by a release mark).
     uint64_t startSeq = 0;
 
     void captureAndRelease(Waveform waveform, double frequency,

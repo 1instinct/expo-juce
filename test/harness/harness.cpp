@@ -510,6 +510,11 @@ static bool runRebuildState() {
     oldSynth.setRelease(900.0);
     oldSynth.setDetune(-25.0);
     oldSynth.setMasterLevel(0.0); // muted: must not come back at the 0.5 default
+    ArpSettings arpWant = ArpSettings::defaults();
+    arpWant.enabled = true; arpWant.mode = ArpMode::UpDown; arpWant.rate = ArpRate::EighthT; arpWant.octaves = 3;
+    arpWant.gate = 0.9f; arpWant.swing = 0.2f; arpWant.latch = true; arpWant.patternMask = 0x5A5A; arpWant.patternLength = 12;
+    arpWant.accent = 0.3f; arpWant.ratchet = 2; arpWant.transposeSteps = 3; arpWant.transposeDistance = -7;
+    oldSynth.arp().setSettings(arpWant);
     oldTransport.setTempo(90.0);
     oldTransport.start();
     juce::AudioBuffer<float> buf(2, 256);
@@ -531,7 +536,8 @@ static bool runRebuildState() {
     const bool synthOk = back.waveform == static_cast<int>(Waveform::Saw) && back.filterCutoff == 1234.0f
         && back.filterResonance == 0.7f && back.attackMs == 15.0f && back.decayMs == 300.0f
         && back.sustainLevel == 0.4f && back.releaseMs == 900.0f && back.detuneCents == -25.0f
-        && back.masterLevel == 0.0f;
+        && back.masterLevel == 0.0f && back.arp == arpWant && ss.arp == arpWant && newSynth.arp().getSettings() == arpWant
+        && arpWant != ArpSettings::defaults();
     const bool transportOk = played > 0.0 && ts.position == 7.5 && newTransport.getTempo() == 90.0
         && newTransport.isPlaying() && newTransport.getPosition() == 7.5;
     newSynth.setRateAndBufferSizeDetails(48000, 256);
@@ -583,7 +589,7 @@ static bool runRebuildState() {
     }
     const bool fxOk = fxStateOk && fxRenderOk;
     const bool ok = synthOk && transportOk && continuesOk && fxOk;
-    std::printf("rs    rebuild carry-over (settings, tempo 90, playing, pending seek, fx)  %-4s synth %d transport %d"
+    std::printf("rs    rebuild carry-over (settings + arp, tempo 90, playing, pending seek, fx)  %-4s synth %d transport %d"
                 " continues %d (pos %.4f) fx state %d fx render %d\n", ok ? "PASS" : "FAIL",
                 synthOk, transportOk, continuesOk, newTransport.getPosition(), fxStateOk, fxRenderOk);
     std::fflush(stdout);
@@ -2102,6 +2108,128 @@ static bool runArp() {
     return pass;
 }
 
+// Arp through PolySynthProcessor: square wave, attack / release 1 ms, 1/16 at 120 bpm (stopped
+// transport), gate 0.5, noteOn(60) → every step's onset is on sample k × 6000 (+ the attack's rise
+// to 0.01, at most 3 samples) in 471-sample blocks, and the output is exactly silent for the 1000
+// samples before each later step (gate 0.5 = 3000 on, 3000 off, 1 ms release). 16 held notes in
+// chord mode sound on 16 voices. Disabling mid-gate silences the output within that block (+ the
+// release), a later player noteOff of the arp note is harmless; enabling leaves a directly played
+// voice sounding until its release. 0 allocations in every processBlock.
+static bool runArpVoices() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    auto prepare = [&](PolySynthProcessor& synth, TransportEngine& transport) {
+        synth.setTransport(&transport);
+        synth.setRateAndBufferSizeDetails(sr, 512);
+        synth.prepareToPlay(sr, 512);
+        synth.setWaveform(Waveform::Square);
+        synth.setAttack(1.0);
+        synth.setRelease(1.0);
+        synth.setMasterLevel(0.5);
+    };
+    // Renders `total` samples in 471-sample blocks; `before(done)` runs before each block.
+    auto render = [&](PolySynthProcessor& synth, int total, std::vector<float>& out, const std::function<void(int)>& before = {}) {
+        juce::AudioBuffer<float> buf(2, 512);
+        juce::MidiBuffer midi;
+        out.assign((size_t)total, 0.0f);
+        for (int done = 0; done < total;) {
+            const int n = std::min(471, total - done);
+            if (before) before(done);
+            buf.setSize(2, n, false, false, true);
+            tCountAllocs = true;
+            synth.processBlock(buf, midi);
+            tCountAllocs = false;
+            std::memcpy(&out[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+            done += n;
+        }
+    };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    // 1. Onsets and gaps.
+    {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        prepare(synth, transport);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.5f;
+        synth.arp().setSettings(s);
+        synth.noteOn(60, 127);
+        std::vector<float> out;
+        render(synth, 48000, out);
+        std::string onsets;
+        for (int k = 0; k < 8; ++k) {
+            const int start = k * 6000;
+            int first = -1;
+            for (int i = start - (k > 0 ? 1000 : 0); i < start + 200; ++i)
+                if (std::fabs(out[(size_t)i]) > 0.01f) { first = i; break; }
+            onsets += std::to_string(first - start) + " ";
+            check(first >= start && first <= start + 3, "step " + std::to_string(k) + " onset at " + std::to_string(first - start));
+            if (k > 0) {
+                int nonZero = 0;
+                for (int i = start - 1000; i < start; ++i) nonZero += out[(size_t)i] != 0.0f ? 1 : 0;
+                check(nonZero == 0, "step " + std::to_string(k) + ": " + std::to_string(nonZero) + " non-zero samples in the gap");
+            }
+        }
+        detail += " onsets+" + onsets;
+        check(synth.noteQueue().lastNoteStarted.load() == 60, "lastNoteStarted");
+        check(synth.arp().isActive() && synth.arp().lastNote() == 60, "arp active");
+    }
+    // 2. 16 held notes in chord mode → 16 voices.
+    int chordVoices = 0;
+    {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        prepare(synth, transport);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.mode = ArpMode::Chord; s.gate = 1.0f;
+        synth.arp().setSettings(s);
+        for (int n = 48; n < 64; ++n) synth.noteOn(n, 100);
+        std::vector<float> out;
+        render(synth, 471, out);
+        chordVoices = synth.diag.activeVoices.load();
+        check(chordVoices == 16 && MAX_VOICES == 16, "chord voices " + std::to_string(chordVoices));
+    }
+    // 3. Disable mid-gate, then a player noteOff of the arp note; enabling keeps a direct voice.
+    {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        prepare(synth, transport);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.5f;
+        synth.arp().setSettings(s);
+        synth.noteOn(60, 127);
+        std::vector<float> out;
+        const int disableAt = 6123; // block start right after step 1 (6000)
+        render(synth, 24000, out, [&](int done) {
+            if (done == disableAt) { ArpSettings off = s; off.enabled = false; synth.arp().setSettings(off); }
+            if (done == 6594) synth.noteOff(60);
+        });
+        int lastNonZero = -1;
+        for (int i = 0; i < 24000; ++i) if (out[(size_t)i] != 0.0f) lastNonZero = i;
+        check(lastNonZero >= 6000 && lastNonZero < disableAt + 200, "disable silences at " + std::to_string(lastNonZero));
+        check(synth.diag.activeVoices.load() == 0 && !synth.arp().isActive(), "disabled: no voices");
+        // Direct note while the arp is off, then the arp is enabled: the voice continues.
+        synth.noteOn(62, 100);
+        render(synth, 942, out);
+        const bool soundingBefore = synth.diag.activeVoices.load() == 1;
+        synth.arp().setSettings(s);
+        render(synth, 942, out);
+        float peak = 0.0f;
+        for (float v : out) peak = std::max(peak, std::fabs(v));
+        const bool soundingAfter = synth.diag.activeVoices.load() == 1 && peak > 0.1f;
+        synth.noteOff(62);
+        render(synth, 942, out);
+        check(soundingBefore && soundingAfter && synth.diag.activeVoices.load() == 0, "enable keeps the direct voice until its release");
+    }
+    const uint64_t allocs = gRenderAllocs.load() + gRenderFrees.load();
+    const bool pass = failures == 0 && allocs == 0;
+    std::printf("arpv  arp through PolySynthProcessor: onsets on k x 6000, silent gaps, 16-voice chord, disable, enable  %-4s"
+                " %d failed checks%s allocs %llu\n", pass ? "PASS" : "FAIL", failures, detail.c_str(), (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the case named on the command line runs (none: every case).
 static const char* gOnlyCase = nullptr;
 static bool want(const char* id) { return gOnlyCase == nullptr || std::strcmp(gOnlyCase, id) == 0; }
@@ -2187,6 +2315,7 @@ int main(int argc, char** argv) {
     if (want("rsa")) unexpected += runAuxRebuildState() ? 0 : 1;
     if (want("an")) unexpected += runAnalysis() ? 0 : 1;
     if (want("arp")) unexpected += runArp() ? 0 : 1;
+    if (want("arpv")) unexpected += runArpVoices() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");
