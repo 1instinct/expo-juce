@@ -37,17 +37,24 @@ void TransportEngine::restoreState(const TransportState& s) {
 
 bool TransportEngine::advanceBlock(int numSamples, double sampleRate) {
     double pending = pendingPosition.exchange(std::numeric_limits<double>::quiet_NaN());
-    if (!std::isnan(pending)) {
+    blockSeeked = !std::isnan(pending);
+    if (blockSeeked) {
         beatPosition = pending;
         lastBeatInt = (int)beatPosition;
     }
 
-    if (!playing.load()) {
+    // One load of each per block, shared by the advance below and the block-start info.
+    const double currentBpm = bpm.load();
+    const bool playingNow = playing.load();
+    blockStartBeat = beatPosition;
+    blockBpm = currentBpm;
+    blockPlaying = playingNow;
+
+    if (!playingNow) {
         positionSnapshot.store(beatPosition);
         return false;
     }
 
-    double currentBpm = bpm.load();
     double beatsPerSample = currentBpm / (60.0 * sampleRate);
     double beatsThisBlock = beatsPerSample * numSamples;
 

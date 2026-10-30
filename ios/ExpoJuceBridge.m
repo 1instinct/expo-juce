@@ -43,6 +43,28 @@
 + (void)setDetune:(double)cents { [[ExpoJuceAudioEngine sharedInstance] setDetune:cents]; }
 + (void)setMasterLevel:(double)level { [[ExpoJuceAudioEngine sharedInstance] setMasterLevel:level]; }
 
+// ── Effects ──
++ (BOOL)setEffectEnabled:(NSString *)effectId enabled:(BOOL)enabled {
+    return [[ExpoJuceAudioEngine sharedInstance] setEffectEnabled:effectId enabled:enabled];
+}
++ (BOOL)setEffectParam:(NSString *)effectId param:(NSString *)param value:(double)value {
+    return [[ExpoJuceAudioEngine sharedInstance] setEffectParam:effectId param:param value:value];
+}
++ (NSDictionary<NSString *, id> *)getEffectsState { return [[ExpoJuceAudioEngine sharedInstance] effectsState]; }
+
+// ── Metronome / backing track / analysis ──
++ (BOOL)setMetronome:(NSDictionary<NSString *, id> *)options { return [[ExpoJuceAudioEngine sharedInstance] setMetronome:options]; }
++ (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options {
+    [[ExpoJuceAudioEngine sharedInstance] setBackingTrackOptions:options];
+}
++ (void)loadBackingTrack:(NSString *)uri
+                 gapless:(NSDictionary<NSString *, id> *)gapless
+              completion:(void (^)(NSDictionary<NSString *, id> *, NSString *, NSString *))completion {
+    [[ExpoJuceAudioEngine sharedInstance] loadBackingTrack:uri gapless:gapless completion:completion];
+}
++ (void)unloadBackingTrack { [[ExpoJuceAudioEngine sharedInstance] unloadBackingTrack]; }
++ (NSDictionary<NSString *, id> *)getAnalysis { return [[ExpoJuceAudioEngine sharedInstance] analysis]; }
+
 // ── Transport ──
 + (void)startTransport { [[ExpoJuceAudioEngine sharedInstance] startTransport]; }
 + (void)stopTransport { [[ExpoJuceAudioEngine sharedInstance] stopTransport]; }

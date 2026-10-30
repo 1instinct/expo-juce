@@ -7,6 +7,7 @@
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PolySynthProcessor.h" // diagPeakDecay
+#include "AnalysisRing.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -26,6 +27,9 @@ public:
     static constexpr int minCapacitySamples = 1024;
 
     void setProcessor(juce::AudioProcessor* p) { processor = p; }
+
+    // Output analysis (getAnalysis): written after the graph, before the test tone. nullptr = none.
+    void setAnalysis(AnalysisRing* a) { analysis = a; }
 
     // Any thread: ask the audio thread to mix a 440 Hz test tone into the
     // device output (after the graph) for durationMs.
@@ -94,6 +98,8 @@ public:
         const float held = outputPeak.load(std::memory_order_relaxed) * diagPeakDecay(numSamples, deviceSampleRate);
         outputPeak.store(std::max(blockPeak, held), std::memory_order_relaxed);
 
+        if (analysis != nullptr) analysis->write(outputChannelData, numOutputChannels, numSamples);
+
         mixTestTone(outputChannelData, numOutputChannels, numSamples);
     }
 
@@ -150,6 +156,7 @@ private:
     }
 
     juce::AudioProcessor* processor = nullptr;
+    AnalysisRing* analysis = nullptr;
     juce::AudioBuffer<float> buffer;     // preallocated in audioDeviceAboutToStart
     int capacitySamples = 0;             // allocated samples per channel
     int capacityChannels = 0;            // allocated channels

@@ -1,12 +1,18 @@
+// JuceConfig.h first: it is only macros + C headers, valid before any Objective-C import, and it
+// must precede Apple's headers for __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES to apply.
+#include "JuceConfig.h"
 #import "ExpoJuceAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
-#include "JuceConfig.h"
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PolySynthProcessor.h"
+#include "FxChainProcessor.h"
+#include "AuxProcessor.h"
+#include "BackingTrack.h"
+#include "AnalysisRing.h"
 #include "TransportEngine.h"
 #include <atomic>
 #include <cmath>
@@ -60,6 +66,9 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 @property (nonatomic, assign) BOOL hasRecoveryState;
 @property (nonatomic, assign) SynthSettings recoverySynthSettings;
 @property (nonatomic, assign) TransportState recoveryTransportState;
+// Main thread: a deferred free of retired backing-track buffers is scheduled.
+@property (nonatomic, assign) BOOL backingTrackCollectScheduled;
+- (void)scheduleBackingTrackCollect;
 @end
 
 // Raw pointers — no JUCE smart pointers at file scope.
@@ -67,6 +76,8 @@ static juce::AudioDeviceManager* sDeviceManager = nullptr;
 static GraphPlayer* sPlayer = nullptr;
 static juce::AudioProcessorGraph* sGraph = nullptr;
 static PolySynthProcessor* sSynth = nullptr;
+static FxChainProcessor* sFx = nullptr;   // owned by sGraph, like sSynth
+static AuxProcessor* sAux = nullptr;      // owned by sGraph
 static TransportEngine* sTransport = nullptr;
 
 // ── Engine lifecycle lock ──
@@ -100,6 +111,36 @@ static std::atomic<uint64_t> sDeadDeviceRestarts{0};
 // note-ons left in the ring before the new synth is attached, so nothing stale plays.
 static NoteEventQueue sNoteQueue;
 static std::atomic<bool> sAcceptingNotes{false};
+
+// ── Effect settings ──
+// Also one for the life of the process: every FxChainProcessor the engine builds reads its
+// settings from here (atomics, see FxChainProcessor.h). setEffectEnabled / setEffectParam write
+// it without the engine lock, so a change is never dropped and is never lost when it is made
+// before setup, during a rebuild, or while a failed rebuild waits for its retry: the next chain
+// simply starts with it. For the same reason it is not part of the rebuild recovery state.
+static FxParamStore sFxParams;
+
+// ── Aux (metronome + backing track) and analysis ──
+// Same pattern: metronome / backing-track options, the backing track itself (decoded source +
+// the buffer the audio thread plays) and the output analysis ring live for the whole process,
+// so they need no engine lock, work before setup and survive rebuilds. The backing track is
+// decoded and resampled on sBackingTrackQueue (serial, never the audio or main thread); buffers
+// it replaces are freed on the main thread once the audio thread has moved past them
+// (BackingTrack::collect, scheduleBackingTrackCollect).
+static AuxSettingsStore sAuxSettings; // atomics only
+// Holds JUCE buffers: heap-allocated and never freed, like the other JUCE objects here (nothing
+// JUCE is destroyed by static destruction, after JUCE has shut down).
+static BackingTrack& sBackingTrack = *new BackingTrack();
+static AnalysisRing sAnalysis;        // atomics only
+
+static dispatch_queue_t backingTrackQueue() {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("expo-juce.backing-track", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
 
 // RAII: holds sEngineLock for a lifecycle section (main thread, blocking) and flags it busy.
 struct LifecycleLock {
@@ -167,6 +208,15 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
         _setupStep = -1;
         _requestedBufferSize = kDefaultBufferSize;
         _requestedSampleRate = kDefaultSampleRate;
+        // The aux node asks for the track at the device rate when it is prepared (setup, rebuild,
+        // device restart with a new rate): decode the file again at that rate off that thread,
+        // then free the old buffer.
+        sBackingTrack.setRateListener([](double) {
+            dispatch_async(backingTrackQueue(), ^{
+                sBackingTrack.reload();
+                [[ExpoJuceAudioEngine sharedInstance] scheduleBackingTrackCollect];
+            });
+        });
     }
     return self;
 }
@@ -341,8 +391,25 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sSynth->setNoteQueue(&sNoteQueue);
 
     self.setupStep = 7;
-    NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth)");
+    NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth, fx chain)");
     auto synthNode = sGraph->addNode(std::move(synthProcessor));
+    // Effects chain between the synth and the output. Its settings come from the process-lifetime
+    // sFxParams, so whatever the app set before (or across a rebuild) is in effect from the
+    // first block. Sources that must bypass the effects connect to the output node directly
+    // (the graph sums every connection into an input channel).
+    auto fxProcessor = std::make_unique<FxChainProcessor>();
+    sFx = fxProcessor.get();
+    sFx->setParamStore(&sFxParams);
+    sFx->setTransport(sTransport);
+    auto fxNode = sGraph->addNode(std::move(fxProcessor));
+    // Aux source (metronome + backing track): straight into the output, not through the effects.
+    auto auxProcessor = std::make_unique<AuxProcessor>();
+    sAux = auxProcessor.get();
+    sAux->setSettings(&sAuxSettings);
+    sAux->setBackingTrack(&sBackingTrack);
+    sAux->setTransport(sTransport);
+    sAux->setAnalysis(&sAnalysis);
+    auto auxNode = sGraph->addNode(std::move(auxProcessor));
 
     self.setupStep = 8;
     NSLog(@"[ExpoJuceAudioEngine] Step 8: addNode (output)");
@@ -352,11 +419,25 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 
     self.setupStep = 9;
     NSLog(@"[ExpoJuceAudioEngine] Step 9: connections");
-    bool connectedL = sGraph->addConnection({{synthNode->nodeID, 0}, {outputNode->nodeID, 0}});
-    bool connectedR = sGraph->addConnection({{synthNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    // synth → fx → output
+    bool connectedL = sGraph->addConnection({{synthNode->nodeID, 0}, {fxNode->nodeID, 0}});
+    bool connectedR = sGraph->addConnection({{synthNode->nodeID, 1}, {fxNode->nodeID, 1}});
     if (!connectedL || !connectedR) {
-        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection failed (L=%d, R=%d)",
+        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection synth->fx failed (L=%d, R=%d)",
                             connectedL ? 1 : 0, connectedR ? 1 : 0]];
+    }
+    bool fxConnectedL = sGraph->addConnection({{fxNode->nodeID, 0}, {outputNode->nodeID, 0}});
+    bool fxConnectedR = sGraph->addConnection({{fxNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    if (!fxConnectedL || !fxConnectedR) {
+        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection fx->output failed (L=%d, R=%d)",
+                            fxConnectedL ? 1 : 0, fxConnectedR ? 1 : 0]];
+    }
+    // aux → output (summed with the fx output by the graph)
+    bool auxConnectedL = sGraph->addConnection({{auxNode->nodeID, 0}, {outputNode->nodeID, 0}});
+    bool auxConnectedR = sGraph->addConnection({{auxNode->nodeID, 1}, {outputNode->nodeID, 1}});
+    if (!auxConnectedL || !auxConnectedR) {
+        [self noteNonFatal:[NSString stringWithFormat:@"step 9 (non-fatal): addConnection aux->output failed (L=%d, R=%d)",
+                            auxConnectedL ? 1 : 0, auxConnectedR ? 1 : 0]];
     }
 
     self.setupStep = 10;
@@ -367,9 +448,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     NSLog(@"[ExpoJuceAudioEngine] Step 11: GraphPlayer + addAudioCallback");
     sPlayer = new GraphPlayer();
     sPlayer->setProcessor(sGraph);
+    sPlayer->setAnalysis(&sAnalysis);
     sDeviceManager->addAudioCallback(sPlayer);
 
     self.isReady = true;
+    sAnalysis.setActive(true);
     NSLog(@"[ExpoJuceAudioEngine] DONE — audio stack initialized (sr=%.0f, buf=%d)", sr, bufSize);
 }
 
@@ -423,16 +506,23 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     NSLog(@"[ExpoJuceAudioEngine] Tearing down engine...");
     sAcceptingNotes.store(false, std::memory_order_release);
     self.isReady = false;
+    sAnalysis.setActive(false);
     if (sDeviceManager && sPlayer) sDeviceManager->removeAudioCallback(sPlayer);
     delete sPlayer; sPlayer = nullptr;
     sSynth = nullptr;
-    delete sGraph; sGraph = nullptr;
+    sFx = nullptr;
+    sAux = nullptr;
+    delete sGraph; sGraph = nullptr; // ~AuxProcessor releases its backing-track reader slot
+    [self scheduleBackingTrackCollect];
     if (sDeviceManager) { sDeviceManager->closeAudioDevice(); delete sDeviceManager; sDeviceManager = nullptr; }
     delete sTransport; sTransport = nullptr;
 }
 
 // Main thread, caller holds sEngineLock. Snapshot of what the app configured (synth parameters,
 // tempo / position / play state), which a teardown would otherwise reset to the defaults.
+// Effect settings are deliberately not captured: they live in sFxParams, which outlives the
+// engine and is attached to the rebuilt chain (restoring a snapshot taken here would undo
+// changes the app makes while a failed rebuild waits for its retry).
 - (void)captureRecoveryStateLocked {
     if (!sSynth || !sTransport) return;
     self.recoverySynthSettings = sSynth->getSettings();
@@ -791,6 +881,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     double synthProcessCount = 0.0, synthPeak = 0.0, notesQueued = 0.0, notesConsumed = 0.0, notesDropped = 0.0;
     int activeVoices = 0;
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
+    double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
+    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
         if (acquireUserLock(lock)) {
@@ -820,6 +912,15 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 activeVoices = synth->diag.activeVoices.load(relaxed);
                 lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
                 lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
+            }
+            if (FxChainProcessor* fx = ready ? sFx : nullptr) {
+                fxProcessCount = (double)fx->diag.processCount.load(relaxed);
+                fxLimiterGain = (double)fx->diag.limiterGain.load(relaxed);
+                fxNonFiniteResets = (double)fx->diag.nonFiniteResets.load(relaxed);
+            }
+            if (AuxProcessor* aux = ready ? sAux : nullptr) {
+                metronomeClicks = (double)aux->diag.clicks.load(relaxed);
+                backingTrackPositionSec = aux->diag.trackPositionSec.load(relaxed);
             }
         }
     }
@@ -852,6 +953,13 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"activeVoices"] = @(activeVoices);
     d[@"lastNoteToRenderMs"] = @(lastNoteToRenderMs);
     d[@"lastTouchToRenderMs"] = @(lastTouchToRenderMs);
+
+    d[@"fxProcessCount"] = @(fxProcessCount);
+    d[@"fxLimiterGain"] = @(fxLimiterGain);
+    d[@"fxNonFiniteResets"] = @(fxNonFiniteResets);
+    d[@"metronomeClicks"] = @(metronomeClicks);
+    d[@"backingTrackLoaded"] = @(sBackingTrack.hasTrack() ? YES : NO);
+    d[@"backingTrackPositionSec"] = @(backingTrackPositionSec);
 
     // engineState: recovering (rebuild running or retry scheduled) > ready > failed > uninitialized.
     // `ready` is false when the lock was busy, which only happens during a lifecycle section.
@@ -944,6 +1052,184 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 - (void)setRelease:(double)ms { withSynth(self, ^(PolySynthProcessor *synth) { synth->setRelease(ms); }); }
 - (void)setDetune:(double)cents { withSynth(self, ^(PolySynthProcessor *synth) { synth->setDetune(cents); }); }
 - (void)setMasterLevel:(double)level { withSynth(self, ^(PolySynthProcessor *synth) { synth->setMasterLevel(level); }); }
+
+// ── Effects ──
+// No engine lock: the settings are atomics in the process-lifetime sFxParams (see "Effect
+// settings"), read by the running chain every chunk and by any chain built later.
+
+// Float-stored values reported to JS rounded to 6 decimals (0.4f → 0.4, not 0.4000000059604645).
+static double fxValueForJS(float value) {
+    return std::round((double)value * 1e6) / 1e6;
+}
+
+- (BOOL)setEffectEnabled:(NSString *)effectId enabled:(BOOL)enabled {
+    return sFxParams.setEnabled(effectId.UTF8String, enabled ? true : false) ? YES : NO;
+}
+
+- (BOOL)setEffectParam:(NSString *)effectId param:(NSString *)param value:(double)value {
+    return sFxParams.setParam(effectId.UTF8String, param.UTF8String, value) ? YES : NO;
+}
+
+- (NSDictionary<NSString *, id> *)effectsState {
+    const FxSettings settings = sFxParams.snapshot();
+    NSMutableDictionary<NSString *, id> *state = [NSMutableDictionary dictionaryWithCapacity:kFxCount];
+    for (int fx = 0; fx < kFxCount; ++fx) {
+        const FxSpec& spec = kFxSpecs[fx];
+        NSMutableDictionary<NSString *, NSNumber *> *params = [NSMutableDictionary dictionaryWithCapacity:spec.numParams];
+        for (int p = 0; p < spec.numParams; ++p)
+            params[@(spec.params[p].name)] = @(fxValueForJS(settings.values[fx][p]));
+        state[@(spec.id)] = @{ @"enabled": @(settings.enabled[fx] ? YES : NO), @"params": params };
+    }
+    return state;
+}
+
+// ── Metronome / backing track ──
+// Options: atomics in the process-lifetime sAuxSettings (no lock, remembered before setup and
+// across rebuilds). Keys that are absent or of the wrong type are left unchanged.
+
+static NSNumber *numberFrom(NSDictionary<NSString *, id> *options, NSString *key) {
+    id value = options[key];
+    if (![value isKindOfClass:[NSNumber class]]) return nil;
+    return std::isfinite([(NSNumber *)value doubleValue]) ? (NSNumber *)value : nil;
+}
+
+- (BOOL)setMetronome:(NSDictionary<NSString *, id> *)options {
+    // An unknown style rejects the whole call (nothing applied), like an unknown effect id.
+    id style = options[@"style"];
+    int styleIndex = -1;
+    if (style != nil) {
+        if (![style isKindOfClass:[NSString class]]) return NO;
+        styleIndex = metronomeStyleIndex(((NSString *)style).UTF8String);
+        if (styleIndex < 0) return NO;
+    }
+    if (NSNumber *v = numberFrom(options, @"enabled")) sAuxSettings.setMetronomeEnabled(v.boolValue);
+    if (styleIndex >= 0) sAuxSettings.setMetronomeStyle(styleIndex);
+    if (NSNumber *v = numberFrom(options, @"level")) sAuxSettings.setMetronomeLevel(v.doubleValue);
+    if (NSNumber *v = numberFrom(options, @"accent")) sAuxSettings.setMetronomeAccent(v.boolValue);
+    if (NSNumber *v = numberFrom(options, @"beatsPerBar")) sAuxSettings.setBeatsPerBar(v.doubleValue);
+    return YES;
+}
+
+- (void)setBackingTrackOptions:(NSDictionary<NSString *, id> *)options {
+    if (NSNumber *v = numberFrom(options, @"level")) sAuxSettings.setTrackLevel(v.doubleValue);
+    if (NSNumber *v = numberFrom(options, @"loop")) sAuxSettings.setTrackLoop(v.boolValue);
+    if (NSNumber *v = numberFrom(options, @"enabled")) sAuxSettings.setTrackEnabled(v.boolValue);
+}
+
+// file:// URL or absolute path → path; nil for anything else (remote URLs are not fetched).
+static NSString *backingTrackPath(NSString *uri) {
+    if ([uri hasPrefix:@"/"]) return uri;
+    if ([uri hasPrefix:@"file://"]) {
+        NSURL *url = [NSURL URLWithString:uri];
+        if (url != nil && url.isFileURL && url.path.length > 0) return url.path;
+        NSString *rest = [[uri substringFromIndex:7] stringByRemovingPercentEncoding];
+        if ([rest hasPrefix:@"localhost/"]) rest = [rest substringFromIndex:9];
+        return [rest hasPrefix:@"/"] ? rest : nil;
+    }
+    return nil;
+}
+
+- (void)loadBackingTrack:(NSString *)uri
+                 gapless:(NSDictionary<NSString *, id> *)gapless
+              completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode, NSString *errorMessage))completion {
+    NSString *path = uri != nil ? backingTrackPath(uri) : nil;
+    if (path == nil) {
+        completion(nil, @"ERR_BACKING_TRACK_URI", [NSString stringWithFormat:@"not a local file URI: %@", uri ?: @"(nil)"]);
+        return;
+    }
+    BackingTrackSource source;
+    source.path = path.UTF8String;
+    if (gapless != nil) {
+        NSNumber *loop = numberFrom(gapless, @"loopSamples");
+        NSNumber *leading = numberFrom(gapless, @"leadingSamples");
+        NSNumber *trailing = numberFrom(gapless, @"trailingSamples");
+        if (loop != nil && leading != nil && trailing != nil) {
+            source.gapless.loopSamples = loop.longLongValue;
+            source.gapless.leadingSamples = leading.longLongValue;
+            source.gapless.trailingSamples = trailing.longLongValue;
+            source.hasGapless = source.gapless.loopSamples > 0;
+        }
+    }
+    // A newer load or an unload supersedes this one (checked while decoding and before publishing).
+    const uint64_t generation = sBackingTrack.beginLoad();
+    dispatch_async(backingTrackQueue(), ^{
+        std::string error;
+        BackingTrackInfo info;
+        // Decoded straight at the device rate (known once the engine has been prepared).
+        auto buffer = BackingTrack::load(source, sBackingTrack.wantedSampleRate(),
+                                         [generation] { return !sBackingTrack.isCurrent(generation); }, info, error);
+        if (buffer == nullptr) {
+            NSString *full = [NSString stringWithUTF8String:error.c_str()] ?: @"ERR_BACKING_TRACK: decode failed";
+            NSRange colon = [full rangeOfString:@": "];
+            NSString *code = colon.location != NSNotFound ? [full substringToIndex:colon.location] : @"ERR_BACKING_TRACK";
+            NSString *message = colon.location != NSNotFound ? [full substringFromIndex:NSMaxRange(colon)] : full;
+            completion(nil, code, message);
+            return;
+        }
+        if (!sBackingTrack.install(std::move(buffer), source, generation)) {
+            completion(nil, @"ERR_BACKING_TRACK_SUPERSEDED", @"a newer load or unload replaced this one");
+            return;
+        }
+        [self scheduleBackingTrackCollect];
+        completion(@{
+            @"durationSec": @(info.durationSec),
+            @"sampleRate": @(info.sampleRate),
+            @"channels": @(info.channels),
+            @"loopStartSample": @((double)info.loopStartSample),
+            @"loopSamples": @((double)info.loopSamples),
+            @"decodedSamples": @((double)info.decodedSamples),
+            @"regionRule": [NSString stringWithUTF8String:backingTrackRegionRuleName(info.regionRule)],
+            @"decoder": [NSString stringWithUTF8String:info.formatName.c_str()] ?: @"",
+        }, nil, nil);
+    });
+}
+
+- (void)unloadBackingTrack {
+    sBackingTrack.unload();
+    [self scheduleBackingTrackCollect];
+}
+
+// Main thread. Frees replaced backing-track buffers the audio thread no longer uses; retries
+// every 100 ms while some are still in use (e.g. the device is stopped mid-swap) or the holder
+// is busy (collect never blocks the main thread).
+- (void)scheduleBackingTrackCollect {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self scheduleBackingTrackCollect]; });
+        return;
+    }
+    if (self.backingTrackCollectScheduled) return;
+    if (sBackingTrack.collect() == 0) return;
+    self.backingTrackCollectScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * (int64_t)NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        self.backingTrackCollectScheduled = NO;
+        [self scheduleBackingTrackCollect];
+    });
+}
+
+// ── Analysis ──
+// Any thread, no lock: everything is read from the process-lifetime sAnalysis (levels and scope
+// written by GraphPlayer, transport as of the last block written by the aux node). Zeros while
+// the engine is not running.
+- (NSDictionary<NSString *, id> *)analysis {
+    const bool active = sAnalysis.isActive();
+    float scope[AnalysisRing::kScopePoints] = {};
+    AnalysisRing::Levels levels{0.0f, 0.0f};
+    if (active) {
+        sAnalysis.readScope(scope);
+        levels = sAnalysis.readLevels();
+    }
+    NSMutableArray<NSNumber *> *points = [NSMutableArray arrayWithCapacity:AnalysisRing::kScopePoints];
+    for (int i = 0; i < AnalysisRing::kScopePoints; ++i) [points addObject:@(scope[i])];
+    return @{
+        @"peak": @(levels.peak),
+        @"rms": @(levels.rms),
+        @"scope": points,
+        @"lastNote": @(sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed)),
+        @"bpm": @(active ? sAnalysis.bpm() : 120.0),
+        @"beat": @(active ? sAnalysis.beat() : 0.0),
+        @"playing": @(active && sAnalysis.playing() ? YES : NO),
+    };
+}
 
 // ── Transport ──
 

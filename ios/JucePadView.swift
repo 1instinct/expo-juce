@@ -15,7 +15,6 @@ class JucePadView: ExpoView {
   // to super would only walk the responder chain, which does not include siblings).
   var enabled: Bool = true {
     didSet {
-      isUserInteractionEnabled = enabled
       if !enabled {
         releaseAllTouches()
       }
@@ -23,12 +22,71 @@ class JucePadView: ExpoView {
     }
   }
 
+  // Hit shape: a polygon in normalised view coordinates, flat [x0, y0, x1, y1, …] with 0–1
+  // spanning the view's bounds. Touches outside it fall through to the views underneath.
+  // Empty, odd-length or fewer than 3 points: the whole rect (the default).
+  var hitPolygon: [Double] = [] {
+    didSet {
+      rebuildHitPath()
+    }
+  }
+
+  private var hitPath: UIBezierPath?
+  private var hitPathBounds: CGRect = .null
+
   private var activeTouches = Set<UITouch>()
   private var soundingNote: Int?
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
     isMultipleTouchEnabled = true
+  }
+
+  // MARK: - Hit shape
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    if bounds != hitPathBounds {
+      rebuildHitPath()
+    }
+  }
+
+  override var bounds: CGRect {
+    didSet {
+      if bounds != hitPathBounds {
+        rebuildHitPath()
+      }
+    }
+  }
+
+  override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+    guard let path = hitPath else {
+      return super.point(inside: point, with: event)
+    }
+    return path.contains(point)
+  }
+
+  private func rebuildHitPath() {
+    hitPathBounds = bounds
+    let values = hitPolygon
+    guard values.count >= 6, values.count % 2 == 0, values.allSatisfy({ $0.isFinite }) else {
+      hitPath = nil
+      return
+    }
+    let path = UIBezierPath()
+    let width = Double(bounds.width)
+    let height = Double(bounds.height)
+    for index in stride(from: 0, to: values.count, by: 2) {
+      let point = CGPoint(x: bounds.minX + CGFloat(values[index] * width),
+                          y: bounds.minY + CGFloat(values[index + 1] * height))
+      if index == 0 {
+        path.move(to: point)
+      } else {
+        path.addLine(to: point)
+      }
+    }
+    path.close()
+    hitPath = path
   }
 
   // MARK: - Touches

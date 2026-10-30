@@ -11,7 +11,19 @@ import {
   JucePadViewProps,
   PadNoteOnEvent,
   PadNoteOffEvent,
+  EffectId,
+  EffectParams,
+  EffectState,
+  EffectsState,
+  MetronomeStyle,
+  MetronomeOptions,
+  BackingTrackGapless,
+  BackingTrackInfo,
+  BackingTrackRegionRule,
+  BackingTrackOptions,
+  Analysis,
 } from './ExpoJuce.types';
+import { defaultEffectsState } from './effectDefaults';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
@@ -109,6 +121,103 @@ export function setMasterLevel(level: number): void {
   ExpoJuceModule.setMasterLevel(level);
 }
 
+// ── Effects (0.6.0+) ─────────────────────────────────────────────
+// Master chain: synth → drive → crush → eq → chorus → phaser → echo → reverb → pump →
+// compressor → safety limiter → output. Synchronous and lock-free; settings are remembered
+// natively whether or not the engine is running (before setup, across engine rebuilds).
+// Binaries older than 0.6.0 have no chain: the setters return false and getEffectsState
+// returns the defaults.
+
+// Turns an effect on or off (short crossfade; an effect starts from a clear state; echo and
+// reverb tails ring out after they are turned off).
+// Returns false for an unknown effect, or if the binary has no effects chain.
+export function setEffectEnabled(id: EffectId, enabled: boolean): boolean {
+  if (typeof ExpoJuceModule?.setEffectEnabled !== 'function') return false;
+  return ExpoJuceModule.setEffectEnabled(id, enabled) === true;
+}
+
+// Sets one parameter; the value is clamped to its range (switches / divisions rounded).
+// Returns false for an unknown effect or parameter, a non-finite value, or no effects chain.
+export function setEffectParam<T extends EffectId>(
+  id: T,
+  param: EffectParams[T] | (string & {}),
+  value: number
+): boolean {
+  if (typeof ExpoJuceModule?.setEffectParam !== 'function') return false;
+  return ExpoJuceModule.setEffectParam(id, param, value) === true;
+}
+
+// Every effect's enabled flag and parameter values, as stored natively (after clamping).
+export function getEffectsState(): EffectsState {
+  if (typeof ExpoJuceModule?.getEffectsState !== 'function') return defaultEffectsState();
+  return ExpoJuceModule.getEffectsState();
+}
+
+// ── Metronome + backing track (0.6.0+) ───────────────────────────
+// Both are summed into the output after the effects chain and follow the transport. Options
+// are synchronous and lock-free, remembered natively before setup and across engine rebuilds.
+// Binaries older than 0.6.0: the setters are no-ops and loadBackingTrack rejects with
+// 'ERR_UNSUPPORTED'.
+
+// Click on every beat while the transport plays, sample-accurate; accent on beat 1 of the bar.
+// Returns false (nothing applied) for an unknown style, or if the binary has no metronome.
+export function setMetronome(options: MetronomeOptions): boolean {
+  if (typeof ExpoJuceModule?.setMetronome !== 'function') return false;
+  return ExpoJuceModule.setMetronome(options) !== false;
+}
+
+// Decodes a local audio file (file:// URI or absolute path; WAV, AIFF, FLAC, MP3, plus CoreAudio
+// formats such as M4A on iOS) off the audio thread at the device rate and swaps it in (5 ms
+// crossfade). It plays while the transport plays; track sample 0 is beat 0, so starts, resumes
+// and setTransportPosition place it at beat x 60 / bpm, and a tempo change does not move it.
+// `gapless` (MP3 LAME/Xing tag values) picks the exact loop region: decoded length ==
+// loopSamples -> [0, loopSamples) ('tag'); == 1152 + leading + loopSamples + trailing ->
+// [1152 + leading, +loopSamples) ('padded'); == leading + loopSamples + trailing ->
+// [leading, +loopSamples) ('paddedNoTagFrame'); otherwise the whole file ('whole'); the result's
+// regionRule says which. A later load or unloadBackingTrack() supersedes a load in flight, which
+// then rejects with 'ERR_BACKING_TRACK_SUPERSEDED'. Other rejections: ERR_BACKING_TRACK_URI,
+// _FILE, _FORMAT, _TOO_LONG (over 6 min), _MEMORY (not enough memory available).
+export async function loadBackingTrack(
+  uri: string,
+  gapless?: BackingTrackGapless
+): Promise<BackingTrackInfo> {
+  if (typeof ExpoJuceModule?.loadBackingTrack !== 'function') {
+    const error = new Error('this binary has no backing-track support (expo-juce 0.6.0+)');
+    (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';
+    throw error;
+  }
+  return ExpoJuceModule.loadBackingTrack(uri, gapless ?? null);
+}
+
+export function unloadBackingTrack(): void {
+  if (typeof ExpoJuceModule?.unloadBackingTrack !== 'function') return;
+  ExpoJuceModule.unloadBackingTrack();
+}
+
+export function setBackingTrackOptions(options: BackingTrackOptions): void {
+  if (typeof ExpoJuceModule?.setBackingTrackOptions !== 'function') return;
+  ExpoJuceModule.setBackingTrackOptions(options);
+}
+
+// ── Analysis (0.6.0+) ────────────────────────────────────────────
+
+const emptyAnalysis = (): Analysis => ({
+  peak: 0,
+  rms: 0,
+  scope: new Array(128).fill(0),
+  lastNote: -1,
+  bpm: 120,
+  beat: 0,
+  playing: false,
+});
+
+// Output level (peak hold and RMS since the previous call), a 128-point oscilloscope and the
+// transport for HUDs. Synchronous, lock-free and cheap: call it every frame, from one place. Zeros when the engine is not running or the binary is older than 0.6.0.
+export function getAnalysis(): Analysis {
+  if (typeof ExpoJuceModule?.getAnalysis !== 'function') return emptyAnalysis();
+  return ExpoJuceModule.getAnalysis();
+}
+
 // ── Transport ────────────────────────────────────────────────────
 
 export function startTransport(): void {
@@ -165,4 +274,15 @@ export {
   BeatEventPayload,
   AudioDiagnostics,
   EngineState,
+  EffectId,
+  EffectParams,
+  EffectState,
+  EffectsState,
+  MetronomeStyle,
+  MetronomeOptions,
+  BackingTrackGapless,
+  BackingTrackInfo,
+  BackingTrackRegionRule,
+  BackingTrackOptions,
+  Analysis,
 };

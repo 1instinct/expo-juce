@@ -35,10 +35,11 @@
 #define JUCE_USE_CURL 0
 #define JUCE_WEB_BROWSER 0
 #define JUCE_USE_OGGVORBIS 0
-#define JUCE_USE_MP3AUDIOFORMAT 0
+// Backing tracks: WAV / AIFF / FLAC / MP3 decoders (plus CoreAudio formats on Apple).
+#define JUCE_USE_MP3AUDIOFORMAT 1
 #define JUCE_USE_LAME_AUDIO_FORMAT 0
 #define JUCE_USE_WINDOWS_MEDIA_FORMAT 0
-#define JUCE_USE_FLAC 0
+#define JUCE_USE_FLAC 1
 
 // No real audio backend: the harness drives AudioIODeviceCallback with a fake device.
 #define JUCE_ALSA 0

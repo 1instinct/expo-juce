@@ -1,5 +1,14 @@
 #pragma once
 
+// Apple's AssertMacros.h (pulled in via CoreServices / AudioToolbox) otherwise defines
+// un-prefixed macros such as check(), verify() and require(), which collide with C++ and JUCE
+// identifiers. It only takes effect in translation units where this header is included before
+// any Apple system header (the JuceModule_*.mm units and ExpoJuceAudioEngine.mm include it
+// first); where an Apple header comes first, AssertMacros.h has already been processed.
+#ifndef __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES
+#define __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES 0
+#endif
+
 // Xcode 16+ clang no longer implicitly includes these —
 // JUCE uses FLT_MAX, FLT_MIN, INT_MAX, etc. throughout.
 // Use C headers (not C++ <cfloat> etc.) since this header is included
@@ -54,10 +63,11 @@
 #define JUCE_USE_CURL 0
 #define JUCE_WEB_BROWSER 0
 #define JUCE_USE_OGGVORBIS 0
-#define JUCE_USE_MP3AUDIOFORMAT 0
+// Backing tracks: WAV / AIFF / FLAC / MP3 decoders (plus CoreAudio formats on Apple).
+#define JUCE_USE_MP3AUDIOFORMAT 1
 #define JUCE_USE_LAME_AUDIO_FORMAT 0
 #define JUCE_USE_WINDOWS_MEDIA_FORMAT 0
-#define JUCE_USE_FLAC 0
+#define JUCE_USE_FLAC 1
 
 // Audio device config
 #define JUCE_ASIO 0
