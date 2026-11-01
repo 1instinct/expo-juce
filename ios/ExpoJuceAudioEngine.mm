@@ -64,7 +64,10 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 @property (nonatomic, assign) int rebuildAttempts;     // attempts in the current recovery
 @property (nonatomic, assign) int recoveryGeneration;  // bumped to cancel scheduled retries
 @property (nonatomic, copy) BeatCallback recoveryBeatCallback; // beat callback kept across retries
-@property (nonatomic, assign) BOOL recoveryTimerWasRunning;
+// Main thread: the beat timer was asked for (public startBeatTimer: listeners exist) and not
+// stopped since (public stopBeatTimer: the last listener left). Internal stops (rebuild,
+// shutdown) keep it; a successful rebuild restarts the timer only if it is still set.
+@property (nonatomic, assign) BOOL beatTimerWanted;
 // Synth settings + transport state taken before a rebuild's first teardown and kept across
 // failed attempts; restored when the engine is built again (by a retry or an explicit setup).
 @property (nonatomic, assign) BOOL hasRecoveryState;
@@ -73,6 +76,9 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 // Main thread: a deferred free of retired backing-track buffers is scheduled.
 @property (nonatomic, assign) BOOL backingTrackCollectScheduled;
 - (void)scheduleBackingTrackCollect;
+// Main thread: the beat timer itself, without changing beatTimerWanted.
+- (void)resumeBeatTimer;
+- (void)cancelBeatTimer;
 @end
 
 // Raw pointers — no JUCE smart pointers at file scope.
@@ -578,10 +584,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     self.engineFailed = NO;
     self.recoveryBeatCallback = nil;
     self.hasRecoveryState = NO;
+    // Also before setup (or after a failed one): the timer may run without an engine.
+    [self cancelBeatTimer];
     if (!self.isReady) return;
 
     NSLog(@"[ExpoJuceAudioEngine] Shutting down...");
-    [self stopBeatTimer];
     {
         LifecycleLock lifecycle;
         sNoteQueue.pushAllNotesOff();
@@ -820,7 +827,6 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (self.isRecovering || self.rebuildRetryPending) return;
     if (!self.isReady) return;
     self.recoveryBeatCallback = self.beatCallback;
-    self.recoveryTimerWasRunning = (self.beatTimer != nil) ? YES : NO;
     {
         LifecycleLock lifecycle;
         [self captureRecoveryStateLocked];
@@ -837,7 +843,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     NSLog(@"[ExpoJuceAudioEngine] rebuilding engine (%@), attempt %d", context, self.rebuildAttempts);
 
     // Beat timer stop is main-thread work outside the lock (the callback is restored below).
-    [self stopBeatTimer];
+    [self cancelBeatTimer];
     BOOL ok = NO;
     {
         LifecycleLock lifecycle;
@@ -853,7 +859,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (ok) {
         [self registerSessionObservers]; // no-op if still registered
         self.beatCallback = self.recoveryBeatCallback;
-        if (self.recoveryTimerWasRunning) [self startBeatTimer];
+        // Only if listeners still want it (the last one may have left during a retry wait).
+        if (self.beatTimerWanted) [self resumeBeatTimer];
         self.recoveryBeatCallback = nil;
         self.engineFailed = NO;
         self.isRecovering = NO;
@@ -1453,6 +1460,22 @@ static NSString *backingTrackPath(NSString *uri) {
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf startBeatTimer]; });
         return;
     }
+    self.beatTimerWanted = YES;
+    [self resumeBeatTimer];
+}
+
+- (void)stopBeatTimer {
+    if (![NSThread isMainThread]) {
+        __weak ExpoJuceAudioEngine *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf stopBeatTimer]; });
+        return;
+    }
+    self.beatTimerWanted = NO;
+    [self cancelBeatTimer];
+}
+
+// Main thread. Creates the timer if it is not running (beatTimerWanted unchanged).
+- (void)resumeBeatTimer {
     if (self.beatTimer) return;
 
     self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -1472,12 +1495,8 @@ static NSString *backingTrackPath(NSString *uri) {
     dispatch_resume(self.beatTimer);
 }
 
-- (void)stopBeatTimer {
-    if (![NSThread isMainThread]) {
-        __weak ExpoJuceAudioEngine *weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf stopBeatTimer]; });
-        return;
-    }
+// Main thread. Cancels the timer, keeping beatTimerWanted and the callback.
+- (void)cancelBeatTimer {
     if (self.beatTimer) {
         dispatch_source_cancel(self.beatTimer);
         self.beatTimer = nil;

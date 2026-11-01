@@ -168,7 +168,11 @@ class JucePadView: ExpoView {
   }
 
   private func startNote(touchTimestamp: TimeInterval) {
-    stopNote()
+    // A drums-mode retrigger (another finger while a hit is held) is just another hit: no
+    // onNoteOff in between, that fires only when the last touch lifts.
+    if !(drumMode && soundingIsDrum) {
+      stopNote()
+    }
     let noteNumber = note
     let noteVelocity = velocity
     soundingNote = noteNumber
