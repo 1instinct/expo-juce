@@ -65,6 +65,24 @@ void free(void* p) {
 }
 
 //==============================================================================
+// BackingTrack::acquire() test seam (CMake defines BACKING_TRACK_ACQUIRE_HOOK as this name). A
+// test arms gAcquireHook; the next acquire() runs it once, between its first read of the
+// published pointer and the re-validation, i.e. as if the control thread published right then.
+// What the hook does is not counted as a render allocation.
+static std::function<void()> gAcquireHook;
+static int gAcquireHookCalls = 0;
+void harnessBackingTrackAcquireHook() {
+    if (!gAcquireHook) return;
+    const bool counting = tCountAllocs;
+    tCountAllocs = false;
+    auto hook = std::move(gAcquireHook);
+    gAcquireHook = nullptr;
+    ++gAcquireHookCalls;
+    hook();
+    tCountAllocs = counting;
+}
+
+//==============================================================================
 // GraphPlayer — the shipped class, from ios/GraphPlayer.h at the same git ref as the engine.
 #include "GraphPlayer.h"
 
@@ -1486,6 +1504,82 @@ static bool runBackingTrackLimits() {
     return pass;
 }
 
+// A swap that lands inside acquire(), after its first read of the published pointer and before
+// the re-validation (the seam runs the control side right there): the reader moves to the new
+// buffer (or to none, for an unload) in that block and fades the old one out, so collect() must
+// keep the old buffer until the fade-out ends. Then it is freed. Deterministic replay of the
+// race the threaded `bts` case hits at random (a freed buffer read by the fade-out).
+static bool runBackingTrackSwapInAcquire() {
+    const double sr = 48000.0;
+    const int fade = (int)(AuxProcessor::kFadeSeconds * sr);
+    BackingTrack holder;
+    TransportEngine transport;
+    AuxProcessor aux;
+    aux.setBackingTrack(&holder);
+    aux.setTransport(&transport);
+    aux.auxSettings().setTrackLevel(1.0);
+    aux.setRateAndBufferSizeDetails(sr, 128);
+    aux.prepareToPlay(sr, 128);
+    transport.start();
+    juce::AudioBuffer<float> buf(2, 128);
+    juce::MidiBuffer midi;
+    uint64_t allocs = 0;
+    auto block = [&] {
+        tCountAllocs = true;
+        transport.advanceBlock(128, sr);
+        aux.processBlock(buf, midi);
+        tCountAllocs = false;
+        allocs += gRenderAllocs.exchange(0) + gRenderFrees.exchange(0);
+    };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    gAcquireHookCalls = 0;
+    holder.install(constantTrack(20000, sr, 0.5f), {}, holder.beginLoad());
+    for (int i = 0; i < 10; ++i) block();
+    const float before = buf.getSample(0, 127);
+
+    // Replace inside acquire(): the old buffer fades out over `fade` samples (2 blocks).
+    auto next = constantTrack(20000, sr, -0.5f);
+    gAcquireHook = [&] { holder.install(std::move(next), {}, holder.beginLoad()); };
+    block();
+    const float firstAfter = buf.getSample(0, 0); // ≈ 0.5: the old buffer still sounds at full gain
+    const int pendingSwap = holder.collect();     // 1: the fading buffer is still in use
+    const int liveSwap = BackingTrackBuffer::live.load();
+    // With the old buffer freed the next blocks would read freed memory: stop there.
+    const bool swapKept = pendingSwap == 1 && liveSwap == 2;
+    int pendingSwapAfter = -2, liveSwapAfter = -1, pendingUnload = -2, liveUnload = -1, pendingEnd = -2, liveEnd = -1;
+    if (swapKept) {
+        for (int i = 0; i < fade / 128 + 3; ++i) block();
+        pendingSwapAfter = holder.collect(); // 0: fade-out over, freed
+        liveSwapAfter = BackingTrackBuffer::live.load();
+        // Unload inside acquire(): the same for the fade-out to silence.
+        gAcquireHook = [&] { holder.unload(); };
+        block();
+        pendingUnload = holder.collect();
+        liveUnload = BackingTrackBuffer::live.load();
+        if (pendingUnload == 1 && liveUnload == 1) {
+            for (int i = 0; i < fade / 128 + 3; ++i) block();
+            pendingEnd = holder.collect();
+            liveEnd = BackingTrackBuffer::live.load();
+        }
+    }
+    gAcquireHook = nullptr;
+    const bool seam = gAcquireHookCalls == (swapKept ? 2 : 1);
+    const bool pass = seam && swapKept && before == 0.5f && std::fabs(firstAfter - 0.5f) < 0.01f
+                   && pendingSwapAfter == 0 && liveSwapAfter == 1 && pendingUnload == 1 && liveUnload == 1
+                   && pendingEnd == 0 && liveEnd == 0 && allocs == 0;
+    std::printf("bsr   swap / unload inside acquire(): old buffer kept for its fade-out, then freed  %-4s"
+                " seam calls %d; swap: retired %d live %d, after fade %d live %d; unload: retired %d live %d,"
+                " after fade %d live %d; first sample after swap %.4f; allocs %llu\n",
+                pass ? "PASS" : "FAIL", gAcquireHookCalls, pendingSwap, liveSwap, pendingSwapAfter, liveSwapAfter,
+                pendingUnload, liveUnload, pendingEnd, liveEnd, firstAfter, (unsigned long long)allocs);
+    std::fflush(stdout);
+    if (!swapKept) {
+        // The aux still holds the freed buffer as its tail: detach it without rendering again.
+        aux.setBackingTrack(nullptr);
+    }
+    return pass;
+}
+
 // Swap stress: an audio thread renders the aux node non-stop (transport playing) while this
 // thread loads / unloads 300 tracks (44.1 kHz → resampled to 48 kHz) and collects retired buffers.
 // The render never allocates or frees; every replaced buffer is freed here; nothing leaks.
@@ -2875,6 +2969,7 @@ int main(int argc, char** argv) {
     if (want("bsf")) unexpected += runBackingTrackSwapFade() ? 0 : 1;
     if (want("btr")) unexpected += runBackingTrackRegion() ? 0 : 1;
     if (want("btl")) unexpected += runBackingTrackLimits() ? 0 : 1;
+    if (want("bsr")) unexpected += runBackingTrackSwapInAcquire() ? 0 : 1;
     if (want("bts")) unexpected += runBackingTrackSwapStress() ? 0 : 1;
     if (want("aux0")) unexpected += runAuxSilent() ? 0 : 1;
     if (want("rsa")) unexpected += runAuxRebuildState() ? 0 : 1;

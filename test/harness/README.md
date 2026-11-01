@@ -40,7 +40,11 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   `collect()` until its fade-out ends), `btr` (loop-region rule on all its cases; decodes
   `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder, prints which length it yields and
   the rule chosen; the exact loop resampled 44.1 → 48 kHz is 743226 frames), `btl` (frame cap
-  and available-memory refusals), `bts` (300
+  and available-memory refusals), `bsr` (a replace, then an unload, published inside
+  `BackingTrack::acquire()` between its first read and its re-check, through the
+  `BACKING_TRACK_ACQUIRE_HOOK` seam the CMake file defines: `collect()` keeps the old buffer
+  while it fades out and frees it afterwards; the deterministic form of the race `bts` hits at
+  random; against sources without the seam it reports `seam calls 0` and fails), `bts` (300
   loads / unloads while another thread renders: 0 allocations and 0 frees in the render, every
   replaced buffer freed by `collect()`, a superseded load does not publish), `aux0` (aux with
   nothing to play outputs exact zeros; a graph with it equals one without it, sample for

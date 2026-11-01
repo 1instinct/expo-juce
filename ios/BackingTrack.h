@@ -28,6 +28,13 @@
 #include <string>
 #include <vector>
 
+// Test seam: the offline harness defines BACKING_TRACK_ACQUIRE_HOOK as the name of a function it
+// provides; acquire() calls it between its first read of the published pointer and the
+// re-validation, so a test can publish at exactly that point. Undefined in the module: no code.
+#ifdef BACKING_TRACK_ACQUIRE_HOOK
+void BACKING_TRACK_ACQUIRE_HOOK();
+#endif
+
 // MP3 gapless information of the source file (frames at the source rate).
 struct BackingTrackGapless {
     int64_t loopSamples = 0;
@@ -152,11 +159,19 @@ public:
     // The buffer to play in this block (nullptr = none), marked in use: buffers published before
     // it are no longer referenced by the reader once this returns, except the one it used before
     // a change, which stays protected (replacing an earlier one) until releaseTail().
+    //
+    // The tail slot is set inside the re-validation loop, on whichever pass first moves off
+    // `previous` (a publish can land after the first read and only be seen by the re-check), and
+    // always before inUse leaves `previous`: collect() reads inUse, then inUseTail, so at every
+    // instant `previous` is in at least one of the slots it reads.
     BackingTrackBuffer* acquire() noexcept {
         BackingTrackBuffer* const previous = inUse.load(std::memory_order_relaxed); // written by the reader only
         BackingTrackBuffer* p = published.load(std::memory_order_seq_cst);
-        if (p != previous && previous != nullptr) inUseTail.store(previous, std::memory_order_seq_cst);
+#ifdef BACKING_TRACK_ACQUIRE_HOOK
+        BACKING_TRACK_ACQUIRE_HOOK();
+#endif
         for (;;) {
+            if (p != previous && previous != nullptr) inUseTail.store(previous, std::memory_order_seq_cst);
             inUse.store(p, std::memory_order_seq_cst);
             BackingTrackBuffer* again = published.load(std::memory_order_seq_cst);
             if (again == p) return p;

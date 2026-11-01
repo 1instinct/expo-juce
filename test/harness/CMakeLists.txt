@@ -107,4 +107,6 @@ add_executable(harness harness.cpp ${ENGINE_CPP})
 target_include_directories(harness PRIVATE "${SNAP}")
 target_link_libraries(harness PRIVATE juce_lib)
 target_compile_definitions(harness PRIVATE HARNESS_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
-                                           HARNESS_JS_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+                                           HARNESS_JS_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../src"
+                                           # BackingTrack::acquire() test seam, see harness.cpp
+                                           BACKING_TRACK_ACQUIRE_HOOK=harnessBackingTrackAcquireHook)

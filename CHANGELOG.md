@@ -24,6 +24,10 @@ Includes everything in 0.7.0-rc.0 (16 voices, arpeggiator, 24 spectrum bands).
   on setup when listeners exist (and may start before setup, idling until the engine exists).
 - No beat events after all listeners were removed and one was added again: stopping the timer no
   longer drops the native beat callback.
+- Backing track: a replace or unload published while the audio thread was inside its
+  per-block buffer hand-over could let the replaced buffer be freed while its 5 ms fade-out
+  still read it (a crash or noise on the audio thread right after a swap; present since
+  0.6.0). The hand-over now keeps the old buffer protected on every path.
 
 ### Changed
 
