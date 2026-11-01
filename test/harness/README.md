@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, an, arp, arpv, sp)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, an, arp, arpv, sp, dr, drs, drb, drd)
 ```
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
@@ -76,6 +76,22 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   ≥ 0.95 in band 1; the edge table is strictly increasing with every band at least one bin wide
   at 48000 and 44100 Hz; `AnalysisRing::readRaw` is oldest-first and `GraphPlayer` publishes the
   device rate into the ring; `analyse` does not allocate).
+- Drums (`ios/DrumMachine.h`, pure C++): `dr` (each of the 8 voices at decay 0 / 0.5 / 1, 128-sample
+  blocks: sounds from sample 0, every 50 ms window is quieter than the one 100 ms before, ends in
+  exact zeros with the voice idle, and decay 0 < 0.5 < 1 in length; finite, bounded, no subnormal
+  sample; the closed hat ends a ringing open hat within 40 ms, an open hat does not choke the closed
+  hat; a retrigger equals a fresh hit sample for sample after the 64-sample declick, with no step
+  larger than the attack's; parameter clamps, NaN / inf / out-of-range ignored; the 4 tune / decay /
+  tone extremes with drive, all voices at once, 471-sample blocks; kit mute is exact 0 and muting
+  mid-sound ramps over one block; voice level 0 is exact 0; an idle machine leaves the buffer
+  untouched; velocity scales linearly; hit / peak counters move and the peak decays; 0
+  allocations), `drs` (through `PolySynthProcessor` and a `NoteEventQueue`, arp off and on: a hit
+  pushed from another thread sounds in the next 128-sample block from its first sample, on both
+  channels, outside `diag.peak` and the note counters, never reaches the arp, survives
+  `allNotesOff`; out-of-range voices are not queued; kit mute through an attached store;
+  `discardPending` and a full ring count hits apart from notes; 0 allocations), `drb` (all 8
+  voices kept sounding with drive, 48 kHz / 128, 20 s: must render under 0.05 × realtime),
+  `drd` (`src/drumDefaults.ts` has the same defaults as `DrumMachine.h`).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

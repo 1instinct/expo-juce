@@ -27,6 +27,7 @@ iOS only for now; the Android and web modules are scaffolds.
                             AuxProcessor (metronome + backing track) ───► audio output node (summed)
                             ├─ NoteEventQueue: note-on ring (256) drained at block start; releases as marks
                             ├─ 8 × Voice: dsp::Oscillator → StateVariableTPTFilter (LP) → ADSR
+                            ├─ DrumMachine (0.8.0+): 8 synthesized drum voices, mixed after the synth voices
                             └─ TransportEngine (tempo / position / beat crossings)
                             FxChainProcessor: drive → crush → eq → chorus → phaser → echo → reverb →
                             pump → compressor → safety limiter; settings in a process-lifetime store
@@ -55,9 +56,9 @@ Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack buil
 One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Also in 0.6.0: an `AuxProcessor` node summed into the output after the effects, with a sample-accurate metronome (5 click styles, bar accent) and a backing track (off-thread decode + resample, gapless MP3 loop regions, lock-free swap, follows transport play / stop / seek; see [Metronome and backing track](#metronome-and-backing-track-060)); `getAnalysis()` (output peak / rms, 128-point scope, last note, transport) for HUDs; a `hitPolygon` touch shape on `JucePadView`. Later: reorderable / per-node effects via modular routing (sub-project 5).
 
 ### Sub-project 3: Sample Playback / Drum Machine
-**Status:** Planned — an earlier JUCE sampler prototype is the starting point
+**Status:** Drum machine in progress (0.8.0-rc.0) — engine + JS API verified in the offline harness, not yet run on a device; sampler planned
 
-`SamplerProcessor` node that loads audio files and triggers playback via `noteOn`. Supports multi-sample mapping (e.g., different samples per MIDI note). Integrates with the transport for sequenced playback.
+0.8.0 adds a synthesized eight-voice drum part (kick, snare, closed / open hat, clap, two toms, rim; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). Next: a `SamplerProcessor` that loads audio files into the same voice slots (multi-sample mapping, transport-sequenced playback).
 
 ### Sub-project 4: Audio Input Processing
 **Status:** Planned
@@ -284,6 +285,55 @@ ExpoJuce.ARP_DEFAULTS;                        // the defaults below
   rebuild is in progress. Binaries older than 0.7.0: `setArpeggiator` returns `false`,
   `getArpeggiatorState` returns `ARP_DEFAULTS`. Web: the same.
 
+### Drums (0.8.0+)
+
+Eight synthesized voices (no samples), in pad order: `0` kick, `1` snare, `2` closed hat, `3`
+open hat, `4` clap, `5` low tom, `6` high tom, `7` rim. The drum part is mixed with the synth
+before the effects chain (so drive, echo, reverb, … apply to both) with its own level and mute;
+the synth's `setMasterLevel` does not affect it and the arpeggiator never applies to it.
+
+```ts
+if (ExpoJuce.hasDrums()) {
+  ExpoJuce.drumHit(0, 120);                                  // kick, velocity 1–127
+  ExpoJuce.setDrumVoice(1, { tune: -2, decay: 0.3, tone: 0.8 }); // partial; clamped
+  ExpoJuce.setDrumKit({ level: 0.9, drive: 0.25 });
+  const { kit, voices } = ExpoJuce.getDrumState();           // as stored (after clamping)
+}
+```
+
+- `drumHit(voice, velocity)`: any thread, lock-free, through the same queue as `noteOn` (hits and
+  notes keep their order and start at the next audio block). Each voice is monophonic: a new hit
+  restarts it (the previous sound fades out over 64 samples, so retriggers do not click). The
+  closed hat chokes the open hat (it fades out over about 12 ms). A voice outside 0–7 (or not an
+  integer) is ignored; velocity is clamped to 1–127 and scales the level linearly. Hits are
+  dropped while the engine is not set up, like note-ons.
+- `setDrumVoice(voice, params)` (`DrumVoiceParams`; omitted and unknown keys unchanged, numbers
+  clamped; `false` for a voice outside 0–7): `tune` −24..24 semitones (0), `decay` 0–1 (0.5:
+  scales every envelope of the voice, 0 = ×0.25, 1 = ×4), `tone` 0–1 (0.5, per voice below),
+  `level` 0–1 (0.8).
+- `setDrumKit(params)` (`DrumKitParams`): `level` 0–1 (0.8), `mute` (false), `drive` 0–1 (0: soft
+  saturation of the kit sum, blended in with the amount). Level and mute ramp over one block.
+- `DRUM_VOICE_DEFAULTS`, `DRUM_KIT_DEFAULTS`, `DRUM_VOICE_COUNT` (8) are exported.
+- Parameters are kept natively for the life of the app (they work before `setup()` and survive
+  engine rebuilds). Binaries older than 0.8.0 and web: `hasDrums()` is `false`, `drumHit` does
+  nothing, the setters return `false`, `getDrumState()` returns the defaults.
+- Diagnostics: `drumHits` (hits started, cumulative since launch), `drumPeak` (the drum part's
+  peak before the effects, decaying hold). `synthPeak` no longer includes drums.
+
+| # | Voice | Model | `tone` |
+|---|---|---|---|
+| 0 | Kick | sine, pitch envelope from 4× the base (52 Hz) down within ~40 ms, noise click, amp decay 0.6 s | click amount |
+| 1 | Snare | two sines (185 / 330 Hz, short pitch bend) + band-passed noise, separate decays (0.2 / 0.3 s) | noise vs body, noise band 2.5–7 kHz |
+| 2 | Closed hat | six square oscillators at 808 ratios + noise, band-pass then high-pass, 0.09 s | brighter, more noise |
+| 3 | Open hat | same source, 0.7 s; choked by the closed hat | same |
+| 4 | Clap | band-passed noise, three bursts 10 ms apart, then a 0.35 s tail | band centre 0.9–2.5 kHz |
+| 5 | Low tom | sine (95 Hz) with a small pitch drop, 0.5 s | attack noise |
+| 6 | High tom | same at 150 Hz, 0.4 s | attack noise |
+| 7 | Rim | band-passed noise click (3.5 kHz) + sine ping (1660 + 480 Hz), 0.07 s | click vs ping |
+
+Decay times above are to −60 dB at `decay` 0.5. More on the voices in
+[docs/drums.md](docs/drums.md).
+
 ### Analysis (0.6.0+)
 
 ```ts
@@ -332,6 +382,16 @@ import { JucePadView } from 'expo-juce';
 
 Check the shipped type definitions for the exact event payloads once 0.5.2 is published.
 
+`mode` (0.8.0+): `'notes'` (default) holds `note` on the synth while touched; `'drums'` makes
+every touch-down hit drum voice `note` (0–7) natively, with the same `velocity` (one-shot; a
+second finger on the pad retriggers it). `onNoteOn` fires per hit and `onNoteOff` when the last
+touch lifts; no note-off reaches the engine. Changing `mode` releases the pad. Older binaries
+ignore the prop (the pad keeps playing notes), so check `hasDrums()` first.
+
+```tsx
+<JucePadView mode="drums" note={0} velocity={110} style={{ width: 80, height: 80 }} />
+```
+
 `hitPolygon` (0.6.0+) makes the touch area non-rectangular: a flat `[x0, y0, x1, y1, …]`
 polygon normalised to the view (0–1). Touches outside it (including on its children) pass
 through to the views underneath, so pads with overlapping bounding boxes do not steal each
@@ -355,6 +415,16 @@ as a pass/fail ladder — see [docs/latency.md](docs/latency.md#5-a-diagnostics-
 
 0.6.0+ adds `fxProcessCount`, `fxLimiterGain` (1 = the safety limiter is idle),
 `fxNonFiniteResets`, `metronomeClicks`, `backingTrackLoaded` and `backingTrackPositionSec`.
+0.8.0+ adds `drumHits` and `drumPeak`.
+
+### Beat events
+
+`addBeatListener(fn)` gets `{ beat, bpm, position }` each time the playing transport crosses a
+beat (polled every 16 ms on the main thread): `beat` is the fractional transport position at the
+end of the audio block that crossed it (`Math.floor(beat)` is the beat number), `position`
+(0.8.0+) the fractional position when the event is sent. 0.8.0 fixes two cases where no events
+arrived: a listener added before `setup()` (the timer now starts on setup), and listeners added
+again after all had been removed (removing the last listener no longer drops the native callback).
 
 Synth settings, effect, metronome and backing-track settings (and the loaded track) and transport state (tempo, position, playing) survive the
 engine's automatic rebuilds after a media-services reset or a stalled device; held notes do not.
@@ -431,6 +501,8 @@ its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the m
 ## Documentation
 
 - [docs/latency.md](docs/latency.md) — latency budget, signal path, changes, panel fields, slow-motion measurement
+- [docs/drums.md](docs/drums.md) — drum voices: models, parameters, realtime rules
+- [CHANGELOG.md](CHANGELOG.md)
 - [test/harness/README.md](test/harness/README.md) — the offline engine harness
 
 ## License
