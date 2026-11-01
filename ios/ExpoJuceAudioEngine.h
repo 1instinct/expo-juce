@@ -2,7 +2,9 @@
 
 #import <Foundation/Foundation.h>
 
-typedef void(^BeatCallback)(double beat, double bpm);
+// beat: transport position (beats, fractional) at the end of the block that crossed a beat;
+// position: transport position (beats, fractional) when the event is delivered.
+typedef void(^BeatCallback)(double beat, double bpm, double position);
 
 @interface ExpoJuceAudioEngine : NSObject
 
@@ -79,6 +81,21 @@ typedef void(^BeatCallback)(double beat, double bpm);
 // Every option as stored (pattern as an array of `length` booleans).
 - (NSDictionary<NSString *, id> *)arpeggiatorState;
 
+// Drums (0.8.0+): eight synthesized voices mixed before the effects (see DrumMachine.h).
+// drumHit: voice 0–7, velocity clamped to 1–127; any thread, lock-free, through the note queue
+// (out-of-range voice ignored; dropped while the engine is not ready, like noteOn).
+- (void)drumHit:(int)voice velocity:(int)velocity;
+// drumHit from a native touch (JucePadView in drums mode); touchTimestamp as for noteOn.
+- (void)drumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp;
+// Parameters: lock-free, any thread, remembered before setup and across rebuilds; absent / unknown
+// keys and non-finite values unchanged, numbers clamped. Voice keys: tune (semitones −24..24),
+// decay, tone, level (0–1). NO for a voice outside 0–7 (nothing applied).
+- (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params;
+// Kit keys: level (0–1), mute (bool), drive (0–1). Always YES.
+- (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params;
+// { kit: { level, mute, drive }, voices: [8 × { tune, decay, tone, level }] } as stored.
+- (NSDictionary<NSString *, id> *)drumState;
+
 // Output analysis for HUDs: { peak, rms, scope: [128 numbers], bands: [24 numbers], sampleRate,
 // lastNote, bpm, beat, playing, arp: { active, step, steps, note } }. Any thread; one 2048-point
 // FFT per call (about 50 µs); zeros when the engine is not running.
@@ -96,6 +113,8 @@ typedef void(^BeatCallback)(double beat, double bpm);
 // Beat events
 - (void)setBeatCallback:(BeatCallback)callback;
 // The beat timer lives on the main queue; called off the main thread these re-dispatch to main.
+// startBeatTimer works before setup (the timer idles until the engine exists); stopBeatTimer keeps
+// the callback.
 - (void)startBeatTimer;
 - (void)stopBeatTimer;
 

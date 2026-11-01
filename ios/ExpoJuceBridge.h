@@ -2,7 +2,9 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
+// beat: fractional transport position at the end of the block that crossed a beat;
+// position: fractional transport position when the event is delivered.
+typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 
 @interface ExpoJuceBridge : NSObject
 
@@ -66,6 +68,17 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 // mode / rate, pattern not 1–16 booleans. Swift: `setArpeggiator(_:)`, `getArpeggiatorState()`.
 + (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options NS_SWIFT_NAME(setArpeggiator(_:));
 + (NSDictionary<NSString *, id> *)getArpeggiatorState NS_SWIFT_NAME(getArpeggiatorState());
+
+// ── Drums (0.8.0+) ───────────────────────────────────────────────
+// drumHit: voice 0–7 (others ignored), velocity clamped to 1–127; lock-free, any thread.
+// Parameters: lock-free, remembered before setup and across rebuilds; unknown keys ignored, values
+// clamped. setDrumVoice returns NO for a voice outside 0–7. Swift: `drumHit(_:velocity:)`,
+// `padDrumHit(_:velocity:touchTimestamp:)`, `setDrumVoice(_:params:)`, `setDrumKit(_:)`, `getDrumState()`.
++ (void)drumHit:(int)voice velocity:(int)velocity NS_SWIFT_NAME(drumHit(_:velocity:));
++ (void)padDrumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp NS_SWIFT_NAME(padDrumHit(_:velocity:touchTimestamp:));
++ (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params NS_SWIFT_NAME(setDrumVoice(_:params:));
++ (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params NS_SWIFT_NAME(setDrumKit(_:));
++ (NSDictionary<NSString *, id> *)getDrumState NS_SWIFT_NAME(getDrumState());
 
 // ── Transport ────────────────────────────────────────────────────
 + (void)startTransport;

@@ -15,6 +15,7 @@
 #include "AnalysisRing.h"
 #include "TransportEngine.h"
 #include "Arpeggiator.h"
+#include "DrumMachine.h"
 #include "SpectrumAnalyser.h"
 #include <atomic>
 #include <cmath>
@@ -148,6 +149,12 @@ static float sLastBands[SpectrumAnalyser::kBands] = {};
 // it once per block. Nothing is copied into the synth, so a setArpeggiator during a rebuild (the
 // window withSynth would drop) is seen by the next block like any other.
 static ArpSettingsStore sArpOptions;
+
+// ── Drum parameters ──
+// Same pattern again: per-voice and kit parameters as relaxed atomics in a process-lifetime store
+// (no lock, works before setup, survives rebuilds), attached to each synth's drum part, which reads
+// it once per block. Drum hits themselves go through sNoteQueue like note-ons.
+static DrumParamStore sDrumParams;
 
 static dispatch_queue_t backingTrackQueue() {
     static dispatch_queue_t queue;
@@ -407,6 +414,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sSynth->setNoteQueue(&sNoteQueue);
     sSynth->setAnalysis(&sAnalysis);
     sSynth->arp().setSettingsStore(&sArpOptions); // the live options, before and across rebuilds
+    sSynth->drums().setParamStore(&sDrumParams);  // same for the drum part
 
     self.setupStep = 7;
     NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth, fx chain)");
@@ -828,7 +836,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     self.rebuildAttempts = self.rebuildAttempts + 1;
     NSLog(@"[ExpoJuceAudioEngine] rebuilding engine (%@), attempt %d", context, self.rebuildAttempts);
 
-    // Beat timer stop is main-thread work outside the lock; it also clears beatCallback.
+    // Beat timer stop is main-thread work outside the lock (the callback is restored below).
     [self stopBeatTimer];
     BOOL ok = NO;
     {
@@ -905,6 +913,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
     double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
     double metronomeClicks = 0.0, backingTrackPositionSec = -1.0;
+    double drumPeak = 0.0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
         if (acquireUserLock(lock)) {
@@ -934,6 +943,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 activeVoices = synth->diag.activeVoices.load(relaxed);
                 lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
                 lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
+                drumPeak = (double)synth->drums().diag.peak.load(relaxed);
             }
             if (FxChainProcessor* fx = ready ? sFx : nullptr) {
                 fxProcessCount = (double)fx->diag.processCount.load(relaxed);
@@ -982,6 +992,9 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"metronomeClicks"] = @(metronomeClicks);
     d[@"backingTrackLoaded"] = @(sBackingTrack.hasTrack() ? YES : NO);
     d[@"backingTrackPositionSec"] = @(backingTrackPositionSec);
+    // Drum hits the engine has started (cumulative since launch, from the process-lifetime queue).
+    d[@"drumHits"] = @((double)sNoteQueue.drumHitsConsumed.load(std::memory_order_relaxed));
+    d[@"drumPeak"] = @(drumPeak);
 
     // engineState: recovering (rebuild running or retry scheduled) > ready > failed > uninitialized.
     // `ready` is false when the lock was busy, which only happens during a lifecycle section.
@@ -1298,6 +1311,61 @@ static NSString *backingTrackPath(NSString *uri) {
     };
 }
 
+// ── Drums ──
+// Hits: through sNoteQueue without the lock, like noteOn (accepted only while the engine is
+// ready). Parameters: sDrumParams, the process-lifetime store (no lock, works before setup).
+// Absent keys, keys of the wrong type and non-finite numbers are left unchanged.
+
+- (void)drumHit:(int)voice velocity:(int)velocity {
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
+    sNoteQueue.pushDrumHit(voice, velocity);
+}
+
+- (void)drumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
+    const juce::int64 touchTicks = (touchTimestamp > 0.0)
+        ? juce::Time::secondsToHighResolutionTicks(touchTimestamp)
+        : (juce::int64)0;
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
+    sNoteQueue.pushDrumHit(voice, velocity, touchTicks);
+}
+
+- (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params {
+    if (voice < 0 || voice >= kDrumVoices) return NO;
+    for (int p = 0; p < kDrumParamCount; ++p) {
+        if (NSNumber *v = numberFrom(params, @(kDrumParamNames[p]))) sDrumParams.setVoiceParam(voice, p, v.doubleValue);
+    }
+    return YES;
+}
+
+- (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params {
+    if (NSNumber *v = numberFrom(params, @"level")) sDrumParams.setKitLevel(v.doubleValue);
+    if (NSNumber *v = numberFrom(params, @"drive")) sDrumParams.setKitDrive(v.doubleValue);
+    if (NSNumber *v = numberFrom(params, @"mute")) sDrumParams.setKitMute(v.boolValue ? true : false);
+    return YES;
+}
+
+- (NSDictionary<NSString *, id> *)drumState {
+    NSMutableArray<NSDictionary<NSString *, NSNumber *> *> *voices = [NSMutableArray arrayWithCapacity:kDrumVoices];
+    for (int v = 0; v < kDrumVoices; ++v) {
+        const DrumVoiceParams p = sDrumParams.voice(v);
+        [voices addObject:@{
+            @"tune": @(fxValueForJS(p.tune)),
+            @"decay": @(fxValueForJS(p.decay)),
+            @"tone": @(fxValueForJS(p.tone)),
+            @"level": @(fxValueForJS(p.level)),
+        }];
+    }
+    const DrumKitParams kit = sDrumParams.kit();
+    return @{
+        @"kit": @{
+            @"level": @(fxValueForJS(kit.level)),
+            @"mute": @(kit.mute ? YES : NO),
+            @"drive": @(fxValueForJS(kit.drive)),
+        },
+        @"voices": voices,
+    };
+}
+
 // ── Analysis ──
 // Any thread, no lock: everything is read from the process-lifetime sAnalysis (levels and scope
 // written by GraphPlayer, transport as of the last block written by the aux node, arp state
@@ -1376,6 +1444,8 @@ static NSString *backingTrackPath(NSString *uri) {
 // Do not hand-write it as `self.beatCallback = callback` — that calls itself forever.
 // The beat timer (and beatCallback) are main-thread state: start/stop called from another
 // thread (Expo's OnStartObserving / OnStopObserving / OnDestroy) re-dispatch to main.
+// The timer may start before setup (an observer subscribed first): it idles until a synth exists.
+// Stopping it keeps beatCallback, so a later start (the next observer) delivers events again.
 
 - (void)startBeatTimer {
     if (![NSThread isMainThread]) {
@@ -1384,7 +1454,6 @@ static NSString *backingTrackPath(NSString *uri) {
         return;
     }
     if (self.beatTimer) return;
-    if (!sSynth) return;
 
     self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
@@ -1394,7 +1463,10 @@ static NSString *backingTrackPath(NSString *uri) {
         if (!strongSelf || !sSynth) return;
         BeatCallback cb = strongSelf.beatCallback;
         if (sSynth->beatState.crossed.exchange(false) && cb) {
-            cb(sSynth->beatState.beat.load(), sSynth->beatState.bpm.load());
+            const double beat = sSynth->beatState.beat.load();
+            // Fractional transport position now (main thread: sTransport cannot change under us).
+            const double position = sTransport ? sTransport->getPosition() : beat;
+            cb(beat, sSynth->beatState.bpm.load(), position);
         }
     });
     dispatch_resume(self.beatTimer);
@@ -1410,7 +1482,6 @@ static NSString *backingTrackPath(NSString *uri) {
         dispatch_source_cancel(self.beatTimer);
         self.beatTimer = nil;
     }
-    self.beatCallback = nil;
 }
 
 - (void)dealloc { [self shutdown]; }

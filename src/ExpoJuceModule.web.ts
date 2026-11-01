@@ -6,11 +6,15 @@ import type {
   BackingTrackGapless,
   BackingTrackInfo,
   BackingTrackOptions,
+  DrumKitParams,
+  DrumState,
+  DrumVoiceParams,
   EffectsState,
   MetronomeOptions,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
 import { arpDefaults } from './arpDefaults';
+import { drumDefaults } from './drumDefaults';
 
 const emitter = new EventEmitter({} as any);
 
@@ -63,5 +67,19 @@ export default {
   },
   getArpeggiatorState(): ArpOptions {
     return arpDefaults();
+  },
+  // No drums on web: hits are ignored, nothing applied, defaults reported.
+  hasDrums(): boolean {
+    return false;
+  },
+  drumHit(_voice: number, _velocity: number): void {},
+  setDrumVoice(_voice: number, _params: Partial<DrumVoiceParams>): boolean {
+    return false;
+  },
+  setDrumKit(_params: Partial<DrumKitParams>): boolean {
+    return false;
+  },
+  getDrumState(): DrumState {
+    return drumDefaults();
   },
 };

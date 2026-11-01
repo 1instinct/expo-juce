@@ -26,9 +26,14 @@ import {
   ArpRate,
   ArpOptions,
   ArpAnalysis,
+  PadMode,
+  DrumVoiceParams,
+  DrumKitParams,
+  DrumState,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
 import { ARP_DEFAULTS, arpDefaults } from './arpDefaults';
+import { DRUM_KIT_DEFAULTS, DRUM_VOICE_COUNT, DRUM_VOICE_DEFAULTS, drumDefaults } from './drumDefaults';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
@@ -254,6 +259,61 @@ export function getArpeggiatorState(): ArpOptions {
   return ExpoJuceModule.getArpeggiatorState();
 }
 
+// ── Drums (0.8.0+) ───────────────────────────────────────────────
+// Eight synthesized voices in pad order: 0 kick, 1 snare, 2 closed hat, 3 open hat (choked by the
+// closed hat), 4 clap, 5 low tom, 6 high tom, 7 rim. Each voice is monophonic: a hit restarts it.
+// The drum part is mixed with the synth before the effects chain; the arpeggiator never applies
+// to it. Parameters are synchronous and lock-free, remembered natively before setup() and across
+// engine rebuilds. Binaries older than 0.8.0: hasDrums() is false, drumHit is a no-op, the setters
+// return false and getDrumState returns the defaults.
+
+export { DRUM_VOICE_COUNT, DRUM_VOICE_DEFAULTS, DRUM_KIT_DEFAULTS };
+
+const DRUM_VOICE_KEYS = ['tune', 'decay', 'tone', 'level'] as const;
+
+const isDrumVoice = (voice: number): boolean =>
+  Number.isInteger(voice) && voice >= 0 && voice < DRUM_VOICE_COUNT;
+
+/** True when this binary has the drum part (0.8+). */
+export function hasDrums(): boolean {
+  return typeof ExpoJuceModule?.hasDrums === 'function' && ExpoJuceModule.hasDrums() === true;
+}
+
+/** Trigger voice 0..7 at velocity 1..127. Thread-safe, lock-free; same queue as noteOn. Out-of-range voice is ignored. */
+export function drumHit(voice: number, velocity: number): void {
+  if (typeof ExpoJuceModule?.drumHit !== 'function') return;
+  if (!isDrumVoice(voice) || !Number.isFinite(velocity)) return;
+  ExpoJuceModule.drumHit(voice, Math.min(127, Math.max(1, Math.round(velocity))));
+}
+
+/** Partial update of one voice; unknown keys ignored; values clamped. Returns false if unsupported. */
+export function setDrumVoice(voice: number, params: Partial<DrumVoiceParams>): boolean {
+  if (typeof ExpoJuceModule?.setDrumVoice !== 'function') return false;
+  if (!isDrumVoice(voice)) return false;
+  const clean: Partial<DrumVoiceParams> = {};
+  for (const key of DRUM_VOICE_KEYS) {
+    const value = params?.[key];
+    if (typeof value === 'number' && Number.isFinite(value)) clean[key] = value;
+  }
+  return ExpoJuceModule.setDrumVoice(voice, clean) === true;
+}
+
+/** Partial update of the kit (level 0–1, mute, drive 0–1); unknown keys ignored; values clamped. Returns false if unsupported. */
+export function setDrumKit(params: Partial<DrumKitParams>): boolean {
+  if (typeof ExpoJuceModule?.setDrumKit !== 'function') return false;
+  const clean: Partial<DrumKitParams> = {};
+  if (typeof params?.level === 'number' && Number.isFinite(params.level)) clean.level = params.level;
+  if (typeof params?.drive === 'number' && Number.isFinite(params.drive)) clean.drive = params.drive;
+  if (typeof params?.mute === 'boolean') clean.mute = params.mute;
+  return ExpoJuceModule.setDrumKit(clean) === true;
+}
+
+/** The kit and the 8 voices as stored natively (after clamping); the defaults on older binaries. */
+export function getDrumState(): { kit: DrumKitParams; voices: DrumVoiceParams[] } {
+  if (typeof ExpoJuceModule?.getDrumState !== 'function') return drumDefaults();
+  return ExpoJuceModule.getDrumState();
+}
+
 // ── Transport ────────────────────────────────────────────────────
 
 export function startTransport(): void {
@@ -325,4 +385,8 @@ export {
   ArpRate,
   ArpOptions,
   ArpAnalysis,
+  PadMode,
+  DrumVoiceParams,
+  DrumKitParams,
+  DrumState,
 };

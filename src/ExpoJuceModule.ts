@@ -7,6 +7,9 @@ import type {
   BackingTrackGapless,
   BackingTrackInfo,
   BackingTrackOptions,
+  DrumKitParams,
+  DrumState,
+  DrumVoiceParams,
   EffectsState,
   MetronomeOptions,
 } from './ExpoJuce.types';
@@ -55,6 +58,13 @@ export type ExpoJuceNativeModule = {
   // Arpeggiator (0.7.0+)
   setArpeggiator?(options: Partial<ArpOptions>): boolean;
   getArpeggiatorState?(): ArpOptions;
+
+  // Drums (0.8.0+)
+  hasDrums?(): boolean;
+  drumHit?(voice: number, velocity: number): void;
+  setDrumVoice?(voice: number, params: Partial<DrumVoiceParams>): boolean;
+  setDrumKit?(params: Partial<DrumKitParams>): boolean;
+  getDrumState?(): DrumState;
 
   // Transport
   startTransport(): void;

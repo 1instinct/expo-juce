@@ -71,6 +71,21 @@
 }
 + (NSDictionary<NSString *, id> *)getArpeggiatorState { return [[ExpoJuceAudioEngine sharedInstance] arpeggiatorState]; }
 
+// ── Drums ──
++ (void)drumHit:(int)voice velocity:(int)velocity {
+    [[ExpoJuceAudioEngine sharedInstance] drumHit:voice velocity:velocity];
+}
++ (void)padDrumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
+    [[ExpoJuceAudioEngine sharedInstance] drumHit:voice velocity:velocity touchTimestamp:touchTimestamp];
+}
++ (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params {
+    return [[ExpoJuceAudioEngine sharedInstance] setDrumVoice:voice params:params];
+}
++ (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params {
+    return [[ExpoJuceAudioEngine sharedInstance] setDrumKit:params];
+}
++ (NSDictionary<NSString *, id> *)getDrumState { return [[ExpoJuceAudioEngine sharedInstance] drumState]; }
+
 // ── Transport ──
 + (void)startTransport { [[ExpoJuceAudioEngine sharedInstance] startTransport]; }
 + (void)stopTransport { [[ExpoJuceAudioEngine sharedInstance] stopTransport]; }
