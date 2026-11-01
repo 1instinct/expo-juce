@@ -10,13 +10,20 @@
 #include <cstdint>
 #include <thread>
 
-// A note-on waiting for the audio thread.
+// What a queued event starts.
+enum class NoteEventKind : uint8_t {
+    Note = 0, // a synth note-on (`note` 0–127)
+    Drum = 1, // a drum hit (`note` = drum voice 0–7); one-shot, never released, never arpeggiated
+};
+
+// A note-on (or drum hit) waiting for the audio thread.
 struct NoteEvent {
-    int note;               // 0–127
+    int note;               // 0–127, or the drum voice for kind Drum
     int velocity;
-    uint64_t seq;           // NoteEventQueue sequence number (1, 2, …), compared with the release marks
+    uint64_t seq;           // NoteEventQueue sequence number (1, 2, …), compared with the release marks; 0 for a drum hit
     juce::int64 stampTicks; // juce::Time::getHighResolutionTicks() at enqueue
     juce::int64 touchTicks; // originating UITouch.timestamp in high-res ticks (same clock); 0 if not a touch
+    NoteEventKind kind = NoteEventKind::Note;
 };
 
 // Note input for the synth: note-ons travel in a ring, releases are marks.
@@ -51,12 +58,33 @@ public:
             return false;
         }
         const uint64_t seq = lastSeq.load(std::memory_order_relaxed) + 1;
-        ring[wp] = { note, velocity, seq, juce::Time::getHighResolutionTicks(), touchTicks };
+        ring[wp] = { note, velocity, seq, juce::Time::getHighResolutionTicks(), touchTicks, NoteEventKind::Note };
         lastOnSeq[note].store(seq, std::memory_order_release);
         lastSeq.store(seq, std::memory_order_release);
         // Count before publishing: the release-store below orders this increment ahead of the
         // consumer's notesConsumed increment for the same event (consumed never exceeds queued).
         notesQueued.fetch_add(1, std::memory_order_relaxed);
+        writePos.store(next, std::memory_order_release);
+        return true;
+    }
+
+    // A drum hit (voice 0..kMaxDrumVoice, velocity clamped to 1–127) through the same ring as the
+    // note-ons, so hits and notes keep their order. Hits carry no sequence number and are not
+    // touched by the release marks. Returns false for an out-of-range voice (ignored, not counted)
+    // or a full ring (counted in drumHitsDropped).
+    static constexpr int kMaxDrumVoice = 7;
+    bool pushDrumHit(int voice, int velocity, juce::int64 touchTicks = 0) {
+        if (voice < 0 || voice > kMaxDrumVoice) return false;
+        velocity = std::clamp(velocity, 1, 127);
+        SpinGuard guard(producerLock);
+        const int wp = writePos.load(std::memory_order_relaxed);
+        const int next = (wp + 1) % kSize;
+        if (next == readPos.load(std::memory_order_acquire)) {
+            drumHitsDropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        ring[wp] = { voice, velocity, 0, juce::Time::getHighResolutionTicks(), touchTicks, NoteEventKind::Drum };
+        drumHitsQueued.fetch_add(1, std::memory_order_relaxed);
         writePos.store(next, std::memory_order_release);
         return true;
     }
@@ -80,7 +108,8 @@ public:
         const int wp = writePos.load(std::memory_order_acquire);
         while (rp != wp) {
             onNoteOn(ring[rp]);
-            notesConsumed.fetch_add(1, std::memory_order_relaxed);
+            if (ring[rp].kind == NoteEventKind::Drum) drumHitsConsumed.fetch_add(1, std::memory_order_relaxed);
+            else notesConsumed.fetch_add(1, std::memory_order_relaxed);
             rp = (rp + 1) % kSize;
         }
         readPos.store(rp, std::memory_order_release);
@@ -103,9 +132,15 @@ public:
     // Drops queued note-ons (counted in notesDiscarded). Consumer side: call only while no audio
     // thread drains the queue (engine setup, before the device callback is attached).
     void discardPending() {
-        const int rp = readPos.load(std::memory_order_relaxed);
+        int rp = readPos.load(std::memory_order_relaxed);
         const int wp = writePos.load(std::memory_order_acquire);
-        notesDiscarded.fetch_add((uint32_t)((wp - rp + kSize) % kSize), std::memory_order_relaxed);
+        uint32_t notes = 0, drums = 0;
+        for (; rp != wp; rp = (rp + 1) % kSize) {
+            if (ring[rp].kind == NoteEventKind::Drum) ++drums;
+            else ++notes;
+        }
+        notesDiscarded.fetch_add(notes, std::memory_order_relaxed);
+        drumHitsDiscarded.fetch_add(drums, std::memory_order_relaxed);
         readPos.store(wp, std::memory_order_release);
     }
 
@@ -115,6 +150,11 @@ public:
     std::atomic<uint32_t> notesConsumed{0};
     std::atomic<uint32_t> notesDropped{0};   // note-on rejected: ring full
     std::atomic<uint32_t> notesDiscarded{0}; // dropped by discardPending (engine setup)
+    // Drum hits, counted apart from the notes (same invariants).
+    std::atomic<uint32_t> drumHitsQueued{0};
+    std::atomic<uint32_t> drumHitsConsumed{0};
+    std::atomic<uint32_t> drumHitsDropped{0};
+    std::atomic<uint32_t> drumHitsDiscarded{0};
     // Last note the synth started (0–127), -1 = none yet. Written by the consumer (relaxed).
     std::atomic<int> lastNoteStarted{-1};
 

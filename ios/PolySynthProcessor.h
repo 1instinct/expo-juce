@@ -7,10 +7,13 @@
 #include "TransportEngine.h"
 #include "NoteEventQueue.h"
 #include "Arpeggiator.h"
+#include "DrumMachine.h"
 #include "AnalysisRing.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+
+static_assert(NoteEventQueue::kMaxDrumVoice == kDrumVoices - 1, "drum voice range of the note queue");
 
 struct BeatState {
     std::atomic<bool> crossed{false};
@@ -75,6 +78,8 @@ public:
     void noteOn(int note, int velocity, juce::int64 touchTicks = 0) { queue->pushNoteOn(note, velocity, touchTicks); }
     void noteOff(int note) { queue->pushNoteOff(note); }
     void allNotesOff() { queue->pushAllNotesOff(); }
+    // A drum hit (voice 0–7, velocity 1–127) through the same queue; any thread. Out of range: ignored.
+    void drumHit(int voice, int velocity, juce::int64 touchTicks = 0) { queue->pushDrumHit(voice, velocity, touchTicks); }
 
     // The queue this synth reads its notes from: its own by default; the engine passes its
     // process-lifetime queue (before the synth is attached to a device). nullptr = own queue. The
@@ -102,6 +107,13 @@ public:
     Arpeggiator& arp() { return arpeggiator; }
     const Arpeggiator& arp() const { return arpeggiator; }
 
+    // The drum part (0.8.0+): drained drum hits trigger it (never the arpeggiator), and it is mixed
+    // into this processor's output after the synth voices, so it goes through the same effects
+    // chain. Its parameters: drums().setParamStore / params() (atomics, any thread). Its level is
+    // its own (the synth's master level does not apply), and it is left out of diag.peak.
+    DrumMachine& drums() { return drumMachine; }
+    const DrumMachine& drums() const { return drumMachine; }
+
     void setTransport(TransportEngine* t) { transport = t; }
     // Receives the arpeggiator state every block (AnalysisRing::publishArp). nullptr = none.
     void setAnalysis(AnalysisRing* a) { analysis = a; }
@@ -112,6 +124,7 @@ private:
     static constexpr int kArpEventCapacity = Arpeggiator::kMaxEvents;
 
     void startQueuedNote(const NoteEvent& event);
+    void startDrumHit(const NoteEvent& event);
     void recordNoteLatency(const NoteEvent& event);
     void renderVoices(float* mono, int numSamples, Waveform wf, float detune, float cutoff, float reso, float master);
     void applyArpEvent(const ArpEvent& event);
@@ -121,6 +134,7 @@ private:
     TransportEngine* transport = nullptr;
     AnalysisRing* analysis = nullptr;
     Arpeggiator arpeggiator;
+    DrumMachine drumMachine;
     ArpEvent arpEvents[kArpEventCapacity]; // this block's arp events (audio thread)
     int arpEventCount = 0;
     uint64_t lastAllReleasedSeen = 0;      // NoteEventQueue::allReleasedMark last applied to the arp

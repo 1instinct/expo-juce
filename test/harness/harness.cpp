@@ -14,6 +14,7 @@
 #include "AnalysisRing.h"
 #include "Arpeggiator.h"
 #include "SpectrumAnalyser.h"
+#include "DrumMachine.h"
 
 #include <atomic>
 #include <chrono>
@@ -2379,6 +2380,417 @@ static bool runSpectrum() {
     return pass;
 }
 
+//==============================================================================
+// Drum machine (ios/DrumMachine.h, pure C++) and the drum part through PolySynthProcessor.
+
+// Renders `total` samples of `dm` in `block`-sample blocks into `out` (allocation-counted);
+// `before(done)` runs before each block.
+static void renderDrums(DrumMachine& dm, int total, int block, std::vector<float>& out,
+                        const std::function<void(int)>& before = {}) {
+    out.assign((size_t)total, 0.0f);
+    for (int done = 0; done < total;) {
+        const int n = std::min(block, total - done);
+        if (before) before(done);
+        tCountAllocs = true;
+        dm.render(&out[(size_t)done], n);
+        tCountAllocs = false;
+        done += n;
+    }
+}
+
+static double rmsOf(const std::vector<float>& x, int from, int to) {
+    from = std::max(0, from);
+    to = std::min((int)x.size(), to);
+    if (to <= from) return 0.0;
+    double acc = 0.0;
+    for (int i = from; i < to; ++i) acc += (double)x[(size_t)i] * x[(size_t)i];
+    return std::sqrt(acc / (to - from));
+}
+
+// Sample after which the output is exactly 0 to the end (0 if it is all 0).
+static int lastNonZero(const std::vector<float>& x) {
+    for (int i = (int)x.size() - 1; i >= 0; --i)
+        if (x[(size_t)i] != 0.0f) return i + 1;
+    return 0;
+}
+
+static bool cleanSamples(const std::vector<float>& x, float limit) {
+    for (float v : x)
+        if (!std::isfinite(v) || std::fabs(v) > limit || std::fpclassify(v) == FP_SUBNORMAL) return false;
+    return true;
+}
+
+static bool runDrums() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+
+    // 1. Every voice: sounds from sample 0, its envelope decays, ends in exact silence (the voice
+    //    goes idle), finite, bounded, no subnormals; decay 0 < 0.5 < 1 in length.
+    std::string lengths;
+    for (int voice = 0; voice < kDrumVoices; ++voice) {
+        int len[3] = {0, 0, 0};
+        const double decays[3] = {0.0, 0.5, 1.0};
+        const std::string name = kDrumVoiceNames[voice];
+        for (int d = 0; d < 3; ++d) {
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.params().setVoiceParam(voice, kDrumParamDecay, decays[d]);
+            std::vector<float> out;
+            renderDrums(dm, (int)(6.0 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(voice, 127); });
+            const std::string tag = name + " decay " + std::to_string(decays[d]).substr(0, 3);
+            check(cleanSamples(out, 4.0f), tag + " finite/no subnormal/bounded");
+            const double first = rmsOf(out, 0, (int)(0.02 * sr));
+            check(first > 0.005, tag + " sounds in its first 20 ms (rms " + std::to_string(first) + ")");
+            check(out[0] != 0.0f || out[1] != 0.0f || out[2] != 0.0f, tag + " starts on sample 0");
+            len[d] = lastNonZero(out);
+            check(len[d] < (int)(5.5 * sr), tag + " ends in exact silence");
+            check(!dm.isVoiceActive(voice), tag + " idle after its tail");
+            // Decays: each 50 ms window after the first 60 ms is quieter than the one 100 ms before.
+            const int w = (int)(0.05 * sr);
+            bool decaying = true;
+            for (int a = (int)(0.06 * sr); a + 3 * w < len[d]; a += w)
+                if (rmsOf(out, a + 2 * w, a + 3 * w) > rmsOf(out, a, a + w) * 1.05 + 1e-6) decaying = false;
+            check(decaying, tag + " envelope decays");
+        }
+        check(len[0] < len[1] && len[1] < len[2], name + " decay scales its length");
+        lengths += " " + name + ":" + std::to_string((int)std::lround(len[1] * 1000.0 / sr));
+    }
+
+    // 2. Choke: an open hat rings past 300 ms alone; a closed hat 50 ms in ends it within 40 ms.
+    {
+        DrumMachine alone, choked;
+        alone.prepare(sr); choked.prepare(sr);
+        alone.params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0); // isolate the open hat
+        choked.params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0);
+        std::vector<float> a, c;
+        renderDrums(alone, (int)(0.5 * sr), 128, a, [&](int done) { if (done == 0) alone.trigger(kDrumOpenHat, 127); });
+        const int chokeAt = 2400 / 128 * 128 + 128; // first block start after 50 ms
+        renderDrums(choked, (int)(0.5 * sr), 128, c, [&](int done) {
+            if (done == 0) choked.trigger(kDrumOpenHat, 127);
+            if (done == chokeAt) choked.trigger(kDrumClosedHat, 127);
+        });
+        check(rmsOf(a, (int)(0.3 * sr), (int)(0.35 * sr)) > 1e-3, "open hat rings alone");
+        check(lastNonZero(c) < chokeAt + (int)(0.04 * sr), "closed hat chokes the open hat within 40 ms (ended at "
+              + std::to_string(lastNonZero(c)) + ")");
+        check(!choked.isVoiceActive(kDrumOpenHat), "choked open hat idle");
+        // An open hat does not choke the closed hat.
+        DrumMachine dm;
+        dm.prepare(sr);
+        std::vector<float> o;
+        renderDrums(dm, 256, 128, o, [&](int done) {
+            if (done == 0) { dm.trigger(kDrumClosedHat, 127); dm.trigger(kDrumOpenHat, 127); }
+        });
+        check(dm.isVoiceActive(kDrumClosedHat) && dm.isVoiceActive(kDrumOpenHat), "open hat does not choke closed hat");
+    }
+
+    // 3. Retrigger restarts the voice: after the declick, a second hit is sample-exact the same as a
+    //    hit on a fresh machine (low tom, tone 0: no noise); the declick has no larger step than the attack.
+    {
+        DrumMachine re, fresh;
+        re.prepare(sr); fresh.prepare(sr);
+        re.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        fresh.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        const int at = 128 * 40;
+        std::vector<float> r, f;
+        renderDrums(re, at + 9600, 128, r, [&](int done) { if (done == 0 || done == at) re.trigger(kDrumLowTom, 100); });
+        renderDrums(fresh, 9600, 128, f, [&](int done) { if (done == 0) fresh.trigger(kDrumLowTom, 100); });
+        bool same = true;
+        for (int i = DrumMachine::kDeclickSamples; i < 9600; ++i)
+            if (r[(size_t)(at + i)] != f[(size_t)i]) { same = false; break; }
+        check(same, "retrigger == fresh hit after the declick");
+        float jump = 0.0f;
+        for (int i = at - 4; i < at + DrumMachine::kDeclickSamples + 4; ++i)
+            jump = std::max(jump, std::fabs(r[(size_t)i] - r[(size_t)i - 1]));
+        float freshJump = 0.0f;
+        for (int i = 1; i < 200; ++i) freshJump = std::max(freshJump, std::fabs(f[(size_t)i] - f[(size_t)i - 1]));
+        check(jump <= freshJump + 0.05f, "retrigger declick step " + std::to_string(jump));
+        check(re.diag.hits.load() == 2, "hits counted");
+    }
+
+    // 4. Parameters clamp; non-finite / out of range are ignored.
+    {
+        DrumParamStore s;
+        check(s.setVoiceParam(0, kDrumParamTune, 100.0) && s.voice(0).tune == 24.0f, "tune clamps to 24");
+        check(s.setVoiceParam(0, kDrumParamTune, -100.0) && s.voice(0).tune == -24.0f, "tune clamps to -24");
+        check(s.setVoiceParam(1, kDrumParamDecay, 2.0) && s.voice(1).decay == 1.0f, "decay clamps to 1");
+        check(s.setVoiceParam(1, kDrumParamTone, -1.0) && s.voice(1).tone == 0.0f, "tone clamps to 0");
+        check(s.setVoiceParam(7, kDrumParamLevel, 1.5) && s.voice(7).level == 1.0f, "level clamps to 1");
+        check(!s.setVoiceParam(2, kDrumParamLevel, std::nan("")) && s.voice(2).level == kDrumVoiceDefaults.level, "NaN ignored");
+        check(!s.setVoiceParam(2, kDrumParamTune, INFINITY) && s.voice(2).tune == 0.0f, "inf ignored");
+        check(!s.setVoiceParam(8, kDrumParamLevel, 0.5) && !s.setVoiceParam(-1, kDrumParamLevel, 0.5), "voice out of range");
+        check(!s.setVoiceParam(0, kDrumParamCount, 0.5), "param out of range");
+        check(s.setKitLevel(-1.0) && s.kit().level == 0.0f, "kit level clamps");
+        check(s.setKitDrive(5.0) && s.kit().drive == 1.0f, "drive clamps");
+        check(!s.setKitLevel(std::nan("")) && s.kit().level == 0.0f, "kit NaN ignored");
+        s.setKitMute(true);
+        check(s.kit().mute, "mute stored");
+        s.reset();
+        check(s.voice(0).tune == 0.0f && s.kit().level == kDrumKitDefaults.level && !s.kit().mute, "reset");
+        check(drumParamIndex("tune") == 0 && drumParamIndex("level") == 3 && drumParamIndex("lev") == -1
+              && drumParamIndex("levels") == -1 && drumParamIndex(nullptr) == -1, "param names");
+    }
+
+    // 5. Extremes (tune ±24, decay 0/1, tone 0/1, level 1, drive 1, all 8 voices at once, odd blocks):
+    //    finite, bounded, no subnormal output, ends silent.
+    for (int combo = 0; combo < 4; ++combo) {
+        DrumMachine dm;
+        dm.prepare(sr);
+        for (int v = 0; v < kDrumVoices; ++v) {
+            dm.params().setVoiceParam(v, kDrumParamTune, (combo & 1) ? 24.0 : -24.0);
+            dm.params().setVoiceParam(v, kDrumParamDecay, (combo & 2) ? 1.0 : 0.0);
+            dm.params().setVoiceParam(v, kDrumParamTone, (combo & 1) ? 0.0 : 1.0);
+            dm.params().setVoiceParam(v, kDrumParamLevel, 1.0);
+        }
+        dm.params().setKitLevel(1.0);
+        dm.params().setKitDrive(combo == 3 ? 1.0 : 0.0);
+        std::vector<float> out;
+        renderDrums(dm, (int)(6.0 * sr), 471, out, [&](int done) {
+            if (done == 0 || done == 471 * 30) for (int v = 0; v < kDrumVoices; ++v) dm.trigger(v, 127);
+        });
+        check(cleanSamples(out, 8.0f), "extremes combo " + std::to_string(combo) + " finite/bounded");
+        check(lastNonZero(out) < (int)out.size(), "extremes combo " + std::to_string(combo) + " ends silent");
+    }
+
+    // 6. Kit mute silences exactly; unmute brings the sound back; muting mid-sound ramps over one
+    //    block; voice level 0 is silent.
+    {
+        DrumMachine dm;
+        dm.prepare(sr);
+        dm.params().setKitMute(true);
+        std::vector<float> out;
+        renderDrums(dm, 4800, 128, out, [&](int done) { if (done == 0) dm.trigger(kDrumKick, 127); });
+        bool zero = true;
+        for (float v : out) zero = zero && v == 0.0f;
+        check(zero, "muted kit is exact 0");
+        dm.params().setKitMute(false);
+        renderDrums(dm, 4800, 128, out, [&](int done) { if (done == 0) dm.trigger(kDrumKick, 127); });
+        check(rmsOf(out, 128, 4800) > 0.01, "unmuted kit sounds");
+        dm.params().setKitMute(true);
+        renderDrums(dm, 1280, 128, out);
+        zero = true;
+        for (int i = 128; i < 1280; ++i) zero = zero && out[(size_t)i] == 0.0f;
+        check(zero && out[0] != 0.0f, "mute mid-sound: one-block ramp then exact 0");
+        dm.params().setKitMute(false);
+        dm.params().setVoiceParam(kDrumSnare, kDrumParamLevel, 0.0);
+        DrumMachine quiet;
+        quiet.prepare(sr);
+        quiet.params().setVoiceParam(kDrumSnare, kDrumParamLevel, 0.0);
+        renderDrums(quiet, (int)(1.0 * sr), 128, out, [&](int done) { if (done == 0) quiet.trigger(kDrumSnare, 127); });
+        zero = true;
+        for (float v : out) zero = zero && v == 0.0f;
+        check(zero, "voice level 0 is exact 0");
+    }
+
+    // 7. Out-of-range hits are ignored; an idle machine leaves the buffer untouched; velocity scales;
+    //    peak / hit counters move and the peak decays; drive changes the sound.
+    {
+        DrumMachine dm;
+        dm.prepare(sr);
+        dm.trigger(8, 127); dm.trigger(-1, 127);
+        check(dm.diag.hits.load() == 0 && dm.activeVoiceCount() == 0, "out-of-range hit ignored");
+        std::vector<float> buf(128, 0.25f);
+        dm.render(buf.data(), 128);
+        bool untouched = true;
+        for (float v : buf) untouched = untouched && v == 0.25f;
+        check(untouched, "idle machine leaves the buffer untouched");
+        std::vector<float> loud, soft;
+        DrumMachine a, b;
+        a.prepare(sr); b.prepare(sr);
+        a.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        b.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        renderDrums(a, 4800, 128, loud, [&](int done) { if (done == 0) a.trigger(kDrumLowTom, 127); });
+        renderDrums(b, 4800, 128, soft, [&](int done) { if (done == 0) b.trigger(kDrumLowTom, 32); });
+        const double ratio = rmsOf(soft, 0, 4800) / std::max(1e-9, rmsOf(loud, 0, 4800));
+        check(std::fabs(ratio - 32.0 / 127.0) < 0.01, "velocity scales linearly (" + std::to_string(ratio) + ")");
+        check(a.diag.hits.load() == 1 && a.diag.peak.load() > 0.1f, "peak diag moves");
+        const float p0 = a.diag.peak.load();
+        std::vector<float> rest;
+        renderDrums(a, (int)(1.0 * sr), 128, rest);
+        check(a.diag.peak.load() < p0 * 0.5f, "peak diag decays");
+        DrumMachine c;
+        c.prepare(sr);
+        c.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        c.params().setKitDrive(1.0);
+        std::vector<float> driven;
+        renderDrums(c, 4800, 128, driven, [&](int done) { if (done == 0) c.trigger(kDrumLowTom, 127); });
+        bool differs = false;
+        for (int i = 0; i < 4800; ++i) differs = differs || driven[(size_t)i] != loud[(size_t)i];
+        check(differs, "drive changes the sound");
+    }
+
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    check(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
+    const bool pass = failures == 0;
+    std::printf("dr    drums: 8 voices decay to exact silence, decay scales, choke, retrigger, clamps, extremes,"
+                " mute, velocity, diag  %-4s %d failed checks; lengths ms (decay 0.5):%s allocs %llu%s\n",
+                pass ? "PASS" : "FAIL", failures, lengths.c_str(), (unsigned long long)allocs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// The drum part through PolySynthProcessor and its note queue: a hit pushed from another thread
+// renders in the next block, with or without the arpeggiator; drums stay out of the synth peak and
+// the note counters; releases do not touch drums; out-of-range hits are not queued; discardPending
+// and a full ring count hits apart from notes.
+static bool runDrumsInSynth() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    auto block = [&](PolySynthProcessor& synth, juce::AudioBuffer<float>& buf, int n) {
+        juce::MidiBuffer midi;
+        buf.setSize(2, n, false, false, true);
+        tCountAllocs = true;
+        synth.processBlock(buf, midi);
+        tCountAllocs = false;
+        return buf.getMagnitude(0, 0, n);
+    };
+    for (int arpOn = 0; arpOn < 2; ++arpOn) {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        NoteEventQueue queue;
+        synth.setNoteQueue(&queue);
+        synth.setTransport(&transport);
+        synth.setRateAndBufferSizeDetails(sr, 512);
+        synth.prepareToPlay(sr, 512);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = arpOn == 1;
+        synth.arp().setSettings(s);
+        juce::AudioBuffer<float> buf(2, 512);
+        const std::string tag = arpOn ? " (arp on)" : " (arp off)";
+        check(block(synth, buf, 128) == 0.0f, "silent before the hit" + tag);
+        std::thread producer([&] { queue.pushDrumHit(kDrumKick, 127); });
+        producer.join();
+        const float p = block(synth, buf, 128);
+        check(p > 0.05f, "hit renders within one block" + tag + " peak " + std::to_string(p));
+        check(buf.getSample(0, 0) != 0.0f || buf.getSample(0, 1) != 0.0f, "hit starts at the block's first sample" + tag);
+        bool stereo = true;
+        for (int i = 0; i < 128; ++i) stereo = stereo && buf.getSample(0, i) == buf.getSample(1, i);
+        check(stereo, "both channels" + tag);
+        check(synth.diag.peak.load() == 0.0f, "drums not in the synth peak" + tag);
+        check(synth.drums().diag.peak.load() > 0.05f, "drum peak diag" + tag);
+        check(queue.drumHitsQueued.load() == 1 && queue.drumHitsConsumed.load() == 1, "drum counters" + tag);
+        check(queue.notesQueued.load() == 0 && queue.notesConsumed.load() == 0, "note counters untouched" + tag);
+        check(!synth.arp().isActive(), "arp never gets drum hits" + tag);
+        check(synth.diag.lastNoteToRenderMs.load() >= 0.0, "hit latency recorded" + tag);
+        check(!queue.pushDrumHit(8, 100) && !queue.pushDrumHit(-1, 100) && queue.drumHitsQueued.load() == 1,
+              "out-of-range voice not queued" + tag);
+        // A synth note and a drum hit in the same block; allNotesOff never touches drums.
+        synth.noteOn(60, 100);
+        synth.drumHit(kDrumSnare, 100);
+        synth.allNotesOff();
+        block(synth, buf, 128);
+        check(synth.drums().isVoiceActive(kDrumSnare), "allNotesOff leaves the drum hit" + tag);
+        // Kit mute through a shared store (as the engine attaches its process-lifetime one).
+        DrumParamStore store;
+        synth.drums().setParamStore(&store);
+        store.setKitMute(true);
+        block(synth, buf, 128);
+        for (int i = 0; i < 100; ++i) block(synth, buf, 128); // let the synth voice release
+        synth.drumHit(kDrumKick, 127);
+        const float muted = block(synth, buf, 128);
+        check(muted == 0.0f, "kit mute through the store silences" + tag + " " + std::to_string(muted));
+    }
+    {
+        NoteEventQueue queue;
+        queue.pushNoteOn(60, 100);
+        queue.pushDrumHit(1, 100);
+        queue.pushDrumHit(2, 100);
+        queue.discardPending();
+        check(queue.notesDiscarded.load() == 1 && queue.drumHitsDiscarded.load() == 2, "discardPending counts by kind");
+        int full = 0;
+        for (int i = 0; i < NoteEventQueue::kSize + 5; ++i) full += queue.pushDrumHit(0, 100) ? 0 : 1;
+        check(full == 6 && queue.drumHitsDropped.load() == 6, "full ring drops hits (counted) " + std::to_string(full));
+        check(queue.notesDropped.load() == 0, "drops counted apart from notes");
+    }
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    check(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
+    const bool pass = failures == 0;
+    std::printf("drs   drums through PolySynthProcessor + note queue (arp off / on), counters, mute  %-4s %d failed"
+                " checks allocs %llu%s\n", pass ? "PASS" : "FAIL", failures, (unsigned long long)allocs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Render budget: all 8 voices retriggered every 250 ms at decay 1 (so all 8 always sound), drive on,
+// 48 kHz / 128-sample blocks, 20 s of audio. Must render far faster than realtime.
+static bool runDrumBudget() {
+    const double sr = 48000.0;
+    DrumMachine dm;
+    dm.prepare(sr);
+    for (int v = 0; v < kDrumVoices; ++v) dm.params().setVoiceParam(v, kDrumParamDecay, 1.0);
+    dm.params().setKitDrive(0.5);
+    const int total = (int)(20.0 * sr);
+    const int every = (int)(0.25 * sr) / 128 * 128;
+    std::vector<float> buf(128);
+    int minActive = kDrumVoices;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int done = 0; done < total; done += 128) {
+        if (done % every == 0) for (int v = 0; v < kDrumVoices; ++v) dm.trigger(v, 127);
+        std::fill(buf.begin(), buf.end(), 0.0f);
+        dm.render(buf.data(), 128);
+        minActive = std::min(minActive, dm.activeVoiceCount());
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double ratio = secs / 20.0;
+    const double perBlockUs = secs * 1e6 / (double)(total / 128);
+    const bool pass = ratio < 0.05 && minActive == kDrumVoices;
+    std::printf("drb   drums render budget: 8 voices sounding, 48k/128, 20 s  %-4s %.4f x realtime (%.2f us per"
+                " 2667 us block, limit 0.05), min active %d\n", pass ? "PASS" : "FAIL", ratio, perBlockUs, minActive);
+    std::fflush(stdout);
+    return pass;
+}
+
+// src/drumDefaults.ts lists the same defaults as kDrumVoiceDefaults / kDrumKitDefaults.
+static bool runDrumDefaultsMatchJs() {
+    const juce::File file(juce::String(HARNESS_JS_SRC) + "/drumDefaults.ts");
+    const juce::String text = file.loadFileAsString();
+    auto body = [&](const char* name) {
+        const juce::String from = text.fromFirstOccurrenceOf(juce::String("export const ") + name, false, false);
+        return from.fromFirstOccurrenceOf("({", false, false).upToFirstOccurrenceOf("})", false, false);
+    };
+    auto value = [](const juce::String& b, const char* key, bool& found) {
+        juce::StringArray pairs;
+        pairs.addTokens(b, ",", "");
+        pairs.trim();
+        for (const juce::String& p : pairs)
+            if (p.upToFirstOccurrenceOf(":", false, false).trim() == key) {
+                found = true;
+                return p.fromFirstOccurrenceOf(":", false, false).trim();
+            }
+        found = false;
+        return juce::String();
+    };
+    int mismatches = 0;
+    std::string detail;
+    auto num = [&](const juce::String& b, const char* key, float want) {
+        bool found = false;
+        const juce::String v = value(b, key, found);
+        if (!found || std::fabs(v.getDoubleValue() - (double)want) > 1e-6) { ++mismatches; detail += std::string(" ") + key; }
+    };
+    const juce::String voice = body("DRUM_VOICE_DEFAULTS"), kit = body("DRUM_KIT_DEFAULTS");
+    num(voice, "tune", kDrumVoiceDefaults.tune);
+    num(voice, "decay", kDrumVoiceDefaults.decay);
+    num(voice, "tone", kDrumVoiceDefaults.tone);
+    num(voice, "level", kDrumVoiceDefaults.level);
+    num(kit, "level", kDrumKitDefaults.level);
+    num(kit, "drive", kDrumKitDefaults.drive);
+    bool found = false;
+    if (value(kit, "mute", found) != juce::String(kDrumKitDefaults.mute ? "true" : "false") || !found) {
+        ++mismatches;
+        detail += " mute";
+    }
+    const bool pass = file.existsAsFile() && mismatches == 0;
+    std::printf("drd   src/drumDefaults.ts == DrumMachine.h defaults  %-4s %d mismatches%s\n", pass ? "PASS" : "FAIL",
+                mismatches, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the cases named on the command line run (none: every case).
 static std::vector<std::string> gOnlyCases;
 static bool want(const char* id) {
@@ -2470,6 +2882,10 @@ int main(int argc, char** argv) {
     if (want("arp")) unexpected += runArp() ? 0 : 1;
     if (want("arpv")) unexpected += runArpVoices() ? 0 : 1;
     if (want("sp")) unexpected += runSpectrum() ? 0 : 1;
+    if (want("dr")) unexpected += runDrums() ? 0 : 1;
+    if (want("drs")) unexpected += runDrumsInSynth() ? 0 : 1;
+    if (want("drb")) unexpected += runDrumBudget() ? 0 : 1;
+    if (want("drd")) unexpected += runDrumDefaultsMatchJs() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

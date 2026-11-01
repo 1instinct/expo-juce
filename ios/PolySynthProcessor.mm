@@ -12,6 +12,7 @@ void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     for (int i = 0; i < MAX_VOICES; i++) {
         voices[i].prepare(sampleRate, samplesPerBlock);
     }
+    drumMachine.prepare(sampleRate);
 }
 
 void PolySynthProcessor::releaseResources() {}
@@ -43,10 +44,12 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // stops (see NoteEventQueue; arp voices have startSeq 0 and are not affected), and the arp
     // drops the held notes the player released. Applied every block, so a release sent while
     // the device was stopped or reopening takes effect on the first block after it. The arp's
-    // options are snapshotted once here and hold for the whole block.
+    // options are snapshotted once here and hold for the whole block. Drum hits in the queue
+    // start their drum voice whether or not the arpeggiator is enabled.
     const ArpSettings& arpNow = arpeggiator.beginBlock();
     if (arpNow.enabled) {
         queue->drainNoteOns([this](const NoteEvent& event) {
+            if (event.kind == NoteEventKind::Drum) { startDrumHit(event); return; }
             arpeggiator.noteOn(event.note, event.velocity, event.seq);
             recordNoteLatency(event);
         });
@@ -57,7 +60,10 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         }
         arpeggiator.releaseHeld([this](int note, uint64_t seq) { return queue->isReleased(note, seq); });
     } else {
-        queue->drainNoteOns([this](const NoteEvent& event) { startQueuedNote(event); });
+        queue->drainNoteOns([this](const NoteEvent& event) {
+            if (event.kind == NoteEventKind::Drum) startDrumHit(event);
+            else startQueuedNote(event);
+        });
         lastAllReleasedSeen = queue->allReleasedMark();
     }
     for (int v = 0; v < MAX_VOICES; v++) {
@@ -101,6 +107,11 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
     if (pos < numSamples) renderVoices(monoBuffer + pos, numSamples - pos, wf, detune, cutoff, reso, master);
 
+    // Synth-only peak (diag.peak), then the drum part on top (with no drum sounding it does not
+    // touch the buffer).
+    const float synthBlockPeak = numSamples > 0 ? buffer.getMagnitude(0, 0, numSamples) : 0.0f;
+    drumMachine.render(monoBuffer, numSamples);
+
     if (buffer.getNumChannels() > 1) {
         buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
     }
@@ -111,9 +122,8 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 
     // ── Diagnostics (relaxed atomics only; no locks/allocation) ──
     {
-        const float blockPeak = numSamples > 0 ? buffer.getMagnitude(0, 0, numSamples) : 0.0f;
         const float held = diag.peak.load(std::memory_order_relaxed) * diagPeakDecay(numSamples, sr);
-        diag.peak.store(std::max(blockPeak, held), std::memory_order_relaxed);
+        diag.peak.store(std::max(synthBlockPeak, held), std::memory_order_relaxed);
         int active = 0;
         for (int v = 0; v < MAX_VOICES; v++)
             if (voices[v].isActive()) ++active;
@@ -155,6 +165,12 @@ void PolySynthProcessor::applyArpEvent(const ArpEvent& event) {
         if (voices[v].isHeld() && voices[v].startSeq == 0 && voices[v].getNoteNumber() == event.note)
             voices[v].stopNote();
     }
+}
+
+// Audio thread (processBlock): start a queued drum hit and record its latency.
+void PolySynthProcessor::startDrumHit(const NoteEvent& event) {
+    drumMachine.trigger(event.note, event.velocity);
+    recordNoteLatency(event);
 }
 
 // Audio thread (processBlock): start a queued note-on and record its latency.
