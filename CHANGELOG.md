@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0-rc.1
+
+### Fixed
+
+- iOS build: `Arpeggiator.h`, `SpectrumAnalyser.h` and `DrumMachine.h` are now private headers.
+  As public headers they went into the module umbrella and were compiled as Objective-C, so
+  `<algorithm>` was not found and the `ExpoJuce` module failed to build (0.7.0-rc.0 and
+  0.8.0-rc.0). `npm run check:headers` fails if a C++ header is missing from the list.
+
 ## 0.8.0-rc.0
 
 Includes everything in 0.7.0-rc.0 (16 voices, arpeggiator, 24 spectrum bands).
