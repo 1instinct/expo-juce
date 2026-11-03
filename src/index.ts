@@ -260,8 +260,9 @@ export function getArpeggiatorState(): ArpOptions {
 }
 
 // ── Drums (0.8.0+) ───────────────────────────────────────────────
-// Eight synthesized voices in pad order: 0 kick, 1 snare, 2 closed hat, 3 open hat (choked by the
-// closed hat), 4 clap, 5 low tom, 6 high tom, 7 rim. Each voice is monophonic: a hit restarts it.
+// Nine synthesized voices: 0 kick, 1 snare, 2 closed hat, 3 open hat (choked by the closed hat),
+// 4 clap, 5 low tom, 6 high tom, 7 rim, 8 mid tom (0.8.0-rc.2+; older binaries have 0-7 and ignore
+// 8: read getDrumState().voices.length). Each voice is monophonic: a hit restarts it.
 // The drum part is mixed with the synth before the effects chain; the arpeggiator never applies
 // to it. Parameters are synchronous and lock-free, remembered natively before setup() and across
 // engine rebuilds. Binaries older than 0.8.0: hasDrums() is false, drumHit is a no-op, the setters
@@ -279,7 +280,7 @@ export function hasDrums(): boolean {
   return typeof ExpoJuceModule?.hasDrums === 'function' && ExpoJuceModule.hasDrums() === true;
 }
 
-/** Trigger voice 0..7 at velocity 1..127. Thread-safe, lock-free; same queue as noteOn. Out-of-range voice is ignored. */
+/** Trigger voice 0..8 at velocity 1..127. Thread-safe, lock-free; same queue as noteOn. Out-of-range voice is ignored. */
 export function drumHit(voice: number, velocity: number): void {
   if (typeof ExpoJuceModule?.drumHit !== 'function') return;
   if (!isDrumVoice(voice) || !Number.isFinite(velocity)) return;

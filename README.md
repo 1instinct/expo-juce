@@ -58,7 +58,7 @@ One `FxChainProcessor` node between the synth and the output with nine effects i
 ### Sub-project 3: Sample Playback / Drum Machine
 **Status:** Drum machine in progress (0.8.0-rc.0) — engine + JS API verified in the offline harness, not yet run on a device; sampler planned
 
-0.8.0 adds a synthesized eight-voice drum part (kick, snare, closed / open hat, clap, two toms, rim; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). Next: a `SamplerProcessor` that loads audio files into the same voice slots (multi-sample mapping, transport-sequenced playback).
+0.8.0 adds a synthesized drum part (kick, snare, closed / open hat, clap, low / mid / high tom, rim; nine voices, the mid tom since 0.8.0-rc.2; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). Next: a `SamplerProcessor` that loads audio files into the same voice slots (multi-sample mapping, transport-sequenced playback).
 
 ### Sub-project 4: Audio Input Processing
 **Status:** Planned
@@ -287,8 +287,11 @@ ExpoJuce.ARP_DEFAULTS;                        // the defaults below
 
 ### Drums (0.8.0+)
 
-Eight synthesized voices (no samples), in pad order: `0` kick, `1` snare, `2` closed hat, `3`
-open hat, `4` clap, `5` low tom, `6` high tom, `7` rim. The drum part is mixed with the synth
+Nine synthesized voices (no samples): `0` kick, `1` snare, `2` closed hat, `3` open hat, `4`
+clap, `5` low tom, `6` high tom, `7` rim, `8` mid tom (0.8.0-rc.2+). Indices 0–7 are the same
+as in 0.8.0-rc.0 / rc.1; binaries from those report 8 voices in `getDrumState().voices` and
+ignore voice 8 (`drumHit` does nothing, `setDrumVoice` returns `false`), so read the voice count
+from `getDrumState()` rather than `DRUM_VOICE_COUNT` when the binary may be older. The drum part is mixed with the synth
 before the effects chain (so drive, echo, reverb, … apply to both) with its own level and mute;
 the synth's `setMasterLevel` does not affect it and the arpeggiator never applies to it.
 
@@ -304,16 +307,16 @@ if (ExpoJuce.hasDrums()) {
 - `drumHit(voice, velocity)`: any thread, lock-free, through the same queue as `noteOn` (hits and
   notes keep their order and start at the next audio block). Each voice is monophonic: a new hit
   restarts it (the previous sound fades out over 64 samples, so retriggers do not click). The
-  closed hat chokes the open hat (it fades out over about 12 ms). A voice outside 0–7 (or not an
+  closed hat chokes the open hat (it fades out over about 12 ms). A voice outside 0–8 (or not an
   integer) is ignored; velocity is clamped to 1–127 and scales the level linearly. Hits are
   dropped while the engine is not set up, like note-ons.
 - `setDrumVoice(voice, params)` (`DrumVoiceParams`; omitted and unknown keys unchanged, numbers
-  clamped; `false` for a voice outside 0–7): `tune` −24..24 semitones (0), `decay` 0–1 (0.5:
+  clamped; `false` for a voice outside 0–8): `tune` −24..24 semitones (0), `decay` 0–1 (0.5:
   scales every envelope of the voice, 0 = ×0.25, 1 = ×4), `tone` 0–1 (0.5, per voice below),
   `level` 0–1 (0.8).
 - `setDrumKit(params)` (`DrumKitParams`): `level` 0–1 (0.8), `mute` (false), `drive` 0–1 (0: soft
   saturation of the kit sum, blended in with the amount). Level and mute ramp over one block.
-- `DRUM_VOICE_DEFAULTS`, `DRUM_KIT_DEFAULTS`, `DRUM_VOICE_COUNT` (8) are exported.
+- `DRUM_VOICE_DEFAULTS`, `DRUM_KIT_DEFAULTS`, `DRUM_VOICE_COUNT` (9; 8 before 0.8.0-rc.2) are exported.
 - Parameters are kept natively for the life of the app (they work before `setup()` and survive
   engine rebuilds). Binaries older than 0.8.0 and web: `hasDrums()` is `false`, `drumHit` does
   nothing, the setters return `false`, `getDrumState()` returns the defaults.
@@ -330,6 +333,7 @@ if (ExpoJuce.hasDrums()) {
 | 5 | Low tom | sine (95 Hz) with a small pitch drop, 0.5 s | attack noise |
 | 6 | High tom | same at 150 Hz, 0.4 s | attack noise |
 | 7 | Rim | band-passed noise click (3.5 kHz) + sine ping (1660 + 480 Hz), 0.07 s | click vs ping |
+| 8 | Mid tom | same as the toms at 119.4 Hz (the log-centre of 95 and 150 Hz), 0.45 s | attack noise |
 
 Decay times above are to −60 dB at `decay` 0.5. More on the voices in
 [docs/drums.md](docs/drums.md).
@@ -383,7 +387,7 @@ import { JucePadView } from 'expo-juce';
 Check the shipped type definitions for the exact event payloads once 0.5.2 is published.
 
 `mode` (0.8.0+): `'notes'` (default) holds `note` on the synth while touched; `'drums'` makes
-every touch-down hit drum voice `note` (0–7) natively, with the same `velocity` (one-shot; a
+every touch-down hit drum voice `note` (0–8) natively, with the same `velocity` (one-shot; a
 second finger on the pad retriggers it). `onNoteOn` fires per hit and `onNoteOff` when the last
 touch lifts; no note-off reaches the engine. Changing `mode` releases the pad. Older binaries
 ignore the prop (the pad keeps playing notes), so check `hasDrums()` first.

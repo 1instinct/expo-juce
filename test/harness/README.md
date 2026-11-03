@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, an, arp, arpv, sp, dr, drs, drb, drd)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, an, arp, arpv, sp, dr, drs, drb, drm, drd)
 ```
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
@@ -80,7 +80,7 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   ≥ 0.95 in band 1; the edge table is strictly increasing with every band at least one bin wide
   at 48000 and 44100 Hz; `AnalysisRing::readRaw` is oldest-first and `GraphPlayer` publishes the
   device rate into the ring; `analyse` does not allocate).
-- Drums (`ios/DrumMachine.h`, pure C++): `dr` (each of the 8 voices at decay 0 / 0.5 / 1, 128-sample
+- Drums (`ios/DrumMachine.h`, pure C++): `dr` (each of the 9 voices at decay 0 / 0.5 / 1, 128-sample
   blocks: sounds from sample 0, every 50 ms window is quieter than the one 100 ms before, ends in
   exact zeros with the voice idle, and decay 0 < 0.5 < 1 in length; finite, bounded, no subnormal
   sample; the closed hat ends a ringing open hat within 40 ms, an open hat does not choke the closed
@@ -93,9 +93,15 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   pushed from another thread sounds in the next 128-sample block from its first sample, on both
   channels, outside `diag.peak` and the note counters, never reaches the arp, survives
   `allNotesOff`; out-of-range voices are not queued; kit mute through an attached store;
-  `discardPending` and a full ring count hits apart from notes; 0 allocations), `drb` (all 8
+  `discardPending` and a full ring count hits apart from notes; 0 allocations), `drb` (all 9
   voices kept sounding with drive, 48 kHz / 128, 20 s: must render under 0.05 × realtime),
-  `drd` (`src/drumDefaults.ts` has the same defaults as `DrumMachine.h`).
+  `drm` (mid tom, voice 8: sounds from its first 20 ms, decays to exact silence and goes idle;
+  at tone 0 its pitch 250–350 ms in, by zero crossings, is above the low tom's and below the
+  high tom's and within a quarter semitone of their log-centre; `tune` +12 doubles it; level 0
+  is exact 0, velocity linear; with the mid tom sounding the closed hat still chokes the open
+  hat and the hats leave the mid tom sample-exact; a mid tom hit chokes nothing; voice 8 is
+  accepted and 9 rejected by the store, the machine and the note queue; 0 allocations), `drd`
+  (`src/drumDefaults.ts` has the same defaults and `DRUM_VOICE_COUNT` as `DrumMachine.h`).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

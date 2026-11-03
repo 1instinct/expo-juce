@@ -10,7 +10,7 @@ synth and drums together. The API is in the README ([Drums](../README.md#drums-0
 ```
  drumHit / JucePadView (drums) ─► NoteEventQueue (kind Drum) ─► PolySynthProcessor::processBlock
                                                                    └─ DrumMachine::trigger(voice, vel)
- voices 0–7 ─► Σ (each × level × velocity / 127) ─► drive ─► × kit level (ramped per block) ─► + synth ─► effects
+ voices 0–8 ─► Σ (each × level × velocity / 127) ─► drive ─► × kit level (ramped per block) ─► + synth ─► effects
 ```
 
 - Envelopes are one-pole exponentials. A decay time `T` is the time to −60 dB; `decay` scales
@@ -42,28 +42,29 @@ synth and drums together. The API is in the README ([Drums](../README.md#drums-0
 | 5 | Low tom | sine at `95 Hz × (1 + 0.5p)`, `p` 0.25 s T60; amp 0.5 s; noise attack (15 ms) | attack noise 0–0.35 |
 | 6 | High tom | same at 150 Hz, amp 0.4 s | same |
 | 7 | Rim | noise → band-pass 3.5 kHz (Q 2), 8 ms click + 1660 / 480 Hz sine ping, 0.07 s | click 1 → 3, ping 0.7 → 0.35 |
+| 8 | Mid tom (0.8.0-rc.2+) | same at 119.4 Hz (√(95 × 150), centred between the toms on a log scale), amp 0.45 s | same |
 
 Starting points for kits (all values as `setDrumVoice` takes them):
 
 - 808-like: kick `decay` 0.8, `tone` 0.2; hats `tone` 0.3; snare `tone` 0.4.
 - 909-like: kick `decay` 0.35, `tone` 0.7, `tune` +2; snare `tone` 0.8; hats `tone` 0.8.
 - Dark / lo-fi: every `tone` 0.2, kit `drive` 0.5, then the `crush` effect.
-- Electro: toms `tune` +7 … +12, `decay` 0.3; clap `tone` 0.7.
+- Electro: toms (5, 8, 6) `tune` +7 … +12, `decay` 0.3; clap `tone` 0.7.
 
 ## Realtime rules
 
-- Everything is preallocated in the processor: 8 voice states, a 256-sample scratch buffer,
+- Everything is preallocated in the processor: 9 voice states, a 256-sample scratch buffer,
   the parameter store. `trigger` and `render` do not allocate, lock or call into the OS.
 - Parameters are relaxed atomics (one per value) read once per block; the engine keeps one
   `DrumParamStore` for the life of the process, so settings work before `setup()` and survive
   rebuilds. Hits travel through the note queue's ring with the note-ons (a full ring drops a hit
   and counts it in `drumHitsDropped`).
-- Cost: with all 8 voices sounding and drive on, about 16 µs per 128-sample block at 48 kHz on a
+- Cost: with all 9 voices sounding and drive on, about 18 µs per 128-sample block at 48 kHz on a
   desktop x86 core (harness case `drb`, 0.006 × realtime); a phone core is a few times slower,
   still well under 1 % of the 2.7 ms block.
 
 ## Verified where
 
-The harness cases `dr`, `drs`, `drb`, `drd` ([test/harness/README.md](../test/harness/README.md))
+The harness cases `dr`, `drs`, `drb`, `drm`, `drd` ([test/harness/README.md](../test/harness/README.md))
 cover the DSP, the queue path and the defaults. The Objective-C++ / Swift glue and the pad's drums
 mode are compiled first by the iOS build.

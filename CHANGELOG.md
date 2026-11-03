@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.0-rc.2
+
+### Added
+
+- **Mid tom**, a ninth drum voice at index 8: the tom model (sine with a small pitch drop and an
+  attack-noise click) at 119.4 Hz, the log-centre of the low (95 Hz) and high (150 Hz) toms,
+  with a 0.45 s decay; the same `tune` / `decay` / `tone` / `level` parameters as every voice.
+  `drumHit(8, v)`, `setDrumVoice(8, …)` and `JucePadView` `mode="drums"` `note={8}` play and set
+  it; `getDrumState().voices` has 9 entries; `DRUM_VOICE_COUNT` is 9. A mid tom hit chokes
+  nothing, and the closed hat still chokes only the open hat.
+
+### Compatibility
+
+- Indices 0–7 are unchanged, so saved hits and kit settings for them stay valid.
+- Binaries from 0.8.0-rc.0 / rc.1 have 8 voices: `getDrumState().voices.length` is 8, voice 8
+  is ignored (`drumHit` does nothing, `setDrumVoice` returns `false`). Use that length, not
+  `DRUM_VOICE_COUNT`, to tell whether the mid tom exists in the running binary.
+
 ## 0.8.0-rc.1
 
 ### Fixed

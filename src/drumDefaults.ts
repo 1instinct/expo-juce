@@ -1,7 +1,11 @@
 import type { DrumKitParams, DrumState, DrumVoiceParams } from './ExpoJuce.types';
 
-/** Number of drum voices (0.8.0+): kick, snare, closed hat, open hat, clap, low tom, high tom, rim. */
-export const DRUM_VOICE_COUNT = 8;
+/**
+ * Number of drum voices in this package (0.8.0-rc.2+: 9): kick, snare, closed hat, open hat, clap,
+ * low tom, high tom, rim, mid tom. A binary reports its own count as `getDrumState().voices.length`
+ * (8 before 0.8.0-rc.2).
+ */
+export const DRUM_VOICE_COUNT = 9;
 
 /**
  * Drum defaults (0.8.0+): what `getDrumState()` returns on a fresh engine, on web and on binaries

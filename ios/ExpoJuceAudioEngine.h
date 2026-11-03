@@ -81,15 +81,15 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // Every option as stored (pattern as an array of `length` booleans).
 - (NSDictionary<NSString *, id> *)arpeggiatorState;
 
-// Drums (0.8.0+): eight synthesized voices mixed before the effects (see DrumMachine.h).
-// drumHit: voice 0–7, velocity clamped to 1–127; any thread, lock-free, through the note queue
+// Drums (0.8.0+): nine synthesized voices (eight before 0.8.0-rc.2) mixed before the effects (see DrumMachine.h).
+// drumHit: voice 0–8, velocity clamped to 1–127; any thread, lock-free, through the note queue
 // (out-of-range voice ignored; dropped while the engine is not ready, like noteOn).
 - (void)drumHit:(int)voice velocity:(int)velocity;
 // drumHit from a native touch (JucePadView in drums mode); touchTimestamp as for noteOn.
 - (void)drumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp;
 // Parameters: lock-free, any thread, remembered before setup and across rebuilds; absent / unknown
 // keys and non-finite values unchanged, numbers clamped. Voice keys: tune (semitones −24..24),
-// decay, tone, level (0–1). NO for a voice outside 0–7 (nothing applied).
+// decay, tone, level (0–1). NO for a voice outside 0–8 (nothing applied).
 - (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params;
 // Kit keys: level (0–1), mute (bool), drive (0–1). Always YES.
 - (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params;

@@ -35,7 +35,7 @@ export type PadNoteOffEvent = {
 export type PadMode = 'notes' | 'drums';
 
 export type JucePadViewProps = {
-  /** MIDI note triggered while the pad is touched; in `drums` mode the drum voice (0–7). */
+  /** MIDI note triggered while the pad is touched; in `drums` mode the drum voice (0–8). */
   note: number;
   /**
    * `notes` (default): the pad holds `note` on the synth while touched. `drums`: every touch-down
@@ -204,7 +204,7 @@ export type ArpOptions = {
 
 /**
  * One drum voice's parameters (0.8.0+). Voices in pad order: 0 kick, 1 snare, 2 closed hat,
- * 3 open hat, 4 clap, 5 low tom, 6 high tom, 7 rim.
+ * 3 open hat, 4 clap, 5 low tom, 6 high tom, 7 rim, 8 mid tom (0.8.0-rc.2+).
  */
 export type DrumVoiceParams = {
   /** Semitones, −24..24 (default 0). */
@@ -227,7 +227,7 @@ export type DrumKitParams = {
   drive: number;
 };
 
-/** `getDrumState()` (0.8.0+): the kit and the 8 voices, as stored natively (after clamping). */
+/** `getDrumState()` (0.8.0+): the kit and every voice (9; 8 before 0.8.0-rc.2), as stored natively (after clamping). */
 export type DrumState = { kit: DrumKitParams; voices: DrumVoiceParams[] };
 
 /** Arpeggiator state in `Analysis.arp` (0.7.0+), as of the last rendered block. */

@@ -3,7 +3,7 @@
 // Pure C++ (no Objective-C, no JUCE): used by PolySynthProcessor, ExpoJuceAudioEngine.mm and the
 // offline harness (test/harness).
 //
-// A synthesized eight-voice drum kit (no samples). Each voice is monophonic: a hit restarts it
+// A synthesized nine-voice drum kit (no samples). Each voice is monophonic: a hit restarts it
 // (the previous sound is faded out over kDeclickSamples so the restart does not click). The
 // closed hat chokes the open hat. Hits arrive on the audio thread (PolySynthProcessor drains them
 // from the note queue) and start at the first sample of the block they are drained in.
@@ -16,9 +16,10 @@
 #include <cmath>
 #include <cstdint>
 
-inline constexpr int kDrumVoices = 8;
+inline constexpr int kDrumVoices = 9;
 
-// Pad order (top-left to bottom-right).
+// 0-7 in pad order (top-left to bottom-right); the mid tom (0.8.0-rc.2) comes after them so the
+// first eight indices never change.
 enum DrumVoiceIndex : int {
     kDrumKick = 0,
     kDrumSnare = 1,
@@ -28,10 +29,11 @@ enum DrumVoiceIndex : int {
     kDrumLowTom = 5,
     kDrumHighTom = 6,
     kDrumRim = 7,
+    kDrumMidTom = 8,
 };
 
 inline constexpr const char* kDrumVoiceNames[kDrumVoices] = {
-    "kick", "snare", "closedHat", "openHat", "clap", "lowTom", "highTom", "rim",
+    "kick", "snare", "closedHat", "openHat", "clap", "lowTom", "highTom", "rim", "midTom",
 };
 
 struct DrumVoiceParams {
@@ -166,7 +168,7 @@ public:
 
     // ── Audio thread ──
 
-    // Starts voice 0..7 at velocity 1..127 from the next rendered sample. Out of range: ignored.
+    // Starts voice 0..kDrumVoices-1 at velocity 1..127 from the next rendered sample. Out of range: ignored.
     void trigger(int voice, int velocity) {
         if (voice < 0 || voice >= kDrumVoices) return;
         VoiceState& v = voices[voice];
@@ -276,6 +278,7 @@ private:
     };
 
     static constexpr double kTwoPi = 6.283185307179586;
+    static constexpr float kMidTomHz = 119.373f; // sqrt(95 x 150)
     static constexpr float kHatRatios[6] = {205.3f, 304.4f, 369.6f, 522.7f, 540.0f, 800.0f};
 
     // Per-sample multiplier that falls by 60 dB over `seconds`.
@@ -387,10 +390,13 @@ private:
             break;
         }
         case kDrumLowTom:
+        case kDrumMidTom:
         case kDrumHighTom: {
-            const bool high = index == kDrumHighTom;
-            const float base = (high ? 150.0f : 95.0f) * ratio;
-            const float ampC = coef60((high ? 0.4 : 0.5) * decayScale);
+            // The mid tom sits at the log-centre of the other two, with a decay between theirs.
+            const float hz = index == kDrumHighTom ? 150.0f : index == kDrumMidTom ? kMidTomHz : 95.0f;
+            const double seconds = index == kDrumHighTom ? 0.4 : index == kDrumMidTom ? 0.45 : 0.5;
+            const float base = hz * ratio;
+            const float ampC = coef60(seconds * decayScale);
             const float pitchC = coef60(0.25);
             const float clickC = coef60(0.015);
             const float clickGain = 0.35f * tone;

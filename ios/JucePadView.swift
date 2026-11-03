@@ -6,7 +6,7 @@ import UIKit
 // stops when the last touch on it lifts or is cancelled. onNoteOn / onNoteOff are for visuals
 // and haptics only; the sound has already been triggered when they fire.
 //
-// Drums mode (mode "drums"): `note` is a drum voice (0–7) and every touch-down hits it (one-shot,
+// Drums mode (mode "drums"): `note` is a drum voice (0–8) and every touch-down hits it (one-shot,
 // with the same velocity as a note; a second finger retriggers). onNoteOn fires per hit and
 // onNoteOff when the last touch lifts; no note-off is sent to the engine.
 class JucePadView: ExpoView {

@@ -217,18 +217,18 @@ public class ExpoJuceModule: Module {
       return true
     }
 
-    // voice 0–7 (anything else, including a non-integer, is ignored); velocity clamped to 1–127.
+    // voice 0–8 (anything else, including a non-integer, is ignored); velocity clamped to 1–127.
     Function("drumHit") { (voice: Double, velocity: Double) -> Void in
-      guard voice.isFinite, velocity.isFinite, voice.rounded() == voice, voice >= 0, voice <= 7 else {
+      guard voice.isFinite, velocity.isFinite, voice.rounded() == voice, voice >= 0, voice <= 8 else {
         return
       }
       let clampedVelocity = Int32(min(max(velocity.rounded(), 1), 127))
       ExpoJuceBridge.drumHit(Int32(voice), velocity: clampedVelocity)
     }
 
-    // Partial update; unknown keys ignored, values clamped. false for a voice outside 0–7.
+    // Partial update; unknown keys ignored, values clamped. false for a voice outside 0–8.
     Function("setDrumVoice") { (voice: Double, params: [String: Any]) -> Bool in
-      guard voice.isFinite, voice.rounded() == voice, voice >= 0, voice <= 7 else {
+      guard voice.isFinite, voice.rounded() == voice, voice >= 0, voice <= 8 else {
         return false
       }
       return ExpoJuceBridge.setDrumVoice(Int32(voice), params: params)
@@ -294,7 +294,7 @@ public class ExpoJuceModule: Module {
         view.note = note
       }
 
-      // "notes" (default) or "drums": in drums mode a touch hits drum voice `note` (0–7).
+      // "notes" (default) or "drums": in drums mode a touch hits drum voice `note` (0–8).
       Prop("mode") { (view: JucePadView, mode: String?) in
         view.drumMode = (mode == "drums")
       }

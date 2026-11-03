@@ -78,7 +78,7 @@ public:
     void noteOn(int note, int velocity, juce::int64 touchTicks = 0) { queue->pushNoteOn(note, velocity, touchTicks); }
     void noteOff(int note) { queue->pushNoteOff(note); }
     void allNotesOff() { queue->pushAllNotesOff(); }
-    // A drum hit (voice 0–7, velocity 1–127) through the same queue; any thread. Out of range: ignored.
+    // A drum hit (voice 0–8, velocity 1–127) through the same queue; any thread. Out of range: ignored.
     void drumHit(int voice, int velocity, juce::int64 touchTicks = 0) { queue->pushDrumHit(voice, velocity, touchTicks); }
 
     // The queue this synth reads its notes from: its own by default; the engine passes its

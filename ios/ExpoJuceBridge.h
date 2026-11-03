@@ -70,9 +70,9 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (NSDictionary<NSString *, id> *)getArpeggiatorState NS_SWIFT_NAME(getArpeggiatorState());
 
 // ── Drums (0.8.0+) ───────────────────────────────────────────────
-// drumHit: voice 0–7 (others ignored), velocity clamped to 1–127; lock-free, any thread.
+// drumHit: voice 0–8 (others ignored), velocity clamped to 1–127; lock-free, any thread.
 // Parameters: lock-free, remembered before setup and across rebuilds; unknown keys ignored, values
-// clamped. setDrumVoice returns NO for a voice outside 0–7. Swift: `drumHit(_:velocity:)`,
+// clamped. setDrumVoice returns NO for a voice outside 0–8. Swift: `drumHit(_:velocity:)`,
 // `padDrumHit(_:velocity:touchTimestamp:)`, `setDrumVoice(_:params:)`, `setDrumKit(_:)`, `getDrumState()`.
 + (void)drumHit:(int)voice velocity:(int)velocity NS_SWIFT_NAME(drumHit(_:velocity:));
 + (void)padDrumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp NS_SWIFT_NAME(padDrumHit(_:velocity:touchTimestamp:));

@@ -13,7 +13,7 @@
 // What a queued event starts.
 enum class NoteEventKind : uint8_t {
     Note = 0, // a synth note-on (`note` 0–127)
-    Drum = 1, // a drum hit (`note` = drum voice 0–7); one-shot, never released, never arpeggiated
+    Drum = 1, // a drum hit (`note` = drum voice 0–8); one-shot, never released, never arpeggiated
 };
 
 // A note-on (or drum hit) waiting for the audio thread.
@@ -72,7 +72,7 @@ public:
     // note-ons, so hits and notes keep their order. Hits carry no sequence number and are not
     // touched by the release marks. Returns false for an out-of-range voice (ignored, not counted)
     // or a full ring (counted in drumHitsDropped).
-    static constexpr int kMaxDrumVoice = 7;
+    static constexpr int kMaxDrumVoice = 8;
     bool pushDrumHit(int voice, int velocity, juce::int64 touchTicks = 0) {
         if (voice < 0 || voice > kMaxDrumVoice) return false;
         velocity = std::clamp(velocity, 1, 127);
