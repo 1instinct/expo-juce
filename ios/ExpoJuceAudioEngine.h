@@ -93,7 +93,7 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 - (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params;
 // Kit keys: level (0–1), mute (bool), drive (0–1). Always YES.
 - (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params;
-// { kit: { level, mute, drive }, voices: [8 × { tune, decay, tone, level }] } as stored.
+// { kit: { level, mute, drive }, voices: [9 × { tune, decay, tone, level }] } as stored.
 - (NSDictionary<NSString *, id> *)drumState;
 
 // Output analysis for HUDs: { peak, rms, scope: [128 numbers], bands: [24 numbers], sampleRate,
