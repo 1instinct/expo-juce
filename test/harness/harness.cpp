@@ -2614,7 +2614,7 @@ static bool runDrums() {
         check(s.setVoiceParam(7, kDrumParamLevel, 1.5) && s.voice(7).level == 1.0f, "level clamps to 1");
         check(!s.setVoiceParam(2, kDrumParamLevel, std::nan("")) && s.voice(2).level == kDrumVoiceDefaults.level, "NaN ignored");
         check(!s.setVoiceParam(2, kDrumParamTune, INFINITY) && s.voice(2).tune == 0.0f, "inf ignored");
-        check(!s.setVoiceParam(8, kDrumParamLevel, 0.5) && !s.setVoiceParam(-1, kDrumParamLevel, 0.5), "voice out of range");
+        check(!s.setVoiceParam(kDrumVoices, kDrumParamLevel, 0.5) && !s.setVoiceParam(-1, kDrumParamLevel, 0.5), "voice out of range");
         check(!s.setVoiceParam(0, kDrumParamCount, 0.5), "param out of range");
         check(s.setKitLevel(-1.0) && s.kit().level == 0.0f, "kit level clamps");
         check(s.setKitDrive(5.0) && s.kit().drive == 1.0f, "drive clamps");
@@ -2627,7 +2627,7 @@ static bool runDrums() {
               && drumParamIndex("levels") == -1 && drumParamIndex(nullptr) == -1, "param names");
     }
 
-    // 5. Extremes (tune ±24, decay 0/1, tone 0/1, level 1, drive 1, all 8 voices at once, odd blocks):
+    // 5. Extremes (tune ±24, decay 0/1, tone 0/1, level 1, drive 1, all voices at once, odd blocks):
     //    finite, bounded, no subnormal output, ends silent.
     for (int combo = 0; combo < 4; ++combo) {
         DrumMachine dm;
@@ -2683,7 +2683,7 @@ static bool runDrums() {
     {
         DrumMachine dm;
         dm.prepare(sr);
-        dm.trigger(8, 127); dm.trigger(-1, 127);
+        dm.trigger(kDrumVoices, 127); dm.trigger(-1, 127);
         check(dm.diag.hits.load() == 0 && dm.activeVoiceCount() == 0, "out-of-range hit ignored");
         std::vector<float> buf(128, 0.25f);
         dm.render(buf.data(), 128);
@@ -2718,7 +2718,7 @@ static bool runDrums() {
     const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
     check(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
     const bool pass = failures == 0;
-    std::printf("dr    drums: 8 voices decay to exact silence, decay scales, choke, retrigger, clamps, extremes,"
+    std::printf("dr    drums: every voice decays to exact silence, decay scales, choke, retrigger, clamps, extremes,"
                 " mute, velocity, diag  %-4s %d failed checks; lengths ms (decay 0.5):%s allocs %llu%s\n",
                 pass ? "PASS" : "FAIL", failures, lengths.c_str(), (unsigned long long)allocs, detail.c_str());
     std::fflush(stdout);
@@ -2771,7 +2771,7 @@ static bool runDrumsInSynth() {
         check(queue.notesQueued.load() == 0 && queue.notesConsumed.load() == 0, "note counters untouched" + tag);
         check(!synth.arp().isActive(), "arp never gets drum hits" + tag);
         check(synth.diag.lastNoteToRenderMs.load() >= 0.0, "hit latency recorded" + tag);
-        check(!queue.pushDrumHit(8, 100) && !queue.pushDrumHit(-1, 100) && queue.drumHitsQueued.load() == 1,
+        check(!queue.pushDrumHit(kDrumVoices, 100) && !queue.pushDrumHit(-1, 100) && queue.drumHitsQueued.load() == 1,
               "out-of-range voice not queued" + tag);
         // A synth note and a drum hit in the same block; allNotesOff never touches drums.
         synth.noteOn(60, 100);
@@ -2810,7 +2810,7 @@ static bool runDrumsInSynth() {
     return pass;
 }
 
-// Render budget: all 8 voices retriggered every 250 ms at decay 1 (so all 8 always sound), drive on,
+// Render budget: every voice retriggered every 250 ms at decay 1 (so all always sound), drive on,
 // 48 kHz / 128-sample blocks, 20 s of audio. Must render far faster than realtime.
 static bool runDrumBudget() {
     const double sr = 48000.0;
@@ -2833,8 +2833,178 @@ static bool runDrumBudget() {
     const double ratio = secs / 20.0;
     const double perBlockUs = secs * 1e6 / (double)(total / 128);
     const bool pass = ratio < 0.05 && minActive == kDrumVoices;
-    std::printf("drb   drums render budget: 8 voices sounding, 48k/128, 20 s  %-4s %.4f x realtime (%.2f us per"
+    std::printf("drb   drums render budget: all voices sounding, 48k/128, 20 s  %-4s %.4f x realtime (%.2f us per"
                 " 2667 us block, limit 0.05), min active %d\n", pass ? "PASS" : "FAIL", ratio, perBlockUs, minActive);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Fundamental of `x` over [from, to) from its rising zero crossings (linearly interpolated).
+static double zeroCrossingHz(const std::vector<float>& x, int from, int to, double sr) {
+    double first = -1.0, last = -1.0;
+    int crossings = 0;
+    for (int i = std::max(1, from); i < std::min((int)x.size(), to); ++i) {
+        const float a = x[(size_t)i - 1], b = x[(size_t)i];
+        if (a < 0.0f && b >= 0.0f) {
+            const double t = (double)(i - 1) + (double)a / (double)(a - b);
+            if (first < 0.0) first = t;
+            last = t;
+            ++crossings;
+        }
+    }
+    return crossings > 1 ? (double)(crossings - 1) * sr / (last - first) : 0.0;
+}
+
+// Mid tom (voice 8, 0.8.0-rc.2): a ninth voice on the tom model. Sounds and decays to exact
+// silence; its pitch is between the low and high tom, centred (log scale) between them; tune
+// moves it; the hat choke and the other toms are unaffected; index 8 is accepted by the store,
+// the machine and the note queue, 9 is not.
+static bool runMidTom() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    const int mid = 8;
+    double hz[3] = {0.0, 0.0, 0.0};
+    if (kDrumVoices < 9) {
+        check(false, "kDrumVoices " + std::to_string(kDrumVoices) + " < 9");
+    } else {
+        check(std::string(kDrumVoiceNames[mid]) == "midTom", "voice 8 is named midTom");
+        check(std::string(kDrumVoiceNames[kDrumLowTom]) == "lowTom" && std::string(kDrumVoiceNames[kDrumHighTom]) == "highTom"
+              && std::string(kDrumVoiceNames[kDrumRim]) == "rim" && std::string(kDrumVoiceNames[kDrumKick]) == "kick",
+              "voices 0-7 keep their names");
+
+        // Sounds from sample 0, decays to exact silence, goes idle.
+        {
+            DrumMachine dm;
+            dm.prepare(sr);
+            std::vector<float> out;
+            renderDrums(dm, (int)(4.0 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(mid, 127); });
+            check(cleanSamples(out, 4.0f), "finite/bounded/no subnormal");
+            check(rmsOf(out, 0, (int)(0.02 * sr)) > 0.05, "non-silent in its first 20 ms");
+            check(rmsOf(out, (int)(0.3 * sr), (int)(0.35 * sr)) < rmsOf(out, (int)(0.05 * sr), (int)(0.1 * sr)) * 0.5,
+                  "decays");
+            const int end = lastNonZero(out);
+            check(end > (int)(0.2 * sr) && end < (int)(3.0 * sr), "ends in exact silence (" + std::to_string(end) + ")");
+            check(!dm.isVoiceActive(mid) && dm.activeVoiceCount() == 0, "idle after its tail");
+            check(dm.diag.hits.load() == 1, "hit counted");
+        }
+
+        // Pitch (tone 0: no attack noise), 250-350 ms after the hit (the pitch drop is over).
+        const int toms[3] = {kDrumLowTom, mid, kDrumHighTom};
+        for (int t = 0; t < 3; ++t) {
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.params().setVoiceParam(toms[t], kDrumParamTone, 0.0);
+            std::vector<float> out;
+            renderDrums(dm, (int)(0.4 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(toms[t], 127); });
+            hz[t] = zeroCrossingHz(out, (int)(0.25 * sr), (int)(0.35 * sr), sr);
+        }
+        check(hz[0] < hz[1] && hz[1] < hz[2], "low < mid < high");
+        const double centre = 0.5 * (std::log2(hz[0]) + std::log2(hz[2]));
+        check(std::fabs(std::log2(hz[1]) - centre) * 12.0 < 0.25, "mid within a quarter semitone of the toms' centre");
+        {
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.params().setVoiceParam(mid, kDrumParamTone, 0.0);
+            dm.params().setVoiceParam(mid, kDrumParamTune, 12.0);
+            std::vector<float> out;
+            renderDrums(dm, (int)(0.4 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(mid, 127); });
+            const double up = zeroCrossingHz(out, (int)(0.25 * sr), (int)(0.35 * sr), sr);
+            check(std::fabs(up / std::max(1.0, hz[1]) - 2.0) < 0.01, "tune +12 doubles the pitch (" + std::to_string(up) + ")");
+        }
+
+        // Level 0 is exact 0; velocity scales linearly.
+        {
+            DrumMachine dm, soft;
+            dm.prepare(sr); soft.prepare(sr);
+            dm.params().setVoiceParam(mid, kDrumParamLevel, 0.0);
+            std::vector<float> out;
+            renderDrums(dm, 9600, 128, out, [&](int done) { if (done == 0) dm.trigger(mid, 127); });
+            bool zero = true;
+            for (float v : out) zero = zero && v == 0.0f;
+            check(zero, "level 0 is exact 0");
+            DrumMachine loud;
+            loud.prepare(sr);
+            loud.params().setVoiceParam(mid, kDrumParamTone, 0.0);
+            soft.params().setVoiceParam(mid, kDrumParamTone, 0.0);
+            std::vector<float> l, s;
+            renderDrums(loud, 4800, 128, l, [&](int done) { if (done == 0) loud.trigger(mid, 127); });
+            renderDrums(soft, 4800, 128, s, [&](int done) { if (done == 0) soft.trigger(mid, 32); });
+            const double ratio = rmsOf(s, 0, 4800) / std::max(1e-9, rmsOf(l, 0, 4800));
+            check(std::fabs(ratio - 32.0 / 127.0) < 0.01, "velocity scales linearly");
+        }
+
+        // Hat choke unaffected: with the mid tom sounding, a closed hat still ends the open hat within
+        // 40 ms; the mid tom (tone 0) renders sample for sample as it does alone (not choked).
+        {
+            DrumMachine alone, both;
+            alone.prepare(sr); both.prepare(sr);
+            for (DrumMachine* m : {&alone, &both}) {
+                m->params().setVoiceParam(mid, kDrumParamTone, 0.0);
+                m->params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0);
+                m->params().setVoiceParam(kDrumOpenHat, kDrumParamLevel, 0.0);
+            }
+            const int chokeAt = 2400 / 128 * 128 + 128;
+            std::vector<float> a, b;
+            renderDrums(alone, (int)(0.5 * sr), 128, a, [&](int done) { if (done == 0) alone.trigger(mid, 127); });
+            renderDrums(both, (int)(0.5 * sr), 128, b, [&](int done) {
+                if (done == 0) { both.trigger(mid, 127); both.trigger(kDrumOpenHat, 127); }
+                if (done == chokeAt) both.trigger(kDrumClosedHat, 127);
+            });
+            check(a == b, "closed / open hats do not touch the mid tom");
+            check(both.isVoiceActive(mid), "mid tom still sounding after the choke");
+            check(!both.isVoiceActive(kDrumOpenHat), "open hat choked with the mid tom sounding");
+
+            DrumMachine hats;
+            hats.prepare(sr);
+            hats.params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0);
+            std::vector<float> c;
+            renderDrums(hats, (int)(0.5 * sr), 128, c, [&](int done) {
+                if (done == 0) { hats.trigger(kDrumOpenHat, 127); hats.trigger(mid, 127); }
+                if (done == chokeAt) hats.trigger(kDrumClosedHat, 127);
+            });
+            check(lastNonZero(c) > chokeAt + (int)(0.04 * sr), "mid tom keeps sounding past the choke");
+            check(!hats.isVoiceActive(kDrumOpenHat) && hats.isVoiceActive(mid),
+                  "closed hat chokes the open hat, not the mid tom (open hat audible)");
+
+            // A mid tom hit does not choke the open hat or either tom.
+            DrumMachine dm;
+            dm.prepare(sr);
+            std::vector<float> o;
+            renderDrums(dm, 256, 128, o, [&](int done) {
+                if (done == 0) { dm.trigger(kDrumOpenHat, 127); dm.trigger(kDrumLowTom, 127); dm.trigger(kDrumHighTom, 127); }
+                if (done == 128) dm.trigger(mid, 127);
+            });
+            check(dm.isVoiceActive(kDrumOpenHat) && dm.isVoiceActive(kDrumLowTom) && dm.isVoiceActive(kDrumHighTom)
+                  && dm.isVoiceActive(mid), "mid tom chokes nothing");
+        }
+
+        // Index range: 8 accepted, 9 rejected (store, machine, queue).
+        {
+            DrumParamStore s;
+            check(s.setVoiceParam(mid, kDrumParamDecay, 0.25) && s.voice(mid).decay == 0.25f, "store accepts voice 8");
+            check(!s.setVoiceParam(9, kDrumParamDecay, 0.25) && !s.setVoiceParam(-1, kDrumParamDecay, 0.25),
+                  "store rejects 9 / -1");
+            s.reset();
+            check(s.voice(mid).decay == kDrumVoiceDefaults.decay, "reset covers voice 8");
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.trigger(9, 127);
+            check(dm.activeVoiceCount() == 0 && dm.diag.hits.load() == 0, "machine ignores voice 9");
+            NoteEventQueue q;
+            check(q.pushDrumHit(mid, 100), "queue accepts voice 8");
+            check(!q.pushDrumHit(9, 100) && q.drumHitsQueued.load() == 1, "queue rejects voice 9");
+        }
+    }
+
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    check(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
+    const bool pass = failures == 0;
+    std::printf("drm   drums: mid tom (voice 8) sounds, decays, pitch between the toms, tune, choke unaffected,"
+                " range  %-4s %d failed checks; Hz low %.1f mid %.1f high %.1f allocs %llu%s\n",
+                pass ? "PASS" : "FAIL", failures, hz[0], hz[1], hz[2], (unsigned long long)allocs, detail.c_str());
     std::fflush(stdout);
     return pass;
 }
@@ -2878,8 +3048,15 @@ static bool runDrumDefaultsMatchJs() {
         ++mismatches;
         detail += " mute";
     }
+    // export const DRUM_VOICE_COUNT = <n>;
+    const juce::String count = text.fromFirstOccurrenceOf("export const DRUM_VOICE_COUNT", false, false)
+                                   .fromFirstOccurrenceOf("=", false, false).upToFirstOccurrenceOf(";", false, false).trim();
+    if (count.isEmpty() || count.getIntValue() != kDrumVoices) {
+        ++mismatches;
+        detail += " DRUM_VOICE_COUNT(" + count.toStdString() + ")";
+    }
     const bool pass = file.existsAsFile() && mismatches == 0;
-    std::printf("drd   src/drumDefaults.ts == DrumMachine.h defaults  %-4s %d mismatches%s\n", pass ? "PASS" : "FAIL",
+    std::printf("drd   src/drumDefaults.ts == DrumMachine.h defaults and voice count  %-4s %d mismatches%s\n", pass ? "PASS" : "FAIL",
                 mismatches, detail.c_str());
     std::fflush(stdout);
     return pass;
@@ -2980,6 +3157,7 @@ int main(int argc, char** argv) {
     if (want("dr")) unexpected += runDrums() ? 0 : 1;
     if (want("drs")) unexpected += runDrumsInSynth() ? 0 : 1;
     if (want("drb")) unexpected += runDrumBudget() ? 0 : 1;
+    if (want("drm")) unexpected += runMidTom() ? 0 : 1;
     if (want("drd")) unexpected += runDrumDefaultsMatchJs() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
