@@ -6,6 +6,8 @@
 #include "VoiceAllocator.h"
 #include "TransportEngine.h"
 #include "NoteEventQueue.h"
+#include "Arpeggiator.h"
+#include "AnalysisRing.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -40,6 +42,7 @@ struct SynthSettings {
     float filterCutoff, filterResonance;
     float attackMs, decayMs, sustainLevel, releaseMs;
     float detuneCents, masterLevel;
+    ArpSettings arp;
 };
 
 class PolySynthProcessor : public juce::AudioProcessor {
@@ -74,8 +77,9 @@ public:
     void allNotesOff() { queue->pushAllNotesOff(); }
 
     // The queue this synth reads its notes from: its own by default; the engine passes its
-    // process-lifetime queue (before the synth is attached to a device). nullptr = own queue.
-    void setNoteQueue(NoteEventQueue* q) { queue = q ? q : &ownQueue; }
+    // process-lifetime queue (before the synth is attached to a device). nullptr = own queue. The
+    // queue's current all-notes-off mark counts as already applied (it may predate this synth).
+    void setNoteQueue(NoteEventQueue* q) { queue = q ? q : &ownQueue; lastAllReleasedSeen = queue->allReleasedMark(); }
     NoteEventQueue& noteQueue() { return *queue; }
 
     void setWaveform(Waveform wf);
@@ -88,20 +92,38 @@ public:
     void setDetune(double cents);
     void setMasterLevel(double level);
 
-    // Any thread (atomic loads / stores, same as the setters).
+    // Any thread (atomic loads / stores, same as the setters). Includes the arpeggiator's options.
     SynthSettings getSettings() const;
     void applySettings(const SynthSettings& s);
 
+    // The arpeggiator between the note queue and the voices (options any thread, see
+    // Arpeggiator::setSettings / setSettingsStore; applySettings writes its store too). Enabled, drained note-ons feed it and it starts / stops voices
+    // at sample offsets inside the block; disabled, note-ons start voices directly as before.
+    Arpeggiator& arp() { return arpeggiator; }
+    const Arpeggiator& arp() const { return arpeggiator; }
+
     void setTransport(TransportEngine* t) { transport = t; }
+    // Receives the arpeggiator state every block (AnalysisRing::publishArp). nullptr = none.
+    void setAnalysis(AnalysisRing* a) { analysis = a; }
     BeatState beatState;
     SynthDiagnostics diag;
 
 private:
+    static constexpr int kArpEventCapacity = Arpeggiator::kMaxEvents;
+
     void startQueuedNote(const NoteEvent& event);
+    void recordNoteLatency(const NoteEvent& event);
+    void renderVoices(float* mono, int numSamples, Waveform wf, float detune, float cutoff, float reso, float master);
+    void applyArpEvent(const ArpEvent& event);
 
     Voice voices[MAX_VOICES];
     VoiceAllocator allocator;
     TransportEngine* transport = nullptr;
+    AnalysisRing* analysis = nullptr;
+    Arpeggiator arpeggiator;
+    ArpEvent arpEvents[kArpEventCapacity]; // this block's arp events (audio thread)
+    int arpEventCount = 0;
+    uint64_t lastAllReleasedSeen = 0;      // NoteEventQueue::allReleasedMark last applied to the arp
 
     std::atomic<int> waveform{static_cast<int>(Waveform::Sine)};
     std::atomic<float> filterCutoff{20000.0f};

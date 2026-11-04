@@ -10,6 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, an, arp, arpv, sp)
 ```
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
@@ -46,6 +47,35 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   sample), `rsa` (aux settings and the track survive a rebuild), `an` (the `AnalysisRing` written
   by `GraphPlayer` holds a known sine at the expected scope indices, peak / rms since the
   last read, mono RMS, the transport published by the aux node). The `allocs` / `frees` counters also count `free()` inside render calls.
+- Arpeggiator (`ios/Arpeggiator.h`, pure C++, driven with a recording sink): `arp` (the six
+  pattern vectors of the design spec plus upDown edge cases, random membership and chord; at
+  120 bpm / `1/16` / 48 kHz every hit lands exactly on `k × 6000` over the odd `kFxBlocks` sizes,
+  note-off at `+ round(gate × 6000)`, swing 0.25 moves odd steps by 1500, ratchet 3 gives hits at
+  0 / 2000 / 4000 with 1200-sample gates, `1/8D` = 18000 and `1/8T` = 8000; playing transport
+  from beat 0.3 plays step 0 at once and step 1 on the 0.5 line, from 0.4 step 0 waits for the
+  0.5 line; latch plays on after release and the next press replaces the list; disabling emits an
+  off for every sounding note in that block and clears; a tap released before the first grid
+  line plays nothing; allNotesOff stops and clears a latched list; a tempo change 120 → 60 puts
+  the next step 12000 after the previous; pattern bits beyond `length` are ignored; same-note
+  legato (gate 1.5) drops the superseded off; playing at 1/32, 200 bpm, swing 0.45 in 1024- and
+    471-sample blocks every step fires once, in order, odd ones at the swung offset; clamping /
+    defaults / name tables; 0 allocations
+  in every `process`), `arpv` (through `PolySynthProcessor`, square wave, attack / release 1 ms,
+  gate 0.5, 471-sample blocks: every step's onset is on sample `k × 6000` + the attack's rise to
+  0.01, the output is exactly 0 for the 1000 samples before each later step, 16 held notes in
+  `chord` mode sound on 16 voices, disabling mid-gate silences the output within that block and
+  a later player note-off of the arp note is harmless, enabling leaves a directly played voice
+  sounding until its release; 0 allocations). `rs` also round-trips the arp settings through
+  `SynthSettings`, and checks that a synth attached to a shared note queue after an allNotesOff on it
+  keeps the chord it drains in its first block (the queue's mark counts as already applied).
+- Spectrum (`ios/SpectrumAnalyser.h`, pure C++): `sp` (a full-scale 1 kHz sine reads ≥ 0.95 in
+  its band, 800–1027 Hz at 48 kHz, and ≤ 0.6 two bands away; a full-scale sine on a bin centre in
+  that band reads ≥ 0.99 with both neighbours ≤ 0.6 (a tone between bins spills its Hann main
+  lobe into the adjacent band, about 0.8, so sidelobe leakage is checked on a bin-centred tone);
+  −60 dBFS → ≤ 0.05; silence → exactly 0; 60 Hz reads ≥ 0.9 in band 0 (one bin wide) and 70 Hz
+  ≥ 0.95 in band 1; the edge table is strictly increasing with every band at least one bin wide
+  at 48000 and 44100 Hz; `AnalysisRing::readRaw` is oldest-first and `GraphPlayer` publishes the
+  device rate into the ring; `analyse` does not allocate).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

@@ -95,6 +95,11 @@ public:
         return seq <= mark;
     }
 
+    // The allNotesOff mark (sequence number every note-on at or below is released by). The
+    // consumer compares it with the value it last saw to detect a pushAllNotesOff, which also
+    // clears the arpeggiator's latched list (a per-note release alone keeps it).
+    uint64_t allReleasedMark() const { return allReleasedUpTo.load(std::memory_order_acquire); }
+
     // Drops queued note-ons (counted in notesDiscarded). Consumer side: call only while no audio
     // thread drains the queue (engine setup, before the device callback is attached).
     void discardPending() {

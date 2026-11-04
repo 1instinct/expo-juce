@@ -14,8 +14,11 @@
 #include "BackingTrack.h"
 #include "AnalysisRing.h"
 #include "TransportEngine.h"
+#include "Arpeggiator.h"
+#include "SpectrumAnalyser.h"
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <mutex>
 #include <thread>
@@ -132,6 +135,19 @@ static AuxSettingsStore sAuxSettings; // atomics only
 // JUCE is destroyed by static destruction, after JUCE has shut down).
 static BackingTrack& sBackingTrack = *new BackingTrack();
 static AnalysisRing sAnalysis;        // atomics only
+// Spectrum of the analysis ring, computed in -analysis on the calling thread (one FFT per call).
+// Holds JUCE buffers: heap-allocated and never freed, like sBackingTrack. sSpectrumBusy keeps two
+// concurrent -analysis calls off the shared FFT scratch (the second one reuses the last bands).
+static SpectrumAnalyser& sSpectrum = *new SpectrumAnalyser();
+static std::atomic_flag sSpectrumBusy = ATOMIC_FLAG_INIT;
+static float sLastBands[SpectrumAnalyser::kBands] = {};
+
+// ── Arpeggiator options ──
+// Same pattern as the aux settings: the process-lifetime store every setArpeggiator writes (no
+// lock, no engine needed), attached to each synth the engine builds, whose audio thread snapshots
+// it once per block. Nothing is copied into the synth, so a setArpeggiator during a rebuild (the
+// window withSynth would drop) is seen by the next block like any other.
+static ArpSettingsStore sArpOptions;
 
 static dispatch_queue_t backingTrackQueue() {
     static dispatch_queue_t queue;
@@ -389,6 +405,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     // as its consumer here: note-ons left from before (a failed or replaced engine) are dropped.
     sNoteQueue.discardPending();
     sSynth->setNoteQueue(&sNoteQueue);
+    sSynth->setAnalysis(&sAnalysis);
+    sSynth->arp().setSettingsStore(&sArpOptions); // the live options, before and across rebuilds
 
     self.setupStep = 7;
     NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth, fx chain)");
@@ -534,7 +552,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 // released, so no caller ever sees the defaults. Held notes are not replayed.
 - (void)restoreRecoveryStateLocked {
     if (!self.hasRecoveryState || !sSynth || !sTransport) return;
-    sSynth->applySettings(self.recoverySynthSettings);
+    // The snapshot's arp options may predate a setArpeggiator made while a failed rebuild waited
+    // for its retry; sArpOptions (which applySettings would write) always holds the latest.
+    SynthSettings settings = self.recoverySynthSettings;
+    settings.arp = sArpOptions.get();
+    sSynth->applySettings(settings);
     sTransport->restoreState(self.recoveryTransportState);
     self.hasRecoveryState = NO;
 }
@@ -1206,28 +1228,121 @@ static NSString *backingTrackPath(NSString *uri) {
     });
 }
 
+// ── Arpeggiator ──
+// Options: sArpOptions, the process-lifetime store the running synth reads every block (no lock,
+// works before setup). Absent keys and keys of the wrong number type are left unchanged; an
+// unknown `mode` / `rate`, a non-string / non-array where one is expected, or a `pattern` that is
+// not 1–16 booleans rejects the whole call (NO, nothing applied).
+
+- (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options {
+    ArpSettings s = sArpOptions.get();
+    id mode = options[@"mode"];
+    if (mode != nil) {
+        if (![mode isKindOfClass:[NSString class]]) return NO;
+        const int index = arpModeIndex(((NSString *)mode).UTF8String);
+        if (index < 0) return NO;
+        s.mode = (ArpMode)index;
+    }
+    id rate = options[@"rate"];
+    if (rate != nil) {
+        if (![rate isKindOfClass:[NSString class]]) return NO;
+        const int index = arpRateIndex(((NSString *)rate).UTF8String);
+        if (index < 0) return NO;
+        s.rate = (ArpRate)index;
+    }
+    id pattern = options[@"pattern"];
+    if (pattern != nil) {
+        if (![pattern isKindOfClass:[NSArray class]]) return NO;
+        NSArray *steps = (NSArray *)pattern;
+        if (steps.count < 1 || steps.count > 16) return NO;
+        const int length = (int)steps.count;
+        uint16_t mask = 0;
+        for (int i = 0; i < length; ++i) {
+            id step = steps[(NSUInteger)i];
+            if (![step isKindOfClass:[NSNumber class]]) return NO;
+            if ([(NSNumber *)step boolValue]) mask |= (uint16_t)(1u << i);
+        }
+        s.patternMask = mask;
+        s.patternLength = length;
+    }
+    if (NSNumber *v = numberFrom(options, @"enabled")) s.enabled = v.boolValue;
+    if (NSNumber *v = numberFrom(options, @"latch")) s.latch = v.boolValue;
+    if (NSNumber *v = numberFrom(options, @"octaves")) s.octaves = (int)std::lround(v.doubleValue);
+    if (NSNumber *v = numberFrom(options, @"gate")) s.gate = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(options, @"swing")) s.swing = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(options, @"accent")) s.accent = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(options, @"ratchet")) s.ratchet = (int)std::lround(v.doubleValue);
+    if (NSNumber *v = numberFrom(options, @"transposeSteps")) s.transposeSteps = (int)std::lround(v.doubleValue);
+    if (NSNumber *v = numberFrom(options, @"transposeDistance")) s.transposeDistance = (int)std::lround(v.doubleValue);
+    sArpOptions.set(s); // clamps; the synth's next block reads it
+    return YES;
+}
+
+- (NSDictionary<NSString *, id> *)arpeggiatorState {
+    const ArpSettings s = sArpOptions.get();
+    NSMutableArray<NSNumber *> *pattern = [NSMutableArray arrayWithCapacity:(NSUInteger)s.patternLength];
+    for (int i = 0; i < s.patternLength; ++i) [pattern addObject:@(((s.patternMask >> i) & 1) ? YES : NO)];
+    return @{
+        @"enabled": @(s.enabled ? YES : NO),
+        @"mode": @(kArpModeNames[std::clamp((int)s.mode, 0, kArpModeCount - 1)]),
+        @"rate": @(kArpRateNames[std::clamp((int)s.rate, 0, kArpRateCount - 1)]),
+        @"octaves": @(s.octaves),
+        @"gate": @(fxValueForJS(s.gate)),
+        @"swing": @(fxValueForJS(s.swing)),
+        @"latch": @(s.latch ? YES : NO),
+        @"pattern": pattern,
+        @"accent": @(fxValueForJS(s.accent)),
+        @"ratchet": @(s.ratchet),
+        @"transposeSteps": @(s.transposeSteps),
+        @"transposeDistance": @(s.transposeDistance),
+    };
+}
+
 // ── Analysis ──
 // Any thread, no lock: everything is read from the process-lifetime sAnalysis (levels and scope
-// written by GraphPlayer, transport as of the last block written by the aux node). Zeros while
-// the engine is not running.
+// written by GraphPlayer, transport as of the last block written by the aux node, arp state
+// written by the synth). The spectrum is one 2048-point FFT of the ring, computed here (the
+// ring is inactive before setup: no FFT, 24 zeros). Zeros while the engine is not running.
 - (NSDictionary<NSString *, id> *)analysis {
     const bool active = sAnalysis.isActive();
     float scope[AnalysisRing::kScopePoints] = {};
+    float bands[SpectrumAnalyser::kBands] = {};
     AnalysisRing::Levels levels{0.0f, 0.0f};
+    double sampleRate = 0.0;
     if (active) {
         sAnalysis.readScope(scope);
         levels = sAnalysis.readLevels();
+        sampleRate = sAnalysis.sampleRate();
+        if (!sSpectrumBusy.test_and_set(std::memory_order_acquire)) {
+            float raw[AnalysisRing::kSize];
+            sAnalysis.readRaw(raw);
+            sSpectrum.analyse(raw, sampleRate, bands);
+            std::memcpy(sLastBands, bands, sizeof(bands));
+            sSpectrumBusy.clear(std::memory_order_release);
+        } else {
+            std::memcpy(bands, sLastBands, sizeof(bands)); // another caller is mid-FFT
+        }
     }
     NSMutableArray<NSNumber *> *points = [NSMutableArray arrayWithCapacity:AnalysisRing::kScopePoints];
     for (int i = 0; i < AnalysisRing::kScopePoints; ++i) [points addObject:@(scope[i])];
+    NSMutableArray<NSNumber *> *bandValues = [NSMutableArray arrayWithCapacity:SpectrumAnalyser::kBands];
+    for (int i = 0; i < SpectrumAnalyser::kBands; ++i) [bandValues addObject:@(bands[i])];
     return @{
         @"peak": @(levels.peak),
         @"rms": @(levels.rms),
         @"scope": points,
+        @"bands": bandValues,
+        @"sampleRate": @(sampleRate),
         @"lastNote": @(sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed)),
         @"bpm": @(active ? sAnalysis.bpm() : 120.0),
         @"beat": @(active ? sAnalysis.beat() : 0.0),
         @"playing": @(active && sAnalysis.playing() ? YES : NO),
+        @"arp": @{
+            @"active": @(active && sAnalysis.arpActive() ? YES : NO),
+            @"step": @(active ? sAnalysis.arpStep() : 0),
+            @"steps": @(active ? sAnalysis.arpSteps() : sArpOptions.get().patternLength),
+            @"note": @(active ? sAnalysis.arpNote() : -1),
+        },
     };
 }
 

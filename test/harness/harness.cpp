@@ -12,6 +12,8 @@
 #include "AuxProcessor.h"
 #include "BackingTrack.h"
 #include "AnalysisRing.h"
+#include "Arpeggiator.h"
+#include "SpectrumAnalyser.h"
 
 #include <atomic>
 #include <chrono>
@@ -509,6 +511,11 @@ static bool runRebuildState() {
     oldSynth.setRelease(900.0);
     oldSynth.setDetune(-25.0);
     oldSynth.setMasterLevel(0.0); // muted: must not come back at the 0.5 default
+    ArpSettings arpWant = ArpSettings::defaults();
+    arpWant.enabled = true; arpWant.mode = ArpMode::UpDown; arpWant.rate = ArpRate::EighthT; arpWant.octaves = 3;
+    arpWant.gate = 0.9f; arpWant.swing = 0.2f; arpWant.latch = true; arpWant.patternMask = 0x5A5A; arpWant.patternLength = 12;
+    arpWant.accent = 0.3f; arpWant.ratchet = 2; arpWant.transposeSteps = 3; arpWant.transposeDistance = -7;
+    oldSynth.arp().setSettings(arpWant);
     oldTransport.setTempo(90.0);
     oldTransport.start();
     juce::AudioBuffer<float> buf(2, 256);
@@ -530,13 +537,40 @@ static bool runRebuildState() {
     const bool synthOk = back.waveform == static_cast<int>(Waveform::Saw) && back.filterCutoff == 1234.0f
         && back.filterResonance == 0.7f && back.attackMs == 15.0f && back.decayMs == 300.0f
         && back.sustainLevel == 0.4f && back.releaseMs == 900.0f && back.detuneCents == -25.0f
-        && back.masterLevel == 0.0f;
+        && back.masterLevel == 0.0f && back.arp == arpWant && ss.arp == arpWant && newSynth.arp().getSettings() == arpWant
+        && arpWant != ArpSettings::defaults();
     const bool transportOk = played > 0.0 && ts.position == 7.5 && newTransport.getTempo() == 90.0
         && newTransport.isPlaying() && newTransport.getPosition() == 7.5;
     newSynth.setRateAndBufferSizeDetails(48000, 256);
     newSynth.prepareToPlay(48000, 256);
     newSynth.processBlock(buf, midi);
     const bool continuesOk = newTransport.getPosition() > 7.5 && newTransport.getPosition() < 7.6;
+
+    // The note queue outlives the synth. After an allNotesOff on it, a synth built later and
+    // attached to it must take the queue's current all-released mark as already applied, not as
+    // new: otherwise its first enabled block flushes the chord it drained in that same block.
+    bool arpRebuildOk = false;
+    {
+        NoteEventQueue sharedQueue;
+        ArpSettings a = ArpSettings::defaults();
+        a.enabled = true; a.mode = ArpMode::Chord; a.gate = 1.0f;
+        TransportEngine t1;
+        PolySynthProcessor s1;
+        s1.setTransport(&t1); s1.setNoteQueue(&sharedQueue);
+        s1.setRateAndBufferSizeDetails(48000, 256); s1.prepareToPlay(48000, 256);
+        s1.arp().setSettings(a);
+        s1.noteOn(60, 100); s1.processBlock(buf, midi);
+        s1.allNotesOff(); s1.processBlock(buf, midi); // the mark advances, the list is cleared
+        const bool clearedOk = !s1.arp().isActive() && s1.arp().heldCount() == 0;
+        TransportEngine t2;
+        PolySynthProcessor s2;
+        s2.setTransport(&t2); s2.setNoteQueue(&sharedQueue);
+        s2.setRateAndBufferSizeDetails(48000, 256); s2.prepareToPlay(48000, 256);
+        s2.arp().setSettings(a);
+        s2.noteOn(60, 100); s2.noteOn(64, 100); s2.noteOn(67, 100);
+        for (int b = 0; b < 4; ++b) s2.processBlock(buf, midi);
+        arpRebuildOk = clearedOk && s2.arp().isActive() && s2.arp().heldCount() == 3 && s2.diag.activeVoices.load() == 3;
+    }
 
     // Effects: the engine keeps one FxParamStore for the process and attaches it to each new
     // FxChainProcessor, so a rebuilt chain renders exactly like the old one did. Checked: the
@@ -581,10 +615,10 @@ static bool runRebuildState() {
         }
     }
     const bool fxOk = fxStateOk && fxRenderOk;
-    const bool ok = synthOk && transportOk && continuesOk && fxOk;
-    std::printf("rs    rebuild carry-over (settings, tempo 90, playing, pending seek, fx)  %-4s synth %d transport %d"
-                " continues %d (pos %.4f) fx state %d fx render %d\n", ok ? "PASS" : "FAIL",
-                synthOk, transportOk, continuesOk, newTransport.getPosition(), fxStateOk, fxRenderOk);
+    const bool ok = synthOk && transportOk && continuesOk && fxOk && arpRebuildOk;
+    std::printf("rs    rebuild carry-over (settings + arp, tempo 90, playing, pending seek, fx, arp + shared queue)  %-4s synth %d"
+                " transport %d continues %d (pos %.4f) fx state %d fx render %d arp rebuild %d\n", ok ? "PASS" : "FAIL",
+                synthOk, transportOk, continuesOk, newTransport.getPosition(), fxStateOk, fxRenderOk, arpRebuildOk);
     std::fflush(stdout);
     return ok;
 }
@@ -1770,7 +1804,591 @@ static bool runAnalysis() {
     return pass;
 }
 
-int main() {
+//==============================================================================
+// Arpeggiator (ios/Arpeggiator.h, pure C++), standalone with a recording sink.
+
+struct ArpRec { int64_t at; int note; int velocity; bool on; };
+
+// Runs `arp` over `total` samples (48 kHz) in blocks cycled from `blocks`; `before(done, bpm)` may
+// change the tempo or the arp before each block. Events are recorded with absolute sample
+// positions. Every process call runs with the allocation counter on (added to `allocs`).
+static std::vector<ArpRec> runArpBlocks(Arpeggiator& arp, int total, const std::vector<int>& blocks, double bpm,
+                                        bool playing, double startBeat, uint64_t& allocs,
+                                        const std::function<void(int, double&)>& before = {}) {
+    const double sr = 48000.0;
+    std::vector<ArpRec> out;
+    out.reserve(8192);
+    size_t bi = 0;
+    double beat = startBeat;
+    for (int done = 0; done < total;) {
+        const int n = std::min(blocks[bi++ % blocks.size()], total - done);
+        if (before) before(done, bpm);
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        arp.process(beat, bpm, playing, sr, n, [&](const ArpEvent& e) {
+            if (out.size() < out.capacity()) out.push_back({(int64_t)done + e.sampleOffset, e.note, e.velocity, e.on});
+        });
+        tCountAllocs = false;
+        allocs += gRenderAllocs.load() + gRenderFrees.load();
+        if (playing) beat += n * bpm / (60.0 * sr);
+        done += n;
+    }
+    return out;
+}
+
+static std::vector<int64_t> arpOnTimes(const std::vector<ArpRec>& r, int note = -1) {
+    std::vector<int64_t> t;
+    for (const ArpRec& e : r) if (e.on && (note < 0 || e.note == note)) t.push_back(e.at);
+    return t;
+}
+static std::vector<int64_t> arpOffTimes(const std::vector<ArpRec>& r, int note = -1) {
+    std::vector<int64_t> t;
+    for (const ArpRec& e : r) if (!e.on && (note < 0 || e.note == note)) t.push_back(e.at);
+    return t;
+}
+static std::string arpList(const std::vector<int64_t>& v, size_t max = 10) {
+    std::string s;
+    for (size_t i = 0; i < v.size() && i < max; ++i) s += (i ? "," : "") + std::to_string(v[i]);
+    return s.empty() ? "-" : s;
+}
+
+static ArpSettings arpBase() {
+    ArpSettings s = ArpSettings::defaults();
+    s.enabled = true;
+    s.rate = ArpRate::Sixteenth; // 120 bpm: a step every 6000 samples at 48 kHz
+    return s;
+}
+
+// Spec 1.2 vectors (pattern order; "-" = rest), then timing (exact offsets over odd block sizes,
+// gate, swing, ratchet, 1/8D), the playing-transport start rule (beat 0.3 → step 0 at once and
+// step 1 on the 0.5 line; beat 0.4 → step 0 on the 0.5 line), latch (plays on after release,
+// the next press replaces the list), disable (an off for every sounding note in that block),
+// a tap released before the first step (nothing, list empty), allNotesOff (stops, clears the
+// latched list), a tempo change mid-run (the next step re-derived from the new bpm, none skipped
+// or doubled), pattern bits beyond `length` ignored, 0 allocations in every process call.
+static bool runArp() {
+    const std::vector<int> b256 = {256};
+    uint64_t allocs = 0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failures; detail += " [" + what + "]"; }
+    };
+    auto settle = [&](Arpeggiator& arp, const ArpSettings& s, std::initializer_list<int> notes) {
+        arp.setSettings(s);
+        uint64_t seq = 1;
+        for (int n : notes) arp.noteOn(n, 100, seq++);
+    };
+    // The note (or -1 = rest) started on each of the first `count` steps, stopped transport.
+    auto firstSteps = [&](const ArpSettings& s, std::initializer_list<int> notes, int count) {
+        Arpeggiator arp;
+        settle(arp, s, notes);
+        const auto rec = runArpBlocks(arp, 6000 * count + 100, b256, 120.0, false, 0.0, allocs);
+        std::vector<int> steps((size_t)count, -1);
+        bool misaligned = false;
+        for (const ArpRec& e : rec) {
+            if (!e.on) continue;
+            if (e.at % 6000 != 0) { misaligned = true; continue; }
+            const int k = (int)(e.at / 6000);
+            if (k < count) steps[(size_t)k] = e.note;
+        }
+        if (misaligned) steps.push_back(-99);
+        return steps;
+    };
+    auto vec = [&](const char* name, const ArpSettings& s, std::initializer_list<int> notes, std::vector<int> want) {
+        const std::vector<int> got = firstSteps(s, notes, 8);
+        std::string g;
+        for (int n : got) g += std::to_string(n) + " ";
+        check(got == want, std::string("vector ") + name + ": " + g);
+    };
+    {
+        ArpSettings s = arpBase();
+        vec("up", s, {60, 64, 67}, {60, 64, 67, 60, 64, 67, 60, 64});
+        s = arpBase(); s.mode = ArpMode::Down; s.octaves = 2;
+        vec("down oct2", s, {60, 64, 67}, {79, 76, 72, 67, 64, 60, 79, 76});
+        s = arpBase(); s.mode = ArpMode::Played;
+        vec("played", s, {67, 60, 64}, {67, 60, 64, 67, 60, 64, 67, 60});
+        s = arpBase(); s.mode = ArpMode::UpDown; s.octaves = 2;
+        vec("upDown oct2", s, {60, 64}, {60, 64, 72, 76, 72, 64, 60, 64});
+        s = arpBase(); s.patternMask = 0b1101; s.patternLength = 4;
+        vec("pattern on off on on", s, {60, 64, 67}, {60, -1, 64, 67, 60, -1, 64, 67});
+        s = arpBase(); s.patternLength = 2; s.transposeSteps = 2; s.transposeDistance = 5;
+        vec("transpose", s, {60}, {60, 60, 65, 65, 70, 70, 60, 60});
+        // Single-note edge cases of upDown, and the mask beyond `length` (bits 2.. set, length 2).
+        s = arpBase(); s.mode = ArpMode::UpDown;
+        vec("upDown one note", s, {60}, {60, 60, 60, 60, 60, 60, 60, 60});
+        s = arpBase(); s.mode = ArpMode::UpDown;
+        vec("upDown two notes", s, {60, 64}, {60, 64, 60, 64, 60, 64, 60, 64});
+        s = arpBase(); s.patternMask = 0xFFFD; s.patternLength = 2;
+        vec("mask beyond length", s, {60}, {60, -1, 60, -1, 60, -1, 60, -1});
+        // Random: membership in the up cycle only; chord: every held note on every step.
+        s = arpBase(); s.mode = ArpMode::Random; s.octaves = 2;
+        {
+            Arpeggiator arp;
+            settle(arp, s, {60, 64});
+            const auto rec = runArpBlocks(arp, 48100, b256, 120.0, false, 0.0, allocs);
+            bool member = true;
+            int ons = 0;
+            for (const ArpRec& e : rec)
+                if (e.on) { ++ons; member = member && (e.note == 60 || e.note == 64 || e.note == 72 || e.note == 76); }
+            check(member && ons == 9, "random membership (" + std::to_string(ons) + " ons)");
+        }
+        s = arpBase(); s.mode = ArpMode::Chord;
+        {
+            Arpeggiator arp;
+            arp.setSettings(s);
+            arp.noteOn(60, 100, 1); arp.noteOn(64, 90, 2); arp.noteOn(67, 80, 3);
+            const auto rec = runArpBlocks(arp, 12100, b256, 120.0, false, 0.0, allocs);
+            const auto t60 = arpOnTimes(rec, 60), t64 = arpOnTimes(rec, 64), t67 = arpOnTimes(rec, 67);
+            const std::vector<int64_t> want = {0, 6000, 12000};
+            int vel64 = -1;
+            for (const ArpRec& e : rec) if (e.on && e.note == 64 && e.at == 0) vel64 = e.velocity;
+            check(t60 == want && t64 == want && t67 == want && vel64 == 90, "chord: " + arpList(t60) + " / " + arpList(t64));
+        }
+    }
+    // Timing: exact grid over odd block sizes; gate 0.6 → off 3600 after each on.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.gate = 0.6f;
+        settle(arp, s, {60});
+        const auto rec = runArpBlocks(arp, 48100, kFxBlocks, 120.0, false, 0.0, allocs);
+        const auto on = arpOnTimes(rec), off = arpOffTimes(rec);
+        std::vector<int64_t> wantOn, wantOff;
+        for (int k = 0; k <= 8; ++k) { wantOn.push_back(6000 * k); if (k < 8) wantOff.push_back(6000 * k + 3600); }
+        check(on == wantOn, "grid ons " + arpList(on));
+        check(off == wantOff, "gate offs " + arpList(off));
+        int vel = -1;
+        for (const ArpRec& e : rec) if (e.on) vel = e.velocity;
+        check(vel == 100, "velocity passthrough");
+    }
+    // Accent 0.5: steps other than slot 0 at velocity × 0.7.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.accent = 0.5f; s.patternLength = 4;
+        settle(arp, s, {60});
+        const auto rec = runArpBlocks(arp, 12100, b256, 120.0, false, 0.0, allocs);
+        int v0 = -1, v1 = -1;
+        for (const ArpRec& e : rec) { if (e.on && e.at == 0) v0 = e.velocity; if (e.on && e.at == 6000) v1 = e.velocity; }
+        check(v0 == 100 && v1 == 70, "accent velocities " + std::to_string(v0) + "/" + std::to_string(v1));
+    }
+    // Swing 0.25: odd steps 1500 later.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.swing = 0.25f;
+        settle(arp, s, {60});
+        const auto on = arpOnTimes(runArpBlocks(arp, 24100, kFxBlocks, 120.0, false, 0.0, allocs));
+        check(on == std::vector<int64_t>{0, 7500, 12000, 19500, 24000}, "swing " + arpList(on));
+    }
+    // Ratchet 3, gate 0.6: hits at 0 / 2000 / 4000 of each step, each 1200 long.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.ratchet = 3; s.gate = 0.6f;
+        settle(arp, s, {60});
+        const auto rec = runArpBlocks(arp, 12100, kFxBlocks, 120.0, false, 0.0, allocs);
+        const auto on = arpOnTimes(rec), off = arpOffTimes(rec);
+        check(on == std::vector<int64_t>{0, 2000, 4000, 6000, 8000, 10000, 12000}, "ratchet ons " + arpList(on));
+        check(off == std::vector<int64_t>{1200, 3200, 5200, 7200, 9200, 11200}, "ratchet offs " + arpList(off));
+    }
+    // 1/8D at 120 bpm: 18000 samples a step; 1/8T: 8000.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.rate = ArpRate::EighthD;
+        settle(arp, s, {60});
+        const auto on = arpOnTimes(runArpBlocks(arp, 36100, kFxBlocks, 120.0, false, 0.0, allocs));
+        check(on == std::vector<int64_t>{0, 18000, 36000}, "1/8D " + arpList(on));
+        Arpeggiator arp2;
+        s.rate = ArpRate::EighthT;
+        settle(arp2, s, {60});
+        const auto on2 = arpOnTimes(runArpBlocks(arp2, 16100, kFxBlocks, 120.0, false, 0.0, allocs));
+        check(on2 == std::vector<int64_t>{0, 8000, 16000}, "1/8T " + arpList(on2));
+    }
+    // Playing transport. From beat 0.3 (0.2 step after the 0.25 line): step 0 at once, step 1 on
+    // the 0.5 line = 0.2 beat = 4800 samples later. From beat 0.4: step 0 on the 0.5 line (2400).
+    {
+        Arpeggiator arp;
+        settle(arp, arpBase(), {60});
+        const auto on = arpOnTimes(runArpBlocks(arp, 17000, kFxBlocks, 120.0, true, 0.3, allocs));
+        check(on == std::vector<int64_t>{0, 4800, 10800, 16800}, "playing from 0.3: " + arpList(on));
+        Arpeggiator arp2;
+        settle(arp2, arpBase(), {60});
+        const auto on2 = arpOnTimes(runArpBlocks(arp2, 15000, kFxBlocks, 120.0, true, 0.4, allocs));
+        check(on2 == std::vector<int64_t>{2400, 8400, 14400}, "playing from 0.4: " + arpList(on2));
+        // Exactly on a line: step 0 at once.
+        Arpeggiator arp3;
+        settle(arp3, arpBase(), {60});
+        const auto on3 = arpOnTimes(runArpBlocks(arp3, 7000, b256, 120.0, true, 2.0, allocs));
+        check(on3 == std::vector<int64_t>{0, 6000}, "playing from 2.0: " + arpList(on3));
+    }
+    // Latch: released (every held note), the arp plays on; the next press replaces the list and,
+    // the list having gone empty → non-empty, restarts the cycle (stopped: the grid restarts at
+    // that press; the old note's pending off still comes).
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.latch = true;
+        settle(arp, s, {60});
+        const auto rec = runArpBlocks(arp, 36100, b256, 120.0, false, 0.0, allocs, [&](int done, double&) {
+            if (done == 256) arp.releaseHeld([](int, uint64_t) { return true; });
+            if (done == 15360) arp.noteOn(64, 100, 7);
+        });
+        const auto on60 = arpOnTimes(rec, 60), on64 = arpOnTimes(rec, 64), off60 = arpOffTimes(rec, 60);
+        check(on60 == std::vector<int64_t>{0, 6000, 12000}, "latch keeps playing: " + arpList(on60));
+        check(on64 == std::vector<int64_t>{15360, 21360, 27360, 33360}, "latch replaced by the next press: " + arpList(on64));
+        check(off60 == std::vector<int64_t>{3600, 9600, 15600}, "latch: old note's off still comes " + arpList(off60));
+        check(arp.isActive() && arp.heldCount() == 1, "latch active");
+    }
+    // No latch: release stops the arp after the current gate (its off still comes), list empty.
+    {
+        Arpeggiator arp;
+        settle(arp, arpBase(), {60});
+        const auto rec = runArpBlocks(arp, 12100, b256, 120.0, false, 0.0, allocs, [&](int done, double&) {
+            if (done == 256) arp.releaseHeld([](int, uint64_t) { return true; });
+        });
+        check(arpOnTimes(rec) == std::vector<int64_t>{0} && arpOffTimes(rec) == std::vector<int64_t>{3600},
+              "release stops: ons " + arpList(arpOnTimes(rec)) + " offs " + arpList(arpOffTimes(rec)));
+        check(!arp.isActive() && arp.heldCount() == 0, "release empties the list");
+    }
+    // Disable while a gate is open (gate 1.2: the note of step 0 sounds past step 1): an off for
+    // every sounding note at offset 0 of that block, nothing after, lists cleared.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.gate = 1.2f; s.mode = ArpMode::Chord;
+        settle(arp, s, {60, 64});
+        const auto rec = runArpBlocks(arp, 24100, b256, 120.0, false, 0.0, allocs, [&](int done, double&) {
+            if (done == 6400) { ArpSettings off = s; off.enabled = false; arp.setSettings(off); }
+        });
+        const auto off60 = arpOffTimes(rec, 60), off64 = arpOffTimes(rec, 64);
+        // Step 0 (0..7200) and step 1 (6000..13200) are both sounding at 6400: one off per note.
+        check(off60 == std::vector<int64_t>{6400} && off64 == std::vector<int64_t>{6400},
+              "disable offs 60 " + arpList(off60) + " 64 " + arpList(off64));
+        check(arpOnTimes(rec) == std::vector<int64_t>{0, 0, 6000, 6000}, "disable: no later ons " + arpList(arpOnTimes(rec)));
+        check(!arp.isActive() && arp.heldCount() == 0, "disable clears");
+        // A later release of a note the player still holds is harmless.
+        arp.releaseHeld([](int, uint64_t) { return true; });
+        arp.noteOff(60);
+        const auto rec2 = runArpBlocks(arp, 12100, b256, 120.0, false, 0.0, allocs);
+        check(rec2.empty(), "disabled: no events");
+    }
+    // A tap released before the first grid line (playing from 0.4; the line is 2400 in): nothing.
+    {
+        Arpeggiator arp;
+        settle(arp, arpBase(), {60});
+        const auto rec = runArpBlocks(arp, 20000, b256, 120.0, true, 0.4, allocs, [&](int done, double&) {
+            if (done == 256) arp.releaseHeld([](int, uint64_t) { return true; });
+        });
+        check(rec.empty() && arp.heldCount() == 0 && !arp.isActive(), "tap before step 0: " + std::to_string(rec.size()) + " events");
+    }
+    // allNotesOff with latch: stops the sounding notes in the next process, clears the list.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.latch = true; s.gate = 1.0f;
+        settle(arp, s, {60, 64});
+        const auto rec = runArpBlocks(arp, 24100, b256, 120.0, false, 0.0, allocs, [&](int done, double&) {
+            if (done == 256) arp.releaseHeld([](int, uint64_t) { return true; }); // latched
+            if (done == 6400) arp.allNotesOff();
+        });
+        const auto on = arpOnTimes(rec), off = arpOffTimes(rec);
+        check(on == std::vector<int64_t>{0, 6000} && off == std::vector<int64_t>{6000, 6400},
+              "allNotesOff: ons " + arpList(on) + " offs " + arpList(off));
+        check(!arp.isActive() && arp.heldCount() == 0, "allNotesOff clears");
+    }
+    // Tempo 120 → 60 after step 1 (stopped): step 2 comes 12000 after step 1, step 3 12000 later.
+    {
+        Arpeggiator arp;
+        settle(arp, arpBase(), {60});
+        const auto on = arpOnTimes(runArpBlocks(arp, 30100, kFxBlocks, 120.0, false, 0.0, allocs, [&](int done, double& bpm) {
+            if (done > 6000) bpm = 60.0;
+        }));
+        check(on == std::vector<int64_t>{0, 6000, 18000, 30000}, "tempo change " + arpList(on));
+    }
+    // Same-note legato (gate 1.5, one note): the previous step's off is dropped when the same note
+    // retriggers (the allocator cuts the old voice), so the new voice is not stopped by it.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.gate = 1.5f;
+        settle(arp, s, {60});
+        const auto rec = runArpBlocks(arp, 12100, b256, 120.0, false, 0.0, allocs);
+        check(arpOnTimes(rec) == std::vector<int64_t>{0, 6000, 12000} && arpOffTimes(rec).empty(),
+              "legato: offs " + arpList(arpOffTimes(rec)));
+    }
+    // Swing while the transport plays, across block boundaries: 1/32 at 200 bpm (L = 1800), swing
+    // 0.45 (odd steps + 810), in 1024- and 471-sample blocks. Every step fires exactly once, in
+    // order, the odd ones at the swung offset: a grid line that passed near the end of a block
+    // while its swung offset lies in the next block is still due there, not a transport jump.
+    for (int blockSize : {1024, 471}) {
+        Arpeggiator arp;
+        ArpSettings s = arpBase(); s.rate = ArpRate::ThirtySecond; s.swing = 0.45f; s.gate = 0.3f;
+        settle(arp, s, {60});
+        const auto on = arpOnTimes(runArpBlocks(arp, 40 * 1800 + 100, std::vector<int>{blockSize}, 200.0, true, 0.0, allocs));
+        std::vector<int64_t> want;
+        for (int k = 0; k <= 40; ++k) want.push_back((int64_t)k * 1800 + ((k & 1) ? 810 : 0));
+        check(on == want, "swing playing " + std::to_string(blockSize) + ": " + std::to_string(on.size()) + " hits " + arpList(on, 8));
+    }
+    // Settings: clamping, defaults, enabled/disabled reads.
+    {
+        Arpeggiator arp;
+        ArpSettings s = arpBase();
+        s.octaves = 9; s.gate = 7.0f; s.swing = -1.0f; s.patternLength = 40; s.accent = 2.0f; s.ratchet = 0;
+        s.transposeSteps = 20; s.transposeDistance = -40;
+        arp.setSettings(s);
+        const ArpSettings g = arp.getSettings();
+        check(g.octaves == 4 && g.gate == 1.5f && g.swing == 0.0f && g.patternLength == 16 && g.accent == 1.0f
+              && g.ratchet == 1 && g.transposeSteps == 8 && g.transposeDistance == -12 && g.enabled, "clamping");
+        const ArpSettings d = ArpSettings::defaults();
+        check(!d.enabled && d.mode == ArpMode::Up && d.rate == ArpRate::Sixteenth && d.octaves == 1 && d.gate == 0.6f
+              && d.swing == 0.0f && !d.latch && d.patternMask == 0xFFFF && d.patternLength == 16 && d.accent == 0.0f
+              && d.ratchet == 1 && d.transposeSteps == 0 && d.transposeDistance == 0, "defaults");
+        check(arpModeIndex("upDown") == (int)ArpMode::UpDown && arpModeIndex("nope") < 0
+              && arpRateIndex("1/16T") == (int)ArpRate::SixteenthT && arpRateIndex("1/3") < 0, "name tables");
+    }
+    const bool pass = failures == 0 && allocs == 0;
+    std::printf("arp   arpeggiator: 6 vectors, grid/gate/swing/ratchet, playing start rule, latch, disable, tap, tempo  %-4s"
+                " %d failed checks%s allocs %llu\n", pass ? "PASS" : "FAIL", failures, detail.c_str(),
+                (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Arp through PolySynthProcessor: square wave, attack / release 1 ms, 1/16 at 120 bpm (stopped
+// transport), gate 0.5, noteOn(60) → every step's onset is on sample k × 6000 (+ the attack's rise
+// to 0.01, at most 3 samples) in 471-sample blocks, and the output is exactly silent for the 1000
+// samples before each later step (gate 0.5 = 3000 on, 3000 off, 1 ms release). 16 held notes in
+// chord mode sound on 16 voices. Disabling mid-gate silences the output within that block (+ the
+// release), a later player noteOff of the arp note is harmless; enabling leaves a directly played
+// voice sounding until its release. 0 allocations in every processBlock.
+static bool runArpVoices() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    auto prepare = [&](PolySynthProcessor& synth, TransportEngine& transport) {
+        synth.setTransport(&transport);
+        synth.setRateAndBufferSizeDetails(sr, 512);
+        synth.prepareToPlay(sr, 512);
+        synth.setWaveform(Waveform::Square);
+        synth.setAttack(1.0);
+        synth.setRelease(1.0);
+        synth.setMasterLevel(0.5);
+    };
+    // Renders `total` samples in 471-sample blocks; `before(done)` runs before each block.
+    auto render = [&](PolySynthProcessor& synth, int total, std::vector<float>& out, const std::function<void(int)>& before = {}) {
+        juce::AudioBuffer<float> buf(2, 512);
+        juce::MidiBuffer midi;
+        out.assign((size_t)total, 0.0f);
+        for (int done = 0; done < total;) {
+            const int n = std::min(471, total - done);
+            if (before) before(done);
+            buf.setSize(2, n, false, false, true);
+            tCountAllocs = true;
+            synth.processBlock(buf, midi);
+            tCountAllocs = false;
+            std::memcpy(&out[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+            done += n;
+        }
+    };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    // 1. Onsets and gaps.
+    {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        prepare(synth, transport);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.5f;
+        synth.arp().setSettings(s);
+        synth.noteOn(60, 127);
+        std::vector<float> out;
+        render(synth, 48000, out);
+        std::string onsets;
+        for (int k = 0; k < 8; ++k) {
+            const int start = k * 6000;
+            int first = -1;
+            for (int i = start - (k > 0 ? 1000 : 0); i < start + 200; ++i)
+                if (std::fabs(out[(size_t)i]) > 0.01f) { first = i; break; }
+            onsets += std::to_string(first - start) + " ";
+            check(first >= start && first <= start + 3, "step " + std::to_string(k) + " onset at " + std::to_string(first - start));
+            if (k > 0) {
+                int nonZero = 0;
+                for (int i = start - 1000; i < start; ++i) nonZero += out[(size_t)i] != 0.0f ? 1 : 0;
+                check(nonZero == 0, "step " + std::to_string(k) + ": " + std::to_string(nonZero) + " non-zero samples in the gap");
+            }
+        }
+        detail += " onsets+" + onsets;
+        check(synth.noteQueue().lastNoteStarted.load() == 60, "lastNoteStarted");
+        check(synth.arp().isActive() && synth.arp().lastNote() == 60, "arp active");
+    }
+    // 2. 16 held notes in chord mode → 16 voices.
+    int chordVoices = 0;
+    {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        prepare(synth, transport);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.mode = ArpMode::Chord; s.gate = 1.0f;
+        synth.arp().setSettings(s);
+        for (int n = 48; n < 64; ++n) synth.noteOn(n, 100);
+        std::vector<float> out;
+        render(synth, 471, out);
+        chordVoices = synth.diag.activeVoices.load();
+        check(chordVoices == 16 && MAX_VOICES == 16, "chord voices " + std::to_string(chordVoices));
+    }
+    // 3. Disable mid-gate, then a player noteOff of the arp note; enabling keeps a direct voice.
+    {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        prepare(synth, transport);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.5f;
+        synth.arp().setSettings(s);
+        synth.noteOn(60, 127);
+        std::vector<float> out;
+        const int disableAt = 6123; // block start right after step 1 (6000)
+        render(synth, 24000, out, [&](int done) {
+            if (done == disableAt) { ArpSettings off = s; off.enabled = false; synth.arp().setSettings(off); }
+            if (done == 6594) synth.noteOff(60);
+        });
+        int lastNonZero = -1;
+        for (int i = 0; i < 24000; ++i) if (out[(size_t)i] != 0.0f) lastNonZero = i;
+        check(lastNonZero >= 6000 && lastNonZero < disableAt + 200, "disable silences at " + std::to_string(lastNonZero));
+        check(synth.diag.activeVoices.load() == 0 && !synth.arp().isActive(), "disabled: no voices");
+        // Direct note while the arp is off, then the arp is enabled: the voice continues.
+        synth.noteOn(62, 100);
+        render(synth, 942, out);
+        const bool soundingBefore = synth.diag.activeVoices.load() == 1;
+        synth.arp().setSettings(s);
+        render(synth, 942, out);
+        float peak = 0.0f;
+        for (float v : out) peak = std::max(peak, std::fabs(v));
+        const bool soundingAfter = synth.diag.activeVoices.load() == 1 && peak > 0.1f;
+        synth.noteOff(62);
+        render(synth, 942, out);
+        check(soundingBefore && soundingAfter && synth.diag.activeVoices.load() == 0, "enable keeps the direct voice until its release");
+    }
+    const uint64_t allocs = gRenderAllocs.load() + gRenderFrees.load();
+    const bool pass = failures == 0 && allocs == 0;
+    std::printf("arpv  arp through PolySynthProcessor: onsets on k x 6000, silent gaps, 16-voice chord, disable, enable  %-4s"
+                " %d failed checks%s allocs %llu\n", pass ? "PASS" : "FAIL", failures, detail.c_str(), (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
+//==============================================================================
+// Spectrum (ios/SpectrumAnalyser.h): 24 log-spaced bands from 2048 mono samples, 0..1 for
+// −60..0 dBFS of the loudest bin in the band. A full-scale 1 kHz sine reads ≥ 0.95 in its band
+// (800–1027 Hz at 48 kHz) and ≤ 0.6 two bands away; a full-scale sine on a bin centre inside that
+// band (914.06 Hz) reads ≥ 0.99 and ≤ 0.6 in both neighbours (a tone straddling bins spills its
+// main lobe into the adjacent band, so only sidelobes are checked there); −60 dBFS → ≤ 0.05;
+// silence → exactly 0 everywhere; 60 Hz reads ≥ 0.9 in band 0 (40–63.4 Hz) and 70 Hz ≥ 0.95 in
+// band 1 (louder than band 0), with nothing above 0.6 from band 3 up; the edge table is strictly
+// increasing, every band at least one bin wide, 40 Hz to 16 kHz, at 48000 and 44100 Hz; the
+// readRaw copy of the AnalysisRing is oldest-first; analyse() does not allocate.
+static bool runSpectrum() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    SpectrumAnalyser analyser;
+    std::vector<float> mono((size_t)SpectrumAnalyser::kSize, 0.0f);
+    float bands[SpectrumAnalyser::kBands];
+    float edges[SpectrumAnalyser::kBands + 1];
+    SpectrumAnalyser::bandEdges(sr, edges);
+    auto bandOf = [&](double hz) {
+        for (int i = 0; i < SpectrumAnalyser::kBands; ++i)
+            if (hz >= edges[i] && hz < edges[i + 1]) return i;
+        return -1;
+    };
+    auto tone = [&](double hz, double amplitude) {
+        for (int i = 0; i < SpectrumAnalyser::kSize; ++i)
+            mono[(size_t)i] = (float)(amplitude * std::sin(juce::MathConstants<double>::twoPi * hz * i / sr));
+    };
+    auto fmt = [](float v) { char b[16]; std::snprintf(b, sizeof b, "%.3f", v); return std::string(b); };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    auto analyse = [&] {
+        tCountAllocs = true;
+        analyser.analyse(mono.data(), sr, bands);
+        tCountAllocs = false;
+    };
+    // 1 kHz full scale.
+    tone(1000.0, 1.0);
+    analyse();
+    const int b1k = bandOf(1000.0);
+    check(b1k == 12 && edges[12] < 801.0 && edges[13] > 1026.0 && edges[13] < 1028.0, "1 kHz band index " + std::to_string(b1k));
+    check(bands[b1k] >= 0.95f, "1 kHz band " + fmt(bands[b1k]));
+    check(bands[b1k - 2] <= 0.6f && bands[b1k + 2] <= 0.6f, "1 kHz two bands away " + fmt(bands[b1k - 2]) + "/" + fmt(bands[b1k + 2]));
+    check(bands[b1k - 1] < bands[b1k] && bands[b1k + 1] < bands[b1k], "1 kHz neighbours below");
+    detail += " 1k:" + fmt(bands[b1k - 1]) + "/" + fmt(bands[b1k]) + "/" + fmt(bands[b1k + 1]);
+    // On a bin centre inside the same band: full scale, only sidelobes leak.
+    tone(39.0 * sr / SpectrumAnalyser::kSize, 1.0);
+    analyse();
+    check(bands[12] >= 0.99f && bands[11] <= 0.6f && bands[13] <= 0.6f,
+          "914 Hz " + fmt(bands[11]) + "/" + fmt(bands[12]) + "/" + fmt(bands[13]));
+    // −60 dBFS and silence.
+    tone(1000.0, 0.001);
+    analyse();
+    check(bands[12] <= 0.05f, "-60 dBFS " + fmt(bands[12]));
+    std::fill(mono.begin(), mono.end(), 0.0f);
+    analyse();
+    bool allZero = true;
+    for (float v : bands) allZero = allZero && v == 0.0f;
+    check(allZero, "silence");
+    // Low bands are one bin wide at 48 kHz: 60 Hz in band 0, 70 Hz in band 1.
+    tone(60.0, 1.0);
+    analyse();
+    bool quietAbove = true;
+    for (int i = 3; i < SpectrumAnalyser::kBands; ++i) quietAbove = quietAbove && bands[i] <= 0.6f;
+    check(bandOf(60.0) == 0 && bands[0] >= 0.9f && quietAbove, "60 Hz band 0 " + fmt(bands[0]) + " band 1 " + fmt(bands[1]));
+    tone(70.0, 1.0);
+    analyse();
+    quietAbove = true;
+    for (int i = 3; i < SpectrumAnalyser::kBands; ++i) quietAbove = quietAbove && bands[i] <= 0.6f;
+    check(bandOf(70.0) == 1 && bands[1] >= 0.95f && bands[0] < bands[1] && quietAbove,
+          "70 Hz band 0 " + fmt(bands[0]) + " band 1 " + fmt(bands[1]));
+    // Edge table at 48000 and 44100.
+    for (double rate : {48000.0, 44100.0}) {
+        float e[SpectrumAnalyser::kBands + 1];
+        SpectrumAnalyser::bandEdges(rate, e);
+        const double bin = rate / SpectrumAnalyser::kSize;
+        bool ok = e[0] == 40.0f && e[SpectrumAnalyser::kBands] == 16000.0f;
+        for (int i = 1; i <= SpectrumAnalyser::kBands; ++i) ok = ok && e[i] > e[i - 1] && e[i] - e[i - 1] >= bin - 1e-3;
+        // The first bands follow the bin (one bin wide) until the geometric spacing overtakes.
+        ok = ok && std::fabs(e[1] - (40.0 + bin)) < 1e-3 && e[23] > 12000.0f;
+        check(ok, "edges at " + std::to_string((int)rate));
+    }
+    // AnalysisRing::readRaw: the last kSize samples, oldest first.
+    {
+        AnalysisRing ring;
+        std::vector<float> ramp(5000);
+        for (int i = 0; i < 5000; ++i) ramp[(size_t)i] = (float)i;
+        const float* channels[1] = { ramp.data() };
+        ring.write(channels, 1, 5000);
+        std::vector<float> raw((size_t)AnalysisRing::kSize);
+        ring.readRaw(raw.data());
+        bool ok = true;
+        for (int i = 0; i < AnalysisRing::kSize; ++i) ok = ok && raw[(size_t)i] == (float)(5000 - AnalysisRing::kSize + i);
+        check(ok, "readRaw order");
+        // GraphPlayer tells the ring the device rate when the device starts.
+        GraphPlayer player;
+        player.setAnalysis(&ring);
+        FakeDevice device(44100, 256);
+        player.audioDeviceAboutToStart(&device);
+        check(ring.sampleRate() == 44100.0, "ring sample rate from the device");
+    }
+    const uint64_t allocs = gRenderAllocs.load() + gRenderFrees.load();
+    const bool pass = failures == 0 && allocs == 0;
+    std::printf("sp    spectrum: 24 bands, 1 kHz / bin-centred / -60 dBFS / silence / 60 + 70 Hz, edge table, readRaw  %-4s"
+                " %d failed checks%s allocs %llu\n", pass ? "PASS" : "FAIL", failures, detail.c_str(), (unsigned long long)allocs);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Only the cases named on the command line run (none: every case).
+static std::vector<std::string> gOnlyCases;
+static bool want(const char* id) {
+    if (gOnlyCases.empty()) return true;
+    for (const std::string& c : gOnlyCases) if (c == id) return true;
+    return false;
+}
+
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) gOnlyCases.emplace_back(argv[i]);
     // App: MessageManager::getInstance() in a static constructor on the main thread, then
     // juce::initialiseJuce_GUI() at doSetup step 0. Same thread here.
     juce::MessageManager::getInstance();
@@ -1809,19 +2427,20 @@ int main() {
         std::fflush(stdout);
     };
     int unexpected = 0;
-    {
+    if (want("ctl")) {
         const Result ctl = runSynthAlone();
         unexpected += ctl.pass ? 0 : 1;
         row("ctl", "synth alone + touch stamp, direct, 48k/512", ctl);
     }
     for (auto& c : cases) {
+        if (!want(c.id.c_str())) continue;
         auto r = runCase(c);
         unexpected += (r.pass == c.expectSilence) ? 1 : 0;
         // Allocation-free rendering is required in every case, the negative control included.
         if (c.expectSilence && r.renderAllocs > 0) ++unexpected;
         row(c.id, c.desc, r);
     }
-    {
+    if (want("mp")) {
         const MultiProducerResult mp = runMultiProducer();
         unexpected += mp.pass ? 0 : 1;
         std::printf("mp    2 producers x 10k noteOn/noteOff + audio thread  %-4s attempted %u = queued %u + dropped %u;"
@@ -1830,24 +2449,27 @@ int main() {
                     mp.nans);
         std::fflush(stdout);
     }
-    unexpected += runRebuildState() ? 0 : 1;
-    unexpected += runReleases().pass ? 0 : 1;
-    unexpected += runFxEffects();
-    unexpected += runFxBypass() ? 0 : 1;
-    unexpected += runFxEchoSync();
-    unexpected += runFxPumpAndLimiter() ? 0 : 1;
-    unexpected += runFxTails() ? 0 : 1;
-    unexpected += runFxDefaultsMatchJs() ? 0 : 1;
-    unexpected += runMetronome();
-    unexpected += runBackingTrackPlayback() ? 0 : 1;
-    unexpected += runBackingTrackTempoRamp() ? 0 : 1;
-    unexpected += runBackingTrackSwapFade() ? 0 : 1;
-    unexpected += runBackingTrackRegion() ? 0 : 1;
-    unexpected += runBackingTrackLimits() ? 0 : 1;
-    unexpected += runBackingTrackSwapStress() ? 0 : 1;
-    unexpected += runAuxSilent() ? 0 : 1;
-    unexpected += runAuxRebuildState() ? 0 : 1;
-    unexpected += runAnalysis() ? 0 : 1;
+    if (want("rs")) unexpected += runRebuildState() ? 0 : 1;
+    if (want("rl")) unexpected += runReleases().pass ? 0 : 1;
+    if (want("fx")) unexpected += runFxEffects();
+    if (want("fxb")) unexpected += runFxBypass() ? 0 : 1;
+    if (want("fxe")) unexpected += runFxEchoSync();
+    if (want("fxp")) unexpected += runFxPumpAndLimiter() ? 0 : 1;
+    if (want("fxt")) unexpected += runFxTails() ? 0 : 1;
+    if (want("fxd")) unexpected += runFxDefaultsMatchJs() ? 0 : 1;
+    if (want("met")) unexpected += runMetronome();
+    if (want("bt")) unexpected += runBackingTrackPlayback() ? 0 : 1;
+    if (want("btt")) unexpected += runBackingTrackTempoRamp() ? 0 : 1;
+    if (want("bsf")) unexpected += runBackingTrackSwapFade() ? 0 : 1;
+    if (want("btr")) unexpected += runBackingTrackRegion() ? 0 : 1;
+    if (want("btl")) unexpected += runBackingTrackLimits() ? 0 : 1;
+    if (want("bts")) unexpected += runBackingTrackSwapStress() ? 0 : 1;
+    if (want("aux0")) unexpected += runAuxSilent() ? 0 : 1;
+    if (want("rsa")) unexpected += runAuxRebuildState() ? 0 : 1;
+    if (want("an")) unexpected += runAnalysis() ? 0 : 1;
+    if (want("arp")) unexpected += runArp() ? 0 : 1;
+    if (want("arpv")) unexpected += runArpVoices() ? 0 : 1;
+    if (want("sp")) unexpected += runSpectrum() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

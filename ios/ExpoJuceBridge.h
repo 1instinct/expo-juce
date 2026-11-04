@@ -61,6 +61,12 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm);
 + (void)unloadBackingTrack;
 + (NSDictionary<NSString *, id> *)getAnalysis NS_SWIFT_NAME(getAnalysis());
 
+// ── Arpeggiator (0.7.0+) ─────────────────────────────────────────
+// Lock-free, any thread; remembered before setup and across rebuilds. NO (nothing applied): unknown
+// mode / rate, pattern not 1–16 booleans. Swift: `setArpeggiator(_:)`, `getArpeggiatorState()`.
++ (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options NS_SWIFT_NAME(setArpeggiator(_:));
++ (NSDictionary<NSString *, id> *)getArpeggiatorState NS_SWIFT_NAME(getArpeggiatorState());
+
 // ── Transport ────────────────────────────────────────────────────
 + (void)startTransport;
 + (void)stopTransport;

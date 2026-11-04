@@ -5,6 +5,7 @@
 PolySynthProcessor::PolySynthProcessor()
     : AudioProcessor(BusesProperties()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)) {
+    lastAllReleasedSeen = queue->allReleasedMark();
 }
 
 void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
@@ -19,23 +20,62 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                        juce::MidiBuffer& /*midiMessages*/) {
     buffer.clear();
 
-    // Note-ons waiting in the queue, then releases: every held voice whose note-on is at or
-    // below its release mark stops (see NoteEventQueue). Applied every block, so a release sent
-    // while the device was stopped or reopening takes effect on the first block after it.
-    queue->drainNoteOns([this](const NoteEvent& event) { startQueuedNote(event); });
+    const int numSamples = buffer.getNumSamples();
+    const double sr = getSampleRate();
+
+    // Transport first, so the block-start beat / bpm / play state describe this block here as
+    // they do for the effects and aux processors downstream (TransportEngine::getBlockStartBeat).
+    double blockBeat = 0.0, bpm = 120.0;
+    bool playing = false;
+    if (transport) {
+        if (transport->advanceBlock(numSamples, sr)) {
+            beatState.crossed.store(true);
+            beatState.beat.store(transport->getPosition());
+            beatState.bpm.store(transport->getTempo());
+        }
+        blockBeat = transport->getBlockStartBeat();
+        bpm = transport->getBlockBpm();
+        playing = transport->isBlockPlaying();
+    }
+
+    // Note-ons waiting in the queue: to the arpeggiator when it is enabled, else straight to
+    // the voices. Then releases: every held voice whose note-on is at or below its release mark
+    // stops (see NoteEventQueue; arp voices have startSeq 0 and are not affected), and the arp
+    // drops the held notes the player released. Applied every block, so a release sent while
+    // the device was stopped or reopening takes effect on the first block after it. The arp's
+    // options are snapshotted once here and hold for the whole block.
+    const ArpSettings& arpNow = arpeggiator.beginBlock();
+    if (arpNow.enabled) {
+        queue->drainNoteOns([this](const NoteEvent& event) {
+            arpeggiator.noteOn(event.note, event.velocity, event.seq);
+            recordNoteLatency(event);
+        });
+        const uint64_t allReleased = queue->allReleasedMark();
+        if (allReleased != lastAllReleasedSeen) {
+            lastAllReleasedSeen = allReleased;
+            arpeggiator.allNotesOff();
+        }
+        arpeggiator.releaseHeld([this](int note, uint64_t seq) { return queue->isReleased(note, seq); });
+    } else {
+        queue->drainNoteOns([this](const NoteEvent& event) { startQueuedNote(event); });
+        lastAllReleasedSeen = queue->allReleasedMark();
+    }
     for (int v = 0; v < MAX_VOICES; v++) {
         if (voices[v].isHeld() && queue->isReleased(voices[v].getNoteNumber(), voices[v].startSeq))
             voices[v].stopNote();
     }
 
-    int numSamples = buffer.getNumSamples();
-    double sr = getSampleRate();
+    // The arp's events for this block (always run: disabling stops its voices here).
+    arpEventCount = 0;
+    arpeggiator.process(blockBeat, bpm, playing, sr, numSamples, [this](const ArpEvent& event) {
+        if (arpEventCount < kArpEventCapacity) arpEvents[arpEventCount++] = event;
+    });
 
-    Waveform wf = static_cast<Waveform>(waveform.load());
-    float cutoff = filterCutoff.load();
-    float reso = filterResonance.load();
-    float detune = detuneCents.load();
-    float master = masterLevel.load();
+    const Waveform wf = static_cast<Waveform>(waveform.load());
+    const float cutoff = filterCutoff.load();
+    const float reso = filterResonance.load();
+    const float detune = detuneCents.load();
+    const float master = masterLevel.load();
 
     float* monoBuffer = buffer.getWritePointer(0);
 
@@ -50,22 +90,24 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         }
     }
 
-    for (int v = 0; v < MAX_VOICES; v++) {
-        if (!voices[v].isActive()) continue;
-
-        int note = voices[v].getNoteNumber();
-        double freq = 440.0 * std::pow(2.0, (note - 69) / 12.0);
-        if (std::fabs(detune) > 0.01f) {
-            freq *= std::pow(2.0, (double)detune / 1200.0);
-        }
-
-        voices[v].renderBlock(monoBuffer, numSamples,
-                              wf, freq, cutoff, reso, master);
+    // Render in segments split at the arp's event offsets (ascending): the voices play up to
+    // each event, the event starts or stops its voice(s), and so on. No events: one segment.
+    int pos = 0;
+    for (int i = 0; i < arpEventCount; ++i) {
+        const int at = std::clamp(arpEvents[i].sampleOffset, pos, numSamples);
+        if (at > pos) renderVoices(monoBuffer + pos, at - pos, wf, detune, cutoff, reso, master);
+        pos = at;
+        applyArpEvent(arpEvents[i]);
     }
+    if (pos < numSamples) renderVoices(monoBuffer + pos, numSamples - pos, wf, detune, cutoff, reso, master);
 
     if (buffer.getNumChannels() > 1) {
         buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
     }
+
+    if (analysis != nullptr)
+        analysis->publishArp(arpeggiator.currentStep(), arpeggiator.patternLength(), arpeggiator.lastNote(),
+                             arpeggiator.isActive());
 
     // ── Diagnostics (relaxed atomics only; no locks/allocation) ──
     {
@@ -78,13 +120,40 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         diag.activeVoices.store(active, std::memory_order_relaxed);
         diag.processCount.fetch_add(1, std::memory_order_relaxed);
     }
+}
 
-    if (transport) {
-        if (transport->advanceBlock(numSamples, sr)) {
-            beatState.crossed.store(true);
-            beatState.beat.store(transport->getPosition());
-            beatState.bpm.store(transport->getTempo());
+// Audio thread: every active voice over `numSamples` samples into `mono` (summed).
+void PolySynthProcessor::renderVoices(float* mono, int numSamples, Waveform wf, float detune, float cutoff,
+                                      float reso, float master) {
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (!voices[v].isActive()) continue;
+
+        const int note = voices[v].getNoteNumber();
+        double freq = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+        if (std::fabs(detune) > 0.01f) {
+            freq *= std::pow(2.0, (double)detune / 1200.0);
         }
+
+        voices[v].renderBlock(mono, numSamples, wf, freq, cutoff, reso, master);
+    }
+}
+
+// Audio thread: an arp note-on starts a voice with startSeq 0 (its note-on never enters the
+// queue's release marks); an arp note-off stops every arp-started voice of that note.
+void PolySynthProcessor::applyArpEvent(const ArpEvent& event) {
+    if (event.note < 0 || event.note > 127) return;
+    if (event.on) {
+        allocator.noteOn(event.note, (float)std::clamp(event.velocity, 0, 127), voices,
+                         static_cast<Waveform>(waveform.load()),
+                         (double)detuneCents.load(),
+                         filterCutoff.load(), filterResonance.load(),
+                         masterLevel.load(), 0);
+        queue->lastNoteStarted.store(event.note, std::memory_order_relaxed);
+        return;
+    }
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (voices[v].isHeld() && voices[v].startSeq == 0 && voices[v].getNoteNumber() == event.note)
+            voices[v].stopNote();
     }
 }
 
@@ -98,7 +167,11 @@ void PolySynthProcessor::startQueuedNote(const NoteEvent& event) {
                      filterCutoff.load(), filterResonance.load(),
                      masterLevel.load(), event.seq);
     queue->lastNoteStarted.store(clampedNote, std::memory_order_relaxed);
+    recordNoteLatency(event);
+}
 
+// Audio thread: enqueue → consume latency of a note-on (direct or into the arpeggiator).
+void PolySynthProcessor::recordNoteLatency(const NoteEvent& event) {
     const juce::int64 nowTicks = juce::Time::getHighResolutionTicks();
     if (event.stampTicks != 0) {
         const juce::int64 elapsed = nowTicks - event.stampTicks;
@@ -155,7 +228,7 @@ SynthSettings PolySynthProcessor::getSettings() const {
     return { waveform.load(), filterCutoff.load(), filterResonance.load(),
              voices[0].attackMs.load(), voices[0].decayMs.load(),
              voices[0].sustainLevel.load(), voices[0].releaseMs.load(),
-             detuneCents.load(), masterLevel.load() };
+             detuneCents.load(), masterLevel.load(), arpeggiator.getSettings() };
 }
 
 void PolySynthProcessor::applySettings(const SynthSettings& s) {
@@ -168,4 +241,5 @@ void PolySynthProcessor::applySettings(const SynthSettings& s) {
     setRelease(s.releaseMs);
     setDetune(s.detuneCents);
     setMasterLevel(s.masterLevel);
+    arpeggiator.setSettings(s.arp);
 }

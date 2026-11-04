@@ -51,6 +51,18 @@ public:
         transportPlaying.store(playing, std::memory_order_relaxed);
     }
 
+    // Audio thread (PolySynthProcessor): arpeggiator state as of the block just rendered.
+    void publishArp(int step, int steps, int note, bool active) {
+        arpStepValue.store(step, std::memory_order_relaxed);
+        arpStepsValue.store(steps, std::memory_order_relaxed);
+        arpNoteValue.store(note, std::memory_order_relaxed);
+        arpActiveValue.store(active, std::memory_order_relaxed);
+    }
+    int arpStep() const { return arpStepValue.load(std::memory_order_relaxed); }
+    int arpSteps() const { return arpStepsValue.load(std::memory_order_relaxed); }
+    int arpNote() const { return arpNoteValue.load(std::memory_order_relaxed); }
+    bool arpActive() const { return arpActiveValue.load(std::memory_order_relaxed); }
+
     // Control side: the engine is running (getAnalysis returns zeros otherwise).
     void setActive(bool on) { active.store(on, std::memory_order_release); }
     bool isActive() const { return active.load(std::memory_order_acquire); }
@@ -65,6 +77,17 @@ public:
             out[j] = ring[index % kSize].load(std::memory_order_relaxed);
         }
     }
+
+    // Any thread: the most recent kSize samples, oldest first (the spectrum's input).
+    void readRaw(float* out) const {
+        const uint32_t end = writeCount.load(std::memory_order_acquire);
+        for (int j = 0; j < kSize; ++j)
+            out[j] = ring[(end - (uint32_t)kSize + (uint32_t)j) % kSize].load(std::memory_order_relaxed);
+    }
+
+    // Control side (GraphPlayer::audioDeviceAboutToStart): the device rate the ring is written at.
+    void setSampleRate(double rate) { sampleRateValue.store(rate, std::memory_order_relaxed); }
+    double sampleRate() const { return sampleRateValue.load(std::memory_order_relaxed); }
 
     // One reader (getAnalysis): max |x| and RMS (all channels) of everything written since the
     // previous call; 0 if nothing was written since.
@@ -101,5 +124,10 @@ private:
     std::atomic<double> transportBeat{0.0};
     std::atomic<double> transportBpm{120.0};
     std::atomic<bool> transportPlaying{false};
+    std::atomic<int> arpStepValue{0};
+    std::atomic<int> arpStepsValue{16};
+    std::atomic<int> arpNoteValue{-1};
+    std::atomic<bool> arpActiveValue{false};
+    std::atomic<double> sampleRateValue{48000.0};
     std::atomic<bool> active{false};
 };

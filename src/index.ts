@@ -22,8 +22,13 @@ import {
   BackingTrackRegionRule,
   BackingTrackOptions,
   Analysis,
+  ArpMode,
+  ArpRate,
+  ArpOptions,
+  ArpAnalysis,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
+import { ARP_DEFAULTS, arpDefaults } from './arpDefaults';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
@@ -205,17 +210,48 @@ const emptyAnalysis = (): Analysis => ({
   peak: 0,
   rms: 0,
   scope: new Array(128).fill(0),
+  bands: new Array(24).fill(0),
+  sampleRate: 0,
   lastNote: -1,
   bpm: 120,
   beat: 0,
   playing: false,
+  arp: { active: false, step: 0, steps: 16, note: -1 },
 });
 
-// Output level (peak hold and RMS since the previous call), a 128-point oscilloscope and the
-// transport for HUDs. Synchronous, lock-free and cheap: call it every frame, from one place. Zeros when the engine is not running or the binary is older than 0.6.0.
+// Output level (peak hold and RMS since the previous call), a 128-point oscilloscope, 24 spectrum
+// bands (0.7.0+), the transport and the arpeggiator state for HUDs. Synchronous and lock-free
+// (one 2048-point FFT per call): call it every frame, from one place. Zeros when the engine is
+// not running or the binary is older than 0.6.0; binaries older than 0.7.0 return no `bands` /
+// `sampleRate` / `arp`, which are filled in here.
 export function getAnalysis(): Analysis {
   if (typeof ExpoJuceModule?.getAnalysis !== 'function') return emptyAnalysis();
-  return ExpoJuceModule.getAnalysis();
+  const native = ExpoJuceModule.getAnalysis() as Partial<Analysis>;
+  if (native.bands !== undefined && native.arp !== undefined) return native as Analysis;
+  return { ...emptyAnalysis(), ...native };
+}
+
+// ── Arpeggiator (0.7.0+) ─────────────────────────────────────────
+// Between the note queue and the voices: while enabled, held notes (pads, keys, noteOn) are
+// arpeggiated on the transport's grid (sample-accurate; free-running at the tempo while the
+// transport is stopped). Options are synchronous and lock-free, remembered natively before
+// setup() and across engine rebuilds. Binaries older than 0.7.0: setArpeggiator returns false
+// and getArpeggiatorState returns the defaults.
+
+export { ARP_DEFAULTS };
+
+// Sets any subset of the options (omitted keys keep their value; numbers are clamped; `pattern`
+// is 1–16 booleans, all or nothing). Returns false, applying nothing, for an unknown `mode` /
+// `rate`, a `pattern` that is not 1–16 booleans, or a binary without an arpeggiator. Disabling stops the arp's sounding notes at once.
+export function setArpeggiator(options: Partial<ArpOptions>): boolean {
+  if (typeof ExpoJuceModule?.setArpeggiator !== 'function') return false;
+  return ExpoJuceModule.setArpeggiator(options) === true;
+}
+
+// Every option as stored natively (after clamping).
+export function getArpeggiatorState(): ArpOptions {
+  if (typeof ExpoJuceModule?.getArpeggiatorState !== 'function') return arpDefaults();
+  return ExpoJuceModule.getArpeggiatorState();
 }
 
 // ── Transport ────────────────────────────────────────────────────
@@ -285,4 +321,8 @@ export {
   BackingTrackRegionRule,
   BackingTrackOptions,
   Analysis,
+  ArpMode,
+  ArpRate,
+  ArpOptions,
+  ArpAnalysis,
 };

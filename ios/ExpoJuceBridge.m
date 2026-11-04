@@ -65,6 +65,12 @@
 + (void)unloadBackingTrack { [[ExpoJuceAudioEngine sharedInstance] unloadBackingTrack]; }
 + (NSDictionary<NSString *, id> *)getAnalysis { return [[ExpoJuceAudioEngine sharedInstance] analysis]; }
 
+// ── Arpeggiator ──
++ (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options {
+    return [[ExpoJuceAudioEngine sharedInstance] setArpeggiator:options];
+}
++ (NSDictionary<NSString *, id> *)getArpeggiatorState { return [[ExpoJuceAudioEngine sharedInstance] arpeggiatorState]; }
+
 // ── Transport ──
 + (void)startTransport { [[ExpoJuceAudioEngine sharedInstance] startTransport]; }
 + (void)stopTransport { [[ExpoJuceAudioEngine sharedInstance] stopTransport]; }

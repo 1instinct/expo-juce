@@ -235,11 +235,61 @@ ExpoJuce.unloadBackingTrack();
 - Binaries older than 0.6.0: the setters are no-ops (`setMetronome` returns `false`) and
   `loadBackingTrack` rejects with `ERR_UNSUPPORTED`. Web: the same.
 
+### Arpeggiator (0.7.0+)
+
+A sample-accurate arpeggiator between the note queue and the voices. While it is enabled, every
+note the synth receives (pads, keys, `noteOn`) joins its held list instead of sounding, and the
+arp plays the held notes step by step on the transport's grid; disabled, notes play directly as
+before (voices that were sounding when the arp was enabled keep sounding until released).
+
+```ts
+ExpoJuce.setArpeggiator({ enabled: true, mode: 'upDown', rate: '1/16', octaves: 2, gate: 0.6 });
+ExpoJuce.setArpeggiator({ pattern: [true, false, true, true], swing: 0.2, ratchet: 2 }); // partial
+const state = ExpoJuce.getArpeggiatorState(); // every option as stored (ArpOptions)
+ExpoJuce.ARP_DEFAULTS;                        // the defaults below
+```
+
+- Options (`ArpOptions`, omitted keys keep their value, numbers are clamped; `setArpeggiator`
+  returns `false` and applies nothing for an unknown `mode` / `rate` or a `pattern` that is not
+  1–16 booleans):
+  - `enabled` (false)
+  - `mode` ('up'): `'up'` held notes ascending, `'down'`, `'upDown'` (up, then the interior
+    reversed: `[60, 64, 72, 76]` → `60 64 72 76 72 64`), `'played'` (press order), `'random'`
+    (a uniform pick per step), `'chord'` (every held note on every step)
+  - `rate` ('1/16'): `'1/4'`, `'1/8'`, `'1/8T'`, `'1/8D'`, `'1/16'`, `'1/16T'`, `'1/32'`
+    (1, 2, 3, 4/3, 4, 6, 8 steps per beat)
+  - `octaves` 1–4 (1): the cycle repeats +12 per extra octave
+  - `gate` 0.05–1.5 of a step (0.6): note length; above 1 the note overlaps the next step
+    (legato; a one-note cycle retriggers the same voice)
+  - `swing` 0–0.5 of a step (0): odd steps start that much later
+  - `latch` (false): the list is kept when every note is released; the next press replaces it
+  - `pattern` 1–16 booleans (16 × true), all or nothing: a false step is a rest and does not
+    advance the cycle
+  - `accent` 0–1 (0): steps other than the first of the pattern play at
+    velocity × (1 − 0.6 × accent)
+  - `ratchet` 1–4 (1): hits per step, each with `gate` of its share
+  - `transposeSteps` 0–8 (0) and `transposeDistance` −12..12 (0): each pass through the pattern
+    rises by `transposeDistance` semitones, wrapping after `transposeSteps` passes
+- Timing: step `k` starts `k × L` after the arp starts (`L = 60 / bpm / stepsPerBeat`), on the
+  exact sample whatever the block size. While the transport plays the steps sit on the beat grid
+  (`beat × stepsPerBeat` integer; a chord landing up to ¼ step after a grid line plays at once,
+  later ones wait for the next line) and a tempo change re-derives the grid from the new bpm.
+  Stopped, the grid starts at the first note-on and runs free at the current tempo.
+- The cycle restarts when the held list goes from empty to non-empty; adding or removing notes
+  while it plays takes effect at the next step. `allNotesOff()` stops the arp and clears its
+  list (a latched list included). Disabling stops the sounding arp notes at once.
+- 16 voices (`MAX_VOICES`), so a 16-note `chord` or ratchets with long releases do not steal.
+- Options are kept natively for the life of the app in one store the synth reads once per block:
+  they work before `setup()`, survive engine rebuilds and apply within a block even while a
+  rebuild is in progress. Binaries older than 0.7.0: `setArpeggiator` returns `false`,
+  `getArpeggiatorState` returns `ARP_DEFAULTS`. Web: the same.
+
 ### Analysis (0.6.0+)
 
 ```ts
 const a = ExpoJuce.getAnalysis();
-// { peak, rms, scope: number[128], lastNote, bpm, beat, playing }
+// { peak, rms, scope: number[128], bands: number[24], sampleRate, lastNote, bpm, beat, playing,
+//   arp: { active, step, steps, note } }
 ```
 
 Synchronous and lock-free, cheap enough to call every animation frame (from one place: each
@@ -249,6 +299,17 @@ since the previous call (synth, effects, metronome and backing track as sent to 
 (mono, may tear across a block; it is for display). `bpm` / `beat` / `playing` are the
 transport as of the last rendered block. `lastNote` is the last note the synth started (-1 if
 none). Zeros when the engine is not running.
+
+0.7.0+ adds `bands`: 24 log-spaced spectrum bands between 40 Hz and 16 kHz, each 0–1 for
+−60..0 dBFS of the loudest FFT bin in the band, from a Hann-windowed 2048-point FFT of the same
+output samples, computed on the calling thread (about 50 µs per call). Band edges are
+`edge_0 = 40`, `edge_i = max(40 × 400^(i/24), edge_(i−1) + sampleRate / 2048)`,
+`edge_24 = 16000`: the lowest bands are one FFT bin wide (23.4 Hz at 48 kHz) until the
+geometric spacing takes over around 140 Hz, so no two bands read the same bin. `sampleRate` is
+the device rate the bands were computed at. `arp` is the arpeggiator as of the last block:
+`active` (enabled and holding notes), `step` (pattern slot of the last step started), `steps`
+(pattern length), `note` (last note the arp started, -1 if none). Older binaries: 24 zeros,
+`sampleRate` 0, `arp` inactive.
 
 ### `JucePadView` (0.5.2+)
 
@@ -331,11 +392,11 @@ bash and fail under npm on Windows, so build and publish by hand from Git Bash:
 npm install
 # 1. bump "version" in package.json, e.g. 0.5.2-diag.2
 CI=1 bash node_modules/expo-module-scripts/bin/expo-module-build   # tsc → build/
-npm publish --tag diag --ignore-scripts                            # npm 2FA code required
+npm publish --tag next --ignore-scripts --otp=<code>               # npm 2FA code required
 ```
 
 `--ignore-scripts` skips `prepublishOnly`, so step 1's build is mandatory. Prereleases go
-under a dist-tag (`diag`) so `latest` is not moved.
+under a dist-tag (`next`, earlier `diag`) so `latest` is not moved.
 
 Then in the consuming app: `npm install expo-juce@<version> --save-exact`, check that
 `package-lock.json` still has its macOS-only optional entries (a lockfile regenerated on

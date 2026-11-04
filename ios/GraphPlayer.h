@@ -107,6 +107,7 @@ public:
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override {
         const double deviceSr = device->getCurrentSampleRate();
         if (deviceSr > 0.0) deviceSampleRate = deviceSr;
+        if (analysis != nullptr) analysis->setSampleRate(deviceSampleRate);
 
         const int deviceBuffer = device->getCurrentBufferSizeSamples();
         const int outs = device->getActiveOutputChannels().countNumberOfSetBits();

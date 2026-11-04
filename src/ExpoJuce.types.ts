@@ -149,6 +149,59 @@ export type BackingTrackOptions = {
   enabled?: boolean;
 };
 
+/** Arpeggiator note order (0.7.0+). */
+export type ArpMode = 'up' | 'down' | 'upDown' | 'played' | 'random' | 'chord';
+
+/**
+ * Arpeggiator step rate (0.7.0+). Steps per beat: '1/4' 1, '1/8' 2, '1/8T' 3, '1/8D' 4/3,
+ * '1/16' 4, '1/16T' 6, '1/32' 8.
+ */
+export type ArpRate = '1/4' | '1/8' | '1/8T' | '1/8D' | '1/16' | '1/16T' | '1/32';
+
+/**
+ * `setArpeggiator()` options / `getArpeggiatorState()` result (0.7.0+). In `setArpeggiator`
+ * omitted keys keep their current value; numbers are clamped to their range; an unknown `mode`
+ * or `rate` rejects the whole call (nothing applied).
+ */
+export type ArpOptions = {
+  /** Arpeggiate held notes instead of playing them directly (default false). */
+  enabled: boolean;
+  /** Note order (default 'up'). */
+  mode: ArpMode;
+  /** Step rate relative to the transport tempo (default '1/16'). */
+  rate: ArpRate;
+  /** 1–4 octaves of the held notes in the cycle (default 1). */
+  octaves: number;
+  /** Note length, 0.05–1.5 of a step (default 0.6); > 1 overlaps the next step (legato). */
+  gate: number;
+  /** 0–0.5 of a step added to odd steps (default 0). */
+  swing: number;
+  /** Keep playing after every note is released; the next press starts a new chord (default false). */
+  latch: boolean;
+  /** 1–16 steps, true = the step plays (default 16 × true). */
+  pattern: boolean[];
+  /** 0–1 (default 0): steps other than step 0 play at velocity × (1 − 0.6 × accent). */
+  accent: number;
+  /** 1–4 hits per step (default 1). */
+  ratchet: number;
+  /** 0–8 pattern passes before the transposition wraps (default 0 = off). */
+  transposeSteps: number;
+  /** −12..12 semitones added per pass (default 0). */
+  transposeDistance: number;
+};
+
+/** Arpeggiator state in `Analysis.arp` (0.7.0+), as of the last rendered block. */
+export type ArpAnalysis = {
+  /** The arp is enabled and holds notes (a step is sounding or coming). */
+  active: boolean;
+  /** Pattern slot of the last step started (0-based). */
+  step: number;
+  /** Pattern length. */
+  steps: number;
+  /** Last note the arp started; -1 if none yet. */
+  note: number;
+};
+
 /** Returned by `getAnalysis()`: the device output (synth, effects, metronome, backing track). */
 export type Analysis = {
   /** Max |sample| since the previous getAnalysis() call (peak hold), 0–1+. */
@@ -157,12 +210,21 @@ export type Analysis = {
   rms: number;
   /** 128 points, oldest first, decimated (every 16th sample) from the last 2048 output samples (mono). */
   scope: number[];
+  /**
+   * 24 log-spaced bands, 40 Hz – 16 kHz, each 0–1 (−60..0 dBFS of the loudest FFT bin in the
+   * band) from the last 2048 output samples (0.7.0+; 24 zeros on older binaries).
+   */
+  bands: number[];
+  /** Sample rate the bands were computed at (0 when the engine is not running / older binaries). */
+  sampleRate: number;
   /** Last note the synth started; -1 if none yet. */
   lastNote: number;
   /** Transport tempo, position (beats) and play state as of the last rendered block. */
   bpm: number;
   beat: number;
   playing: boolean;
+  /** Arpeggiator state (0.7.0+; inactive on older binaries). */
+  arp: ArpAnalysis;
 };
 
 /** Native engine lifecycle state reported in `AudioDiagnostics.engineState`. */

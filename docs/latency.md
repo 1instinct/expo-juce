@@ -51,7 +51,10 @@ that covers it, if any.
 
 Bluetooth and AirPlay latency is added by the receiver and the radio link; nothing the app
 does can remove it. The app plays through them, but they are not supported for playing
-pads in time. Out of scope: Android, sample-accurate event timing within a block.
+pads in time. Out of scope: Android. Note-ons from pads and keys are still applied at the start
+of the block that drains them (segment 3); the arpeggiator's steps (0.7.0+) are the exception:
+the arp schedules its note-ons and note-offs at sample offsets inside the block and the synth
+renders the block in segments around them, so step timing does not depend on the block size.
 
 ## 3. Baseline (2026-10-22)
 
