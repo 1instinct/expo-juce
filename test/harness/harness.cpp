@@ -1365,6 +1365,459 @@ static bool runBackingTrackTempoRamp() {
     return pass;
 }
 
+// ── Backing track following the tempo ──
+// A click on every beat of a track at `srcBpm`: 6 ms of 1 kHz at 0.8, otherwise exact silence.
+static std::unique_ptr<BackingTrackBuffer> clickTrack(double srcBpm, double sr, int beats) {
+    auto t = std::make_unique<BackingTrackBuffer>();
+    const double perBeat = 60.0 / srcBpm * sr;
+    const int L = (int)std::llround(perBeat * beats);
+    t->sampleRate = sr;
+    t->length = L;
+    t->audio.setSize(2, L);
+    t->audio.clear();
+    const int burst = (int)(0.006 * sr);
+    for (int k = 0; k < beats; ++k) {
+        const int at = (int)std::llround(k * perBeat);
+        for (int i = 0; i < burst && at + i < L; ++i) {
+            const float v = 0.8f * (float)std::sin(juce::MathConstants<double>::twoPi * 1000.0 * i / sr);
+            t->audio.setSample(0, at + i, v);
+            t->audio.setSample(1, at + i, v);
+        }
+    }
+    return t;
+}
+
+// A steady sine, a whole number of periods long, so its own loop seam is invisible.
+static std::unique_ptr<BackingTrackBuffer> sineTrack(double freq, double sr, double seconds, float amp = 0.5f) {
+    auto t = std::make_unique<BackingTrackBuffer>();
+    const int periods = (int)std::llround(freq * seconds);
+    const int L = (int)std::llround(periods * sr / freq);
+    t->sampleRate = sr;
+    t->length = L;
+    t->audio.setSize(2, L);
+    for (int i = 0; i < L; ++i) {
+        const float v = amp * (float)std::sin(juce::MathConstants<double>::twoPi * periods * (double)i / (double)L);
+        t->audio.setSample(0, i, v);
+        t->audio.setSample(1, i, v);
+    }
+    return t;
+}
+
+// Where each beat's click sounds, in samples from the start of the render: the first sample over
+// half the click's level within ±windowSec of `gridAt(beat)`. -1 if none.
+static std::vector<int> clickOnsets(const std::vector<float>& l, int firstBeat, int beats, double sr, double windowSec,
+                                    const std::function<double(int)>& gridAt) {
+    std::vector<int> out;
+    const int w = (int)(windowSec * sr);
+    for (int k = firstBeat; k < firstBeat + beats; ++k) {
+        const int g = (int)std::llround(gridAt(k));
+        int found = -1;
+        for (int i = std::max(0, g - w); i < std::min((int)l.size(), g + w); ++i)
+            if (std::fabs(l[(size_t)i]) > 0.4f) { found = i; break; }
+        out.push_back(found);
+    }
+    return out;
+}
+
+// Frequency from positive-going zero crossings over [from, to).
+static double risingCrossingHz(const std::vector<float>& l, int from, int to, double sr) {
+    int first = -1, last = -1, crossings = 0;
+    for (int i = from + 1; i < to; ++i) {
+        if (l[(size_t)i - 1] < 0.0f && l[(size_t)i] >= 0.0f) {
+            if (first < 0) first = i;
+            last = i;
+            ++crossings;
+        }
+    }
+    return crossings > 1 ? (crossings - 1) * sr / (double)(last - first) : 0.0;
+}
+
+// A track with a source tempo keeps its beats on the transport's beats at any tempo, with its
+// pitch unchanged, and is the untouched file at its own tempo.
+static bool runBackingTrackFollow() {
+    const std::vector<int> blocks = {471, 127, 1024, 333};
+    int failures = 0;
+    uint64_t allocs = 0, frees = 0;
+    std::string detail;
+    const auto check = [&](bool ok, const std::string& what) {
+        if (!ok) ++failures;
+        detail += std::string("  ") + (ok ? "ok   " : "FAIL ") + what + "\n";
+    };
+    struct Rig {
+        BackingTrack holder;
+        AuxProcessor aux;
+        TransportEngine transport;
+        Rig(double sr, double bpm) {
+            transport.setTempo(bpm);
+            aux.setBackingTrack(&holder);
+            aux.setTransport(&transport);
+            aux.auxSettings().setTrackLevel(1.0);
+            aux.setRateAndBufferSizeDetails(sr, 512);
+            aux.prepareToPlay(sr, 512);
+        }
+        void install(std::unique_ptr<BackingTrackBuffer> t, double sourceBpm) {
+            t->sourceBpm = sourceBpm;
+            holder.install(std::move(t), {}, holder.beginLoad());
+        }
+    };
+    const auto render = [&](Rig& r, double sr, int total, std::vector<float>& l, const std::function<void(int)>& before = {}) {
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        renderAux(r.aux, r.transport, sr, total, blocks, l, nullptr, before);
+        allocs += gRenderAllocs.load(); frees += gRenderFrees.load();
+    };
+
+    // 1. Beat lock at steady tempos, both ways and at both rates: every click within the limit
+    //    of its beat, and no drift from the first beats to the last.
+    struct Lock { double src, bpm, sr; };
+    for (const Lock c : {Lock{100, 120, 48000}, Lock{100, 80, 48000}, Lock{100, 150, 48000}, Lock{124, 100, 44100}, Lock{84, 90, 48000}}) {
+        Rig r(c.sr, c.bpm);
+        r.install(clickTrack(c.src, c.sr, 32), c.src);
+        r.transport.start();
+        const int beats = 96; // three times around the loop
+        const double perBeat = 60.0 / c.bpm * c.sr;
+        std::vector<float> l;
+        render(r, c.sr, (int)(perBeat * (beats + 1)), l);
+        const auto on = clickOnsets(l, 0, beats, c.sr, 0.05, [&](int k) { return k * perBeat; });
+        double worst = 0.0, early = 0.0, late = 0.0;
+        int missing = 0;
+        for (int k = 0; k < beats; ++k) {
+            if (on[(size_t)k] < 0) { ++missing; continue; }
+            const double err = (on[(size_t)k] - k * perBeat) / c.sr * 1000.0;
+            worst = std::max(worst, std::fabs(err));
+            if (k < 16) early += err / 16.0;
+            if (k >= beats - 16) late += err / 16.0;
+        }
+        char text[160];
+        std::snprintf(text, sizeof(text), "track %.0f at %.0f bpm, %.0f Hz: worst click %.1f ms from its beat, drift %.2f ms, missing %d",
+                      c.src, c.bpm, c.sr, worst, late - early, missing);
+        check(missing == 0 && worst <= 20.0 && std::fabs(late - early) <= 3.0, text);
+    }
+
+    // 2. A tempo change while playing takes effect: 120 → 90 bpm on bar 5, the clicks are on the
+    //    new grid at once, and bar 1 of the second time round is still on its beat.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(clickTrack(100, sr, 16), 100);
+        r.transport.start();
+        const int change = 16 * 24000;
+        bool changed = false;
+        std::vector<float> l;
+        render(r, sr, change + 34 * 32000, l, [&](int done) {
+            if (!changed && done >= change) { r.transport.setTempo(90); changed = true; }
+        });
+        const auto on = clickOnsets(l, 17, 32, sr, 0.05, [&](int k) { return change + (k - 16) * 32000.0; });
+        double worst = 0.0;
+        int missing = 0;
+        for (int k = 0; k < 32; ++k) {
+            if (on[(size_t)k] < 0) { ++missing; continue; }
+            worst = std::max(worst, std::fabs(on[(size_t)k] - (change + (k + 1) * 32000.0)) / sr * 1000.0);
+        }
+        char text[120];
+        std::snprintf(text, sizeof(text), "tempo 120 -> 90 while playing: worst click %.1f ms from its beat, missing %d", worst, missing);
+        check(missing == 0 && worst <= 25.0, text);
+    }
+
+    // 3. Pitch stays, level stays, no clicks: a steady sine through the stretch.
+    for (const double bpm : {120.0, 80.0, 133.0}) {
+        for (const double freq : {55.0, 220.0, 1760.0}) {
+            const double sr = 48000.0;
+            Rig r(sr, bpm);
+            r.install(sineTrack(freq, sr, 1.0), 100);
+            r.transport.start();
+            const int total = 3 * 48000;
+            std::vector<float> l;
+            render(r, sr, total, l);
+            const double hz = risingCrossingHz(l, 4800, total, sr);
+            float lowest = 1.0f, highest = 0.0f, step = 0.0f;
+            const int win = std::max(1024, (int)(3.0 * sr / freq));
+            for (int from = 4800; from + win < total; from += win / 2) {
+                double e = 0.0;
+                for (int i = from; i < from + win; ++i) e += (double)l[(size_t)i] * l[(size_t)i];
+                const float rms = (float)std::sqrt(e / win);
+                lowest = std::min(lowest, rms);
+                highest = std::max(highest, rms);
+            }
+            for (int i = 1; i < total; ++i) step = std::max(step, std::fabs(l[(size_t)i] - l[(size_t)i - 1]));
+            const float idealRms = 0.5f / std::sqrt(2.0f);
+            const float idealStep = 0.5f * (float)(juce::MathConstants<double>::twoPi * freq / sr);
+            char text[170];
+            std::snprintf(text, sizeof(text), "%.0f Hz sine at %.0f bpm (track 100): %.2f Hz, rms %.3f..%.3f (ideal %.3f), largest step %.4f (sine's own %.4f)",
+                          freq, bpm, hz, lowest, highest, idealRms, step, idealStep);
+            check(std::fabs(hz / freq - 1.0) < 0.005 && lowest > 0.9f * idealRms && highest < 1.1f * idealRms
+                  && step < idealStep * 1.25f + 0.002f, text);
+        }
+    }
+
+    // 4. At its own tempo it is the file: the same samples as with no source tempo at all, across
+    //    a start, a seek and a pause + resume.
+    {
+        const double sr = 48000.0;
+        const auto run = [&](double sourceBpm, std::vector<float>& l) {
+            Rig r(sr, 100);
+            r.install(makeTrack(30000, sr), sourceBpm);
+            r.transport.start();
+            int phase = 0;
+            render(r, sr, 200000, l, [&](int done) {
+                if (phase == 0 && done >= 60000) { r.transport.setPosition(10.25); ++phase; }
+                if (phase == 1 && done >= 90000) { r.transport.stop(); ++phase; }
+                if (phase == 2 && done >= 100000) { r.transport.start(); ++phase; }
+            });
+        };
+        std::vector<float> plain, own;
+        run(0.0, plain);
+        run(100.0, own);
+        int diffs = 0;
+        for (size_t i = 0; i < plain.size(); ++i) diffs += plain[i] == own[i] ? 0 : 1;
+        check(diffs == 0, "track at its own tempo == no source tempo, sample for sample: " + std::to_string(diffs) + " differ");
+    }
+
+    // 5. Back at its own tempo it returns to the file, sample-exact and on the grid. A change at a
+    //    known beat: 120 → 100 bpm, then every sample equals the track at beat × 60 / 100.
+    {
+        const double sr = 48000.0;
+        const int L = 300000;
+        juce::AudioBuffer<float> ref;
+        { auto t = makeTrack(L, sr); ref.makeCopyOf(t->audio); }
+        Rig r(sr, 120);
+        r.install(makeTrack(L, sr), 100);
+        r.transport.start();
+        bool changed = false;
+        int changeAt = -1;
+        double beatAtChange = 0.0;
+        std::vector<float> l;
+        render(r, sr, 240000, l, [&](int done) {
+            if (!changed && done >= 96000) {
+                beatAtChange = done * 120.0 / 60.0 / sr;
+                r.transport.setTempo(100);
+                changeAt = done;
+                changed = true;
+            }
+        });
+        // Two hand-overs at most, then the plain path.
+        const int settled = changeAt + (int)(2.0 * AuxProcessor::kGrainHopSeconds * sr) + 2048;
+        int off = 0;
+        for (int i = settled; i < 240000; ++i) {
+            const double beat = beatAtChange + (i - changeAt) * 100.0 / 60.0 / sr;
+            const int64_t p = std::llround(beat * 60.0 / 100.0 * sr);
+            off += l[(size_t)i] == ref.getSample(0, (int)(p % L)) ? 0 : 1;
+        }
+        check(off == 0, "back at its own tempo: sample-exact on the grid, " + std::to_string(off) + " samples off");
+    }
+
+    // 6. Seek and pause + resume while stretched land on the track's own grid, not the transport's.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(clickTrack(100, sr, 64), 100);
+        r.transport.start();
+        int seekAt = -1, pauseAt = -1, resumeAt = -1;
+        std::vector<float> l;
+        render(r, sr, 400000, l, [&](int done) {
+            if (seekAt < 0 && done >= 50000) { r.transport.setPosition(16.5); seekAt = done; }
+            if (pauseAt < 0 && done >= 150000) { r.transport.stop(); pauseAt = done; }
+            if (pauseAt >= 0 && resumeAt < 0 && done >= 200000) { r.transport.start(); resumeAt = done; }
+        });
+        const auto worstFrom = [&](double beatBase, int base, int count) {
+            double worst = 0.0;
+            for (int k = 0; k < count; ++k) {
+                const int beat = (int)std::ceil(beatBase) + k;
+                const double at = base + (beat - beatBase) * 24000.0;
+                const auto on = clickOnsets(l, 0, 1, sr, 0.05, [&](int) { return at; });
+                worst = std::max(worst, on[0] < 0 ? 1000.0 : std::fabs(on[0] - at) / sr * 1000.0);
+            }
+            return worst;
+        };
+        const double afterSeek = worstFrom(16.5, seekAt, 3);
+        const double beatAtPause = 16.5 + (pauseAt - seekAt) / 24000.0;
+        const double afterResume = worstFrom(beatAtPause, resumeAt, 3);
+        char text[120];
+        std::snprintf(text, sizeof(text), "stretched: clicks after a seek within %.1f ms, after pause + resume within %.1f ms", afterSeek, afterResume);
+        check(afterSeek <= 20.0 && afterResume <= 20.0, text);
+    }
+
+    // 7. Starting, seeking, stopping and swapping a stretched track are declicked.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(sineTrack(220.0, sr, 1.0), 100);
+        r.transport.start();
+        int phase = 0;
+        std::vector<float> l;
+        render(r, sr, 192000, l, [&](int done) {
+            if (phase == 0 && done >= 48000) { r.transport.setPosition(3.3); ++phase; }
+            if (phase == 1 && done >= 96000) { r.holder.install([&] { auto t = sineTrack(220.0, sr, 1.5); t->sourceBpm = 100; return t; }(), {}, r.holder.beginLoad()); ++phase; }
+            if (phase == 2 && done >= 144000) { r.transport.stop(); ++phase; }
+        });
+        float step = 0.0f;
+        for (size_t i = 1; i < l.size(); ++i) step = std::max(step, std::fabs(l[i] - l[i - 1]));
+        char text[120];
+        std::snprintf(text, sizeof(text), "stretched seek, swap, stop: largest step %.4f (sine's own 0.0144)", step);
+        check(step < 0.05f, text);
+        int collected = -1;
+        for (int i = 0; i < 3 && collected != 0; ++i) collected = r.holder.collect();
+        check(collected == 0, "replaced buffer freed after its fade-out");
+    }
+
+    // 8. Loop off: one stretched pass, then silence.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.aux.auxSettings().setTrackLoop(false);
+        r.install(sineTrack(220.0, sr, 1.0), 100); // 1 s of track = 1 / 1.2 s on this transport
+        r.transport.start();
+        std::vector<float> l;
+        render(r, sr, 96000, l);
+        const int end = (int)(48000 / 1.2);
+        const int after = end + (int)((AuxProcessor::kGrainHopSeconds * 2.0 + AuxProcessor::kGrainSearchSeconds) * sr);
+        float sounding = 0.0f, past = 0.0f;
+        for (int i = 0; i < end - 2400; ++i) sounding = std::max(sounding, std::fabs(l[(size_t)i]));
+        for (int i = after; i < 96000; ++i) past = std::max(past, std::fabs(l[(size_t)i]));
+        char text[100];
+        std::snprintf(text, sizeof(text), "loop off: peak %.2f during the pass, %.5f after it", sounding, past);
+        check(sounding > 0.4f && past == 0.0f, text);
+    }
+
+    // 9. The tempo travels with the file: load() puts it on the buffer, a device-rate reload keeps
+    //    it, and nonsense means "unknown".
+    {
+        const double sr = 48000.0;
+        juce::AudioBuffer<float> ref;
+        { auto t = makeTrack(30000, sr); ref.makeCopyOf(t->audio); }
+        const std::string path = writeWav(ref, sr, "ejfx-bt-follow.wav");
+        BackingTrackSource source;
+        source.path = path;
+        source.sourceBpm = 128.5;
+        BackingTrackInfo info;
+        std::string error;
+        auto buffer = BackingTrack::load(source, sr, {}, info, error);
+        const bool onLoad = buffer != nullptr && buffer->sourceBpm == 128.5 && info.sourceBpm == 128.5;
+        BackingTrack holder;
+        holder.install(std::move(buffer), source, holder.beginLoad());
+        holder.requestRate(44100.0);
+        const bool reloaded = holder.reload();
+        const BackingTrackBuffer* after = holder.publishedBuffer();
+        const bool onReload = reloaded && after != nullptr && after->sampleRate == 44100.0 && after->sourceBpm == 128.5;
+        bool nonsense = true;
+        for (const double v : {-10.0, std::nan(""), std::numeric_limits<double>::infinity()}) {
+            source.sourceBpm = v;
+            auto b = BackingTrack::load(source, sr, {}, info, error);
+            nonsense = nonsense && b != nullptr && b->sourceBpm == 0.0 && info.sourceBpm == 0.0;
+        }
+        holder.unload();
+        holder.collect();
+        juce::File(juce::String(path)).deleteFile();
+        check(onLoad, "load() puts the tempo on the buffer and in the info");
+        check(onReload, "a device-rate reload keeps the tempo");
+        check(nonsense, "negative, NaN and infinite tempos mean unknown");
+    }
+
+    // 10. Cost: the stretch on a dense track, 128-sample blocks, 20 s, well under real time, with
+    //     no block near its budget (a search lands inside one block).
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(makeTrack(480000, sr), 100);
+        r.transport.start();
+        juce::AudioBuffer<float> buf(2, 128);
+        juce::MidiBuffer midi;
+        double total = 0.0, worst = 0.0;
+        for (int i = 0; i < (int)(20.0 * sr / 128); ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            r.transport.advanceBlock(128, sr);
+            r.aux.processBlock(buf, midi);
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            total += s;
+            worst = std::max(worst, s);
+        }
+        char text[120];
+        std::snprintf(text, sizeof(text), "cost: %.4f x realtime, worst block %.3f ms of its 2.667 ms", total / 20.0, worst * 1000.0);
+        check(total / 20.0 < 0.05, text);
+    }
+
+    // 11. Real music (the 124 bpm MP3 fixture, 48 kHz) at 124, 123, 100, 150 and 70 bpm, with a click on
+    //     every beat: each click within 12 ms of its beat (the search reaches 10 ms; 20 ms at 70 bpm,
+    //     close to half speed), the median within 7 ms (the search now
+    //     sees real music); the level per beat stays within 1.5 dB of the source's.
+    {
+        const double sr = 48000.0;
+        BackingTrackSource source;
+        source.path = std::string(HARNESS_FIXTURES) + "/loop-124bpm-44k.mp3";
+        source.hasGapless = true;
+        source.gapless = {682839, 4561, 1496};
+        source.sourceBpm = 124.0;
+        BackingTrackInfo info;
+        std::string error;
+        auto loaded = BackingTrack::load(source, sr, {}, info, error);
+        if (loaded == nullptr) {
+            check(false, "fixture decode: " + error);
+        } else {
+            juce::AudioBuffer<float> ref;
+            ref.makeCopyOf(loaded->audio);
+            const int L = loaded->length;
+            // The music at half level plus a click on every beat (the click track of part 1).
+            juce::AudioBuffer<float> mixed;
+            mixed.makeCopyOf(ref);
+            mixed.applyGain(0.5f);
+            {
+                auto clicks = clickTrack(124.0, sr, (int)std::floor(L / (60.0 / 124.0 * sr)));
+                for (int ch = 0; ch < 2; ++ch) mixed.addFrom(ch, 0, clicks->audio, ch, 0, std::min(L, clicks->length));
+            }
+            for (const double bpm : {124.0, 123.0, 100.0, 150.0, 70.0}) {
+                Rig r(sr, bpm);
+                auto copy = std::make_unique<BackingTrackBuffer>();
+                copy->audio.makeCopyOf(mixed);
+                copy->sampleRate = sr;
+                copy->length = L;
+                r.install(std::move(copy), 124.0);
+                r.transport.start();
+                const double outPerBeat = 60.0 / bpm * sr, srcPerBeat = 60.0 / 124.0 * sr;
+                const int beats = 24;
+                std::vector<float> l;
+                render(r, sr, (int)(outPerBeat * (beats + 1)), l);
+                // A 1 kHz click (6 ms) on every source beat rides on the music; the matched filter
+                // finds it in the output within 40 ms of its beat.
+                const int burst = (int)(0.006 * sr), reach = (int)(0.04 * sr);
+                const auto clickAt = [&](double beatAt) {
+                    double best = -1.0;
+                    int at = 0;
+                    for (int d = -reach; d <= reach; ++d) {
+                        double acc = 0.0;
+                        for (int j = 0; j < burst; ++j)
+                            acc += l[(size_t)((int)beatAt + d + j)] * std::sin(juce::MathConstants<double>::twoPi * 1000.0 * j / sr);
+                        if (acc > best) { best = acc; at = d; }
+                    }
+                    return at;
+                };
+                std::vector<double> lags;
+                double worstDb = 0.0;
+                // The level is compared on the music alone: 30 ms clear of the clicks at both ends of a beat.
+                const int skipOut = (int)(0.03 * sr), skipSrc = (int)(0.03 * sr);
+                for (int k = 1; k < beats - 1; ++k) {
+                    lags.push_back(std::fabs(clickAt(std::llround(k * outPerBeat)) / sr * 1000.0));
+                    double eo = 0.0, es = 0.0;
+                    for (int i = skipOut; i < (int)outPerBeat - skipOut; ++i) eo += (double)l[(size_t)(k * outPerBeat) + i] * l[(size_t)(k * outPerBeat) + i];
+                    for (int i = skipSrc; i < (int)srcPerBeat - skipSrc; ++i) { const float v = mixed.getSample(0, ((int)(k * srcPerBeat) + i) % L); es += (double)v * v; }
+                    worstDb = std::max(worstDb, std::fabs(10.0 * std::log10((eo / (outPerBeat - 2 * skipOut) + 1e-12) / (es / (srcPerBeat - 2 * skipSrc) + 1e-12))));
+                }
+                std::vector<double> sorted = lags;
+                std::sort(sorted.begin(), sorted.end());
+                const double median = sorted[sorted.size() / 2], worst = sorted.back();
+                char text[160];
+                std::snprintf(text, sizeof(text), "fixture 124 bpm at %.0f bpm: clicks on the music (%d beats) off their beat by median %.1f ms, worst %.1f ms; level per beat within %.2f dB",
+                              bpm, (int)lags.size(), median, worst, worstDb);
+                // Near half speed (70 bpm) a click may land a little further off: it is in up to four grains.
+                check(median <= 7.0 && worst <= (bpm < 80.0 ? 20.0 : 12.0) && worstDb <= 1.5, text);
+            }
+        }
+    }
+
+    check(allocs == 0 && frees == 0, "render: " + std::to_string(allocs) + " allocations, " + std::to_string(frees) + " frees");
+    std::printf("btf   backing track follows the tempo  %-4s\n%s", failures == 0 ? "PASS" : "FAIL", detail.c_str());
+    std::fflush(stdout);
+    return failures == 0;
+}
+
 // Swaps are declicked: while a track of constant +0.5 plays, a track of constant -0.5 replaces
 // it (crossfade, never a step larger than one fade increment), then an unload fades it out. The
 // old buffer stays alive while it fades out (collect() keeps it), and is freed afterwards.
@@ -3143,6 +3596,7 @@ int main(int argc, char** argv) {
     if (want("met")) unexpected += runMetronome();
     if (want("bt")) unexpected += runBackingTrackPlayback() ? 0 : 1;
     if (want("btt")) unexpected += runBackingTrackTempoRamp() ? 0 : 1;
+    if (want("btf")) unexpected += runBackingTrackFollow() ? 0 : 1;
     if (want("bsf")) unexpected += runBackingTrackSwapFade() ? 0 : 1;
     if (want("btr")) unexpected += runBackingTrackRegion() ? 0 : 1;
     if (want("btl")) unexpected += runBackingTrackLimits() ? 0 : 1;

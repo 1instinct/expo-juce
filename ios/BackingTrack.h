@@ -61,6 +61,7 @@ struct BackingTrackSource {
     std::string path;
     bool hasGapless = false;
     BackingTrackGapless gapless;
+    double sourceBpm = 0.0; // the file's own tempo; 0 = unknown (it then plays at its own speed)
 };
 
 // Result of a load (also what loadBackingTrack resolves with).
@@ -75,6 +76,7 @@ struct BackingTrackInfo {
     std::string formatName;      // reader used ("CoreAudio", "MP3 file", "WAV file", …)
     double playbackRate = 0.0;   // rate of the playable buffer
     int64_t playbackFrames = 0;  // its length
+    double sourceBpm = 0.0;      // the tempo taken from the source (0 = unknown)
 };
 
 // Playable buffer: stereo at the device rate.
@@ -87,6 +89,7 @@ struct BackingTrackBuffer {
     juce::AudioBuffer<float> audio;
     double sampleRate = 0.0;
     int length = 0;
+    double sourceBpm = 0.0; // set before publishing, then read-only (AuxProcessor follows it)
 
     static inline std::atomic<int> live{0}; // instances alive (tests check the deferred frees)
 };
