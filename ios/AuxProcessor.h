@@ -159,7 +159,7 @@ private:
     void renderMetronome(float* left, float* right, int n, double beatStart, double beatsPerSample, bool playing);
     void renderTrack(float* left, float* right, int n, double beatStart, double bpm, bool playing, bool seeked);
     void startTail(BackingTrackBuffer* buffer, int64_t position);
-    void startGrain(const BackingTrackBuffer& buffer, double sourcePosition, bool search, bool loop);
+    void startGrain(const BackingTrackBuffer& buffer, double sourcePosition, bool search, bool loop, bool fromTop);
 
     AuxSettingsStore ownSettings;
     AuxSettingsStore* settings = &ownSettings;

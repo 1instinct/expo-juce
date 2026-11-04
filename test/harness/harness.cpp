@@ -1812,6 +1812,94 @@ static bool runBackingTrackFollow() {
         }
     }
 
+    // 12. Bar 1 is the file's first sample, never the loop's tail: a track silent for its first half
+    //     and loud in its last, from beat 0 at 80 and 120 bpm (loop on), and after a count-in from
+    //     beat -4 with loop off that comes back on 30 ms after bar 1: exact silence until the
+    //     loud half is due.
+    for (const double bpm : {80.0, 120.0}) {
+        for (const bool countIn : {false, true}) {
+            const double sr = 48000.0;
+            Rig r(sr, bpm);
+            auto t = std::make_unique<BackingTrackBuffer>();
+            t->sampleRate = sr;
+            t->length = 48000;
+            t->audio.setSize(2, 48000);
+            t->audio.clear();
+            for (int i = 24000; i < 48000; ++i)
+                for (int ch = 0; ch < 2; ++ch) t->audio.setSample(ch, i, 0.5f * (float)std::sin(i * 0.05));
+            r.install(std::move(t), 100);
+            if (countIn) { r.aux.auxSettings().setTrackLoop(false); r.transport.setPosition(-4.0); }
+            r.transport.start();
+            const int bar1 = countIn ? (int)std::llround(4 * 60.0 / bpm * sr) : 0;
+            bool restored = !countIn;
+            std::vector<float> l;
+            render(r, sr, bar1 + 48000, l, [&](int done) {
+                if (!restored && done >= bar1 + (int)(0.03 * sr)) { r.aux.auxSettings().setTrackLoop(true); restored = true; }
+            });
+            // The loud half starts 0.5 s into the track: 0.5 × 100 / bpm s after bar 1, less the search.
+            const int quietUntil = bar1 + (int)((0.5 * 100.0 / bpm - AuxProcessor::kGrainSearchSeconds - 0.005) * sr);
+            float before = 0.0f;
+            for (int i = 0; i < quietUntil; ++i) before = std::max(before, std::fabs(l[(size_t)i]));
+            char text[140];
+            std::snprintf(text, sizeof(text), "%s at %.0f bpm: peak %.5f before the track's loud half is due (its tail must not bleed in)",
+                          countIn ? "count-in from beat -4, loop back on after bar 1," : "start at beat 0", bpm, before);
+            check(before == 0.0f, text);
+        }
+    }
+
+    // 13. A swap to a track without a tempo while stretching: after the 5 ms crossfade the new
+    //     track plays plainly, sample after sample, and the ratio reads 1.
+    {
+        const double sr = 48000.0;
+        const int L = 200000;
+        juce::AudioBuffer<float> ref;
+        { auto t = makeTrack(L, sr, 1.7); ref.makeCopyOf(t->audio); }
+        Rig r(sr, 120);
+        r.install(sineTrack(220.0, sr, 2.0), 100);
+        r.transport.start();
+        int swapAt = -1;
+        std::vector<float> l;
+        render(r, sr, 120000, l, [&](int done) {
+            if (swapAt < 0 && done >= 30000) { r.holder.install(makeTrack(L, sr, 1.7), {}, r.holder.beginLoad()); swapAt = done; }
+        });
+        const int from = swapAt + 2048;
+        int p0 = -1;
+        for (int p = 0; p < L && p0 < 0; ++p)
+            if (ref.getSample(0, p) == l[(size_t)from] && ref.getSample(0, (p + 1) % L) == l[(size_t)from + 1]) p0 = p;
+        int off = p0 < 0 ? -1 : 0;
+        for (int i = from; p0 >= 0 && i < 120000; ++i) off += l[(size_t)i] == ref.getSample(0, (p0 + i - from) % L) ? 0 : 1;
+        const double ratio = r.aux.diag.trackTempoRatio.load();
+        check(off == 0 && ratio == 1.0, "swap to a track without a tempo mid-stretch: plain after the fade, "
+              + std::to_string(off) + " samples off, ratio " + std::to_string(ratio));
+    }
+
+    // 14. Loop toggled while stretching: on, off and on again inside the track keep the sound going
+    //     with no step above the sine's own; with loop on it plays on past the end.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.aux.auxSettings().setTrackLoop(false);
+        r.install(sineTrack(220.0, sr, 1.0), 100);
+        r.transport.start();
+        int phase = 0;
+        std::vector<float> l;
+        render(r, sr, 144000, l, [&](int done) {
+            if (phase == 0 && done >= 9000) { r.aux.auxSettings().setTrackLoop(true); ++phase; }
+            if (phase == 1 && done >= 18000) { r.aux.auxSettings().setTrackLoop(false); ++phase; }
+            if (phase == 2 && done >= 27000) { r.aux.auxSettings().setTrackLoop(true); ++phase; }
+        });
+        float step = 0.0f, lowest = 1.0f;
+        for (size_t i = 1; i < l.size(); ++i) step = std::max(step, std::fabs(l[i] - l[i - 1]));
+        for (int from = 4800; from + 4800 <= 144000; from += 2400) {
+            double e = 0.0;
+            for (int i = from; i < from + 4800; ++i) e += (double)l[(size_t)i] * l[(size_t)i];
+            lowest = std::min(lowest, (float)std::sqrt(e / 4800));
+        }
+        char text[140];
+        std::snprintf(text, sizeof(text), "loop toggled mid-stretch: largest step %.4f (sine's own 0.0144), lowest rms %.3f past the end too", step, lowest);
+        check(step < 0.02f && lowest > 0.3f, text);
+    }
+
     check(allocs == 0 && frees == 0, "render: " + std::to_string(allocs) + " allocations, " + std::to_string(frees) + " frees");
     std::printf("btf   backing track follows the tempo  %-4s\n%s", failures == 0 ? "PASS" : "FAIL", detail.c_str());
     std::fflush(stdout);

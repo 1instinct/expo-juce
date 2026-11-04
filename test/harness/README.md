@@ -45,7 +45,10 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   buffer is freed; loop off is silent after one pass; `load()` and a rate reload keep the tempo,
   nonsense means unknown; 0.0007× realtime; the 124 bpm MP3 fixture with a click on every beat at
   123 / 100 / 150 bpm: clicks within 12 ms of their beats, median within 7 ms, 20 ms at 70 bpm;
-  level per beat within 1.5 dB; 0 allocations), `bsf` (replacing and unloading the track
+  level per beat within 1.5 dB; from beat 0 below its tempo, and after a count-in from beat -4
+  with loop off and back on after bar 1, the loop's tail never bleeds into bar 1; a swap to a track
+  without a tempo mid-stretch plays plainly after its fade; loop toggled mid-stretch keeps the sound
+  going with no step; 0 allocations), `bsf` (replacing and unloading the track
   while it plays are crossfaded, never a step above one fade increment; the old buffer survives
   `collect()` until its fade-out ends), `btr` (loop-region rule on all its cases; decodes
   `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder, prints which length it yields and

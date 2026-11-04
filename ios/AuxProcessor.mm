@@ -117,9 +117,10 @@ inline float grainWeight(int phase, int hop) {
 // Where near `target` the track best continues what `outgoing` is about to play: normalised
 // cross-correlation of the two channels' sum, over `compare` samples, every `stride` samples and
 // then refined to the sample. Of near-equal places the nearest to `target` wins, and with nothing
-// to compare (silence, the ends of a track that does not loop) `target` itself.
+// to compare (silence, the ends of a track that does not loop) `target` itself. It never looks below
+// `lowest` (the first pass from the top: before sample 0 would be the loop's tail).
 int64_t bestGrainStart(const BackingTrackBuffer& b, int64_t outgoing, int64_t target, int search, int compare,
-                       int stride, bool loop) {
+                       int stride, bool loop, int64_t lowest) {
     constexpr int kMaxPoints = 256;
     const int64_t len = b.length;
     const int points = std::min(compare / stride, kMaxPoints);
@@ -153,14 +154,15 @@ int64_t bestGrainStart(const BackingTrackBuffer& b, int64_t outgoing, int64_t ta
         const float distance = 1.0f - 0.1f * (float)std::abs(offset) / (float)search;
         return xy / std::sqrt(yy + 1e-9f) * distance;
     };
+    const int from = (int)std::max<int64_t>(-search, lowest - target);
     int best = 0;
     float bestScore = 0.0f; // only a positive match moves it off the target
-    for (int offset = -search; offset <= search; offset += stride) {
+    for (int offset = from; offset <= search; offset += stride) {
         const float s = score(offset);
         if (s > bestScore) { bestScore = s; best = offset; }
     }
     const int coarse = best;
-    for (int offset = std::max(-search, coarse - stride + 1); offset <= std::min(search, coarse + stride - 1); ++offset) {
+    for (int offset = std::max(from, coarse - stride + 1); offset <= std::min(search, coarse + stride - 1); ++offset) {
         const float s = score(offset);
         if (s > bestScore) { bestScore = s; best = offset; }
     }
@@ -407,11 +409,14 @@ void AuxProcessor::startTail(BackingTrackBuffer* buffer, int64_t position) {
     grainsActive = false;
 }
 
-// The incoming head becomes the outgoing one; a new incoming head starts at `sourcePosition`.
-void AuxProcessor::startGrain(const BackingTrackBuffer& b, double sourcePosition, bool search, bool loop) {
+// The incoming head becomes the outgoing one; a new incoming head starts at `sourcePosition`. From
+// the top (`fromTop`: the transport is at or past beat 0) it never starts before sample 0: below a
+// track's tempo the target of the first grains is negative, and looping that reads the loop's tail.
+void AuxProcessor::startGrain(const BackingTrackBuffer& b, double sourcePosition, bool search, bool loop, bool fromTop) {
     grainOutPos = trackPos;
-    const int64_t target = std::llround(sourcePosition);
-    trackPos = search ? bestGrainStart(b, grainOutPos, target, grainSearch, grainCompare, grainStride, loop) : target;
+    const int64_t lowest = fromTop ? 0 : INT64_MIN / 2;
+    const int64_t target = std::max((int64_t)std::llround(sourcePosition), lowest);
+    trackPos = search ? bestGrainStart(b, grainOutPos, target, grainSearch, grainCompare, grainStride, loop, lowest) : target;
     grainPhase = 0;
 }
 
@@ -502,7 +507,7 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
                     // The grain's middle, a hop from now, is where its position should be on the beat.
                     const double beat = beatStart + i * beatsPerSample;
                     const double source = beat * samplesPerBeat + (beatsPerSample * samplesPerBeat - 1.0) * grainHop;
-                    startGrain(*t, source, follow, loop);
+                    startGrain(*t, source, follow, loop, beat >= 0.0);
                     grainsOnGrid = !follow;
                 }
             }
