@@ -21,6 +21,7 @@ import {
   BackingTrackInfo,
   BackingTrackRegionRule,
   BackingTrackOptions,
+  BackingTrackLoadOptions,
   Analysis,
   ArpMode,
   ArpRate,
@@ -179,7 +180,11 @@ export function setMetronome(options: MetronomeOptions): boolean {
 // Decodes a local audio file (file:// URI or absolute path; WAV, AIFF, FLAC, MP3, plus CoreAudio
 // formats such as M4A on iOS) off the audio thread at the device rate and swaps it in (5 ms
 // crossfade). It plays while the transport plays; track sample 0 is beat 0, so starts, resumes
-// and setTransportPosition place it at beat x 60 / bpm, and a tempo change does not move it.
+// and setTransportPosition place it at beat x 60 / bpm. Without `options.sourceBpm` it plays at its
+// own speed (bpm is the transport's, and a tempo change does not move it). With the file's own
+// tempo (0.8.0-rc.3+) bpm is that tempo and the track follows the transport tempo at its own
+// pitch, each beat on the transport's beat; at exactly that tempo it is the file untouched. The
+// result's `sourceBpm` (absent on older binaries) says whether the binary does this.
 // `gapless` (MP3 LAME/Xing tag values) picks the exact loop region: decoded length ==
 // loopSamples -> [0, loopSamples) ('tag'); == 1152 + leading + loopSamples + trailing ->
 // [1152 + leading, +loopSamples) ('padded'); == leading + loopSamples + trailing ->
@@ -189,12 +194,19 @@ export function setMetronome(options: MetronomeOptions): boolean {
 // _FILE, _FORMAT, _TOO_LONG (over 6 min), _MEMORY (not enough memory available).
 export async function loadBackingTrack(
   uri: string,
-  gapless?: BackingTrackGapless
+  gapless?: BackingTrackGapless,
+  options?: BackingTrackLoadOptions
 ): Promise<BackingTrackInfo> {
   if (typeof ExpoJuceModule?.loadBackingTrack !== 'function') {
     const error = new Error('this binary has no backing-track support (expo-juce 0.6.0+)');
     (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';
     throw error;
+  }
+  // The tempo travels in the gapless dictionary, so the native signature is unchanged and older
+  // binaries simply ignore it.
+  const sourceBpm = options?.sourceBpm;
+  if (typeof sourceBpm === 'number' && Number.isFinite(sourceBpm) && sourceBpm > 0) {
+    return ExpoJuceModule.loadBackingTrack(uri, { ...(gapless ?? {}), sourceBpm });
   }
   return ExpoJuceModule.loadBackingTrack(uri, gapless ?? null);
 }
@@ -381,6 +393,7 @@ export {
   BackingTrackInfo,
   BackingTrackRegionRule,
   BackingTrackOptions,
+  BackingTrackLoadOptions,
   Analysis,
   ArpMode,
   ArpRate,

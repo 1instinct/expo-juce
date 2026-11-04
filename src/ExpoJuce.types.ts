@@ -149,6 +149,22 @@ export type BackingTrackInfo = {
   regionRule?: BackingTrackRegionRule;
   /** Decoder used (e.g. "CoreAudio", "MP3 file", "WAV file"). */
   decoder?: string;
+  /**
+   * The tempo the track follows from (0.8.0-rc.3+): the `sourceBpm` passed in, 0 if none was or it
+   * was not a positive finite number. Absent on older binaries, which play every track at its own
+   * speed: use its presence to tell whether the running binary follows the tempo.
+   */
+  sourceBpm?: number;
+};
+
+/** `loadBackingTrack()` options beyond the file (0.8.0-rc.3+; older binaries ignore them). */
+export type BackingTrackLoadOptions = {
+  /**
+   * The file's own tempo. With it the track follows the transport tempo at its own pitch (time
+   * stretch), locked to the beat; at exactly this tempo it plays untouched. 0 / omitted: the track
+   * plays at its own speed whatever the tempo.
+   */
+  sourceBpm?: number;
 };
 
 /** `setBackingTrackOptions()` options; omitted keys keep their current value. */
@@ -346,6 +362,8 @@ export type AudioDiagnostics = {
   backingTrackLoaded?: boolean;
   /** Backing-track playback position in seconds; -1 when not playing (0.6.0+). */
   backingTrackPositionSec?: number;
+  /** Transport tempo / the playing track's own tempo; 1 = untouched or no tempo (0.8.0-rc.3+). */
+  backingTrackTempoRatio?: number;
   /** Drum hits the engine has started (cumulative since launch, 0.8.0+). */
   drumHits?: number;
   /** Peak of the drum part, before the effects (decaying hold, 0.8.0+). */

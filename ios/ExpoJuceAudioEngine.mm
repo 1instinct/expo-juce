@@ -919,7 +919,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     int activeVoices = 0;
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
     double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
-    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0;
+    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0, backingTrackTempoRatio = 1.0;
     double drumPeak = 0.0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
@@ -960,6 +960,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
             if (AuxProcessor* aux = ready ? sAux : nullptr) {
                 metronomeClicks = (double)aux->diag.clicks.load(relaxed);
                 backingTrackPositionSec = aux->diag.trackPositionSec.load(relaxed);
+                backingTrackTempoRatio = aux->diag.trackTempoRatio.load(relaxed);
             }
         }
     }
@@ -999,6 +1000,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"metronomeClicks"] = @(metronomeClicks);
     d[@"backingTrackLoaded"] = @(sBackingTrack.hasTrack() ? YES : NO);
     d[@"backingTrackPositionSec"] = @(backingTrackPositionSec);
+    d[@"backingTrackTempoRatio"] = @(backingTrackTempoRatio);
     // Drum hits the engine has started (cumulative since launch, from the process-lifetime queue).
     d[@"drumHits"] = @((double)sNoteQueue.drumHitsConsumed.load(std::memory_order_relaxed));
     d[@"drumPeak"] = @(drumPeak);
@@ -1191,6 +1193,8 @@ static NSString *backingTrackPath(NSString *uri) {
             source.gapless.trailingSamples = trailing.longLongValue;
             source.hasGapless = source.gapless.loopSamples > 0;
         }
+        // The file's own tempo rides in the same dictionary (older binaries ignore the key).
+        if (NSNumber *bpm = numberFrom(gapless, @"sourceBpm")) source.sourceBpm = bpm.doubleValue;
     }
     // A newer load or an unload supersedes this one (checked while decoding and before publishing).
     const uint64_t generation = sBackingTrack.beginLoad();
@@ -1222,6 +1226,7 @@ static NSString *backingTrackPath(NSString *uri) {
             @"decodedSamples": @((double)info.decodedSamples),
             @"regionRule": [NSString stringWithUTF8String:backingTrackRegionRuleName(info.regionRule)],
             @"decoder": [NSString stringWithUTF8String:info.formatName.c_str()] ?: @"",
+            @"sourceBpm": @(info.sourceBpm),
         }, nil, nil);
     });
 }

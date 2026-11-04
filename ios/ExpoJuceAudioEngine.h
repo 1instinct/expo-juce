@@ -66,6 +66,8 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // (gapless: loopSamples / leadingSamples / trailingSamples, optional), resamples to the device
 // rate and swaps it in. A later load / unload supersedes it (ERR_BACKING_TRACK_SUPERSEDED).
 // `completion` runs on that background queue: result on success, else errorCode + message.
+// `gapless` may also carry `sourceBpm`, the file's own tempo (0.8.0-rc.3+): the track then follows
+// the transport tempo (see AuxProcessor.h).
 - (void)loadBackingTrack:(NSString *)uri
                  gapless:(NSDictionary<NSString *, id> *)gapless
               completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode,

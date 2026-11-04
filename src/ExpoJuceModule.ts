@@ -51,7 +51,8 @@ export type ExpoJuceNativeModule = {
   // Metronome, backing track, analysis (0.6.0+)
   setMetronome?(options: MetronomeOptions): boolean;
   setBackingTrackOptions?(options: BackingTrackOptions): void;
-  loadBackingTrack?(uri: string, gapless: BackingTrackGapless | null): Promise<BackingTrackInfo>;
+  // `gapless` may also carry `sourceBpm` (0.8.0-rc.3+; see loadBackingTrack in index.ts).
+  loadBackingTrack?(uri: string, gapless: (Partial<BackingTrackGapless> & { sourceBpm?: number }) | null): Promise<BackingTrackInfo>;
   unloadBackingTrack?(): void;
   getAnalysis?(): Analysis;
 

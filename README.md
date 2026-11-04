@@ -188,6 +188,8 @@ const info = await ExpoJuce.loadBackingTrack(fileUri, {   // gapless info: optio
   loopSamples: 682839, leadingSamples: 4561, trailingSamples: 1496,
 });
 // { durationSec, sampleRate, channels, loopStartSample, loopSamples, decodedSamples, regionRule, decoder }
+// or, with the file's own tempo (0.8.0-rc.3+), it follows the transport tempo:
+// await ExpoJuce.loadBackingTrack(fileUri, gapless, { sourceBpm: 124 });
 ExpoJuce.setBackingTrackOptions({ level: 0.8, loop: true, enabled: true });
 ExpoJuce.startTransport();                                 // the track and the clicks start
 ExpoJuce.unloadBackingTrack();
@@ -226,8 +228,17 @@ ExpoJuce.unloadBackingTrack();
 - **Playback** follows the transport. Track sample 0 is beat 0: when the transport starts or
   is moved (`setTransportPosition`), the track goes to beat × 60 / bpm seconds (modulo its
   length when looping), so pause + resume continues where it stopped and seeks land on the
-  beat grid. While playing, the track simply advances with the audio: a tempo change does not
-  move or stretch it (it keeps its own speed). Starts away from the top, seeks, stops, and
+  beat grid. Without a `sourceBpm`, bpm is the transport's and the track simply advances with
+  the audio: a tempo change does not move or stretch it (it keeps its own speed).
+- **Following the tempo** (0.8.0-rc.3+): with `loadBackingTrack(uri, gapless, { sourceBpm })`,
+  bpm above is the track's own tempo and the track follows the transport tempo at its own pitch
+  (WSOLA: two read heads at normal speed crossfade every 20 ms; each new head starts where the
+  transport beat says the track should be and moves up to 10 ms to continue the sound best).
+  Its beats stay on the transport's: within about 10 ms between 0.8× and 1.25×, never adding
+  up, and a tempo change while playing holds at once. Far from its tempo (towards half or
+  double speed) transients smear and repeat more. At exactly its own tempo there is no stretch:
+  the file plays sample for sample. The result's `sourceBpm` says what the binary took (absent
+  before 0.8.0-rc.3); `getDiagnostics().backingTrackTempoRatio` is transport / track tempo. Starts away from the top, seeks, stops, and
   replacing or unloading the track while it plays are crossfaded over 5 ms. With `loop` off it
   plays once and then stays silent until the transport is moved back.
 - Options: `level` 0–1 (0.8), `loop` (true), `enabled` (true).

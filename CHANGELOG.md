@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.0-rc.3
+
+### Added
+
+- **Backing tracks follow the tempo.** `loadBackingTrack(uri, gapless, { sourceBpm })` takes the
+  file's own tempo. The track then follows the transport tempo at its own pitch (time stretch,
+  WSOLA over the resident buffer: two read heads at normal speed, a 20 ms crossfade, each new
+  head placed by the transport beat and moved up to 10 ms to the place that best continues the
+  sound). Every beat of the track stays on the transport's beat: a click lands within about 10 ms
+  of it between 0.8× and 1.25× (offline harness, real music), errors never add up, and a tempo
+  change while playing holds from the next grain. Seeks, starts and resumes map onto the track's
+  own beat grid. No allocation and no lock on the audio thread.
+- `BackingTrackInfo.sourceBpm`: the tempo the track follows from (0 if none). `getDiagnostics()`:
+  `backingTrackTempoRatio` (transport tempo / track tempo, 1 = untouched).
+- Harness case `btf`.
+
+### Unchanged
+
+- At exactly its own tempo a track is the file, sample for sample (no stretch runs), and a track
+  loaded without `sourceBpm` plays as before: at its own speed whatever the tempo.
+
+### Compatibility
+
+- The tempo travels inside the `gapless` dictionary, so the native signature is unchanged: this
+  JS on an older binary loads the track as before (no stretch), and `sourceBpm` is then missing
+  from the result. Use its presence, not `typeof`, to tell whether the binary follows the tempo.
+
 ## 0.8.0-rc.2
 
 ### Added
