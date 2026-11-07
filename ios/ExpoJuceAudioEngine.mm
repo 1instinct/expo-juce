@@ -3,6 +3,7 @@
 #include "JuceConfig.h"
 #import "ExpoJuceAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMIDI/CoreMIDI.h>
 #import <UIKit/UIKit.h>
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
@@ -42,6 +43,9 @@ static const int64_t kRebuildRetryDelayMs = 1000;
 static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt + 2 retries, then "failed"
 
 @interface ExpoJuceAudioEngine ()
+// Absorbs CoreMIDI's one-time XPC initialisation on a background queue so it
+// cannot block the main thread later. See the definition for why.
++ (void)warmCoreMidiOffMainThread;
 @property (nonatomic, assign) bool isReady;
 @property (nonatomic, readwrite) int setupStep;
 @property (atomic, readwrite, copy) NSString *lastError;
@@ -246,8 +250,35 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 [[ExpoJuceAudioEngine sharedInstance] scheduleBackingTrackCollect];
             });
         });
+        [ExpoJuceAudioEngine warmCoreMidiOffMainThread];
     }
     return self;
+}
+
+// The first CoreMIDI call in a process pays for MIDIProcessXPC::InitOnce — a
+// synchronous XPC handshake that launches midiserver and can take seconds. JUCE
+// requires its MIDI calls on the message thread, so when that cost lands on a
+// MIDI call it blocks the main thread (BEEPER-BUZZ-B).
+//
+// That initialisation is process-global and not thread-affine, so touching any
+// cheap CoreMIDI query from a background queue first absorbs the cost there.
+// Afterwards MIDIProcess::CheckInitialization on the main thread finds the
+// connection already up and returns immediately.
+//
+// This is belt-and-braces: with midiDeviceListConnection now made lazily (see
+// juce_AudioDeviceManager.h), a host that never uses MIDI devices never calls
+// into CoreMIDI at all. This keeps the main thread clear for when one does —
+// e.g. BLE MIDI. If the warm-up has not finished by then, behaviour is exactly
+// what it is today, so this can only help.
++ (void)warmCoreMidiOffMainThread {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            // Return value deliberately unused; the call is made for the
+            // initialisation it forces, not the count.
+            (void)MIDIGetNumberOfSources();
+        });
+    });
 }
 
 - (BOOL)setup {

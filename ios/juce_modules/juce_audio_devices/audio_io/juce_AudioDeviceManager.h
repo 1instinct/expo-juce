@@ -514,10 +514,22 @@ private:
     std::unique_ptr<XmlElement> lastExplicitSettings;
     mutable bool listNeedsScanning = true;
     AudioBuffer<float> tempBuffer;
-    MidiDeviceListConnection midiDeviceListConnection = MidiDeviceListConnection::make ([this]
-    {
-        midiDeviceListChanged();
-    });
+
+    // PATCHED (expo-juce): this was eagerly initialised with
+    // MidiDeviceListConnection::make(...), which made simply constructing an
+    // AudioDeviceManager reach MidiDeviceListConnectionBroadcaster::get() ->
+    // State{} -> Midi{In,Out}put::getAvailableDevices() -> getGlobalMidiClient()
+    // -> MIDIClientCreate(). On a cold CoreMIDI that call blocks on a
+    // synchronous XPC handshake with midiserver for seconds, and because JUCE
+    // requires MIDI calls on the message thread it blocked the main thread and
+    // tripped Sentry's App Hanging monitor (BEEPER-BUZZ-B).
+    //
+    // A default-constructed MidiDeviceListConnection is documented as inactive
+    // and touches nothing, so hosts that never use MIDI (this one only uses
+    // juce::MidiBuffer for processing) never initialise CoreMIDI at all. The
+    // real connection is made on first use by ensureMidiDeviceListConnection().
+    MidiDeviceListConnection midiDeviceListConnection;
+    bool midiDeviceListConnectionCreated = false;
 
     struct MidiCallbackInfo
     {
@@ -557,6 +569,11 @@ private:
     void handleIncomingMidiMessageInt (MidiInput*, const MidiMessage&);
     void audioDeviceListChanged();
     void midiDeviceListChanged();
+
+    // PATCHED (expo-juce): subscribes to MIDI device list changes the first time
+    // the host actually touches MIDI. Must be called on the message thread, as
+    // the underlying broadcaster asserts that.
+    void ensureMidiDeviceListConnection();
 
     String restartDevice (int blockSizeToUse, double sampleRateToUse,
                           const BigInteger& ins, const BigInteger& outs);
