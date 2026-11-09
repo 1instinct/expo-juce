@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Licensing is stated in full.** Added `LICENSE` (MIT, for expo-juce's own code) and
+  `THIRD_PARTY_NOTICES.md` (JUCE 8: the JUCE licence or AGPLv3; Oboe: Apache 2.0; libFLAC: BSD).
+  `package.json` `license` is now `MIT AND (AGPL-3.0-only OR LicenseRef-JUCE-8-EULA)`, and both
+  files ship in the package. No code change.
+
 ## 0.8.0-rc.3
 
 ### Added

@@ -10,7 +10,8 @@
     "ios/",
     "android/build.gradle",
     "android/src/",
-    "expo-module.config.json"
+    "expo-module.config.json",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "build": "expo-module build",
@@ -37,7 +38,7 @@
     "url": "https://github.com/1instinct/expo-juce/issues"
   },
   "author": "1instinct (https://github.com/1instinct)",
-  "license": "MIT",
+  "license": "MIT AND (AGPL-3.0-only OR LicenseRef-JUCE-8-EULA)",
   "homepage": "https://github.com/1instinct/expo-juce#readme",
   "devDependencies": {
     "@types/adm-zip": "^0.5.5",

@@ -522,4 +522,7 @@ its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the m
 
 ## License
 
-MIT
+expo-juce's own code is MIT (`LICENSE`). It bundles JUCE 8, which is dual licensed under the JUCE
+licence or AGPLv3, so an app built with expo-juce needs a JUCE licence (Starter is free below a
+revenue limit) unless the whole app is released under AGPLv3. Details, and the other bundled
+code (Oboe, libFLAC), are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
