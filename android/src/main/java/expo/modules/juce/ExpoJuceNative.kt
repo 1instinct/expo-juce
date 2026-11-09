@@ -91,6 +91,9 @@ internal object ExpoJuceNative {
   @JvmStatic external fun nativeSetup(bufferSize: Int, sampleRate: Double, nativeSampleRate: Double): Boolean
   @JvmStatic external fun nativeSetupErrorMessage(): String
   @JvmStatic external fun nativeShutdown()
+  @JvmStatic external fun nativeEnterBackground()
+  @JvmStatic external fun nativeEnterForeground()
+  @JvmStatic external fun nativeLastNote(): Int
   @JvmStatic external fun nativeDiagnosticsJson(): String?
   @JvmStatic external fun nativePlayTestTone(durationMs: Double): Boolean
   @JvmStatic external fun nativeNoteOn(note: Int, velocity: Int)

@@ -381,4 +381,10 @@ export type AudioDiagnostics = {
   nativeSampleRate?: number;
   /** Android: output underruns reported by the audio stream since it opened; -1 = unknown (0.9.0+). */
   xrunCount?: number;
+  /** Android: the app is in the background and the audio device is closed (0.9.0+). */
+  backgrounded?: boolean;
+  /** Android: times the device was closed because the app went to the background (0.9.0+). */
+  backgroundStops?: number;
+  /** Android: times it was reopened when the app came back (0.9.0+). */
+  foregroundRestarts?: number;
 };

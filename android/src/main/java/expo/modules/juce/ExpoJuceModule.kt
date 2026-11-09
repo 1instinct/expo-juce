@@ -23,8 +23,22 @@ class ExpoJuceModule : Module() {
 
     OnDestroy {
       // Lifecycle calls belong on the main thread (JUCE's message thread).
-      Handler(Looper.getMainLooper()).post {
+      onMainThread {
         if (ExpoJuceNative.isInitialised) ExpoJuceNative.nativeShutdown()
+      }
+    }
+
+    // In the background the audio device is closed (held notes released) and nothing renders;
+    // back in the foreground it reopens with the same setup. Both are no-ops before setup.
+    OnActivityEntersBackground {
+      onMainThread {
+        if (ExpoJuceNative.isInitialised) ExpoJuceNative.nativeEnterBackground()
+      }
+    }
+
+    OnActivityEntersForeground {
+      onMainThread {
+        if (ExpoJuceNative.isInitialised) ExpoJuceNative.nativeEnterForeground()
       }
     }
 
@@ -179,6 +193,11 @@ class ExpoJuceModule : Module() {
     // No native pad view on Android yet: the JS wrapper's isJucePadViewAvailable() is false.
     // The function must exist, because the wrapper passes setup options only when it does.
     Function("hasJucePadView") { false }
+  }
+
+  // Runs block on the main thread: now if this is it, else posted.
+  private fun onMainThread(block: () -> Unit) {
+    if (Looper.myLooper() == Looper.getMainLooper()) block() else Handler(Looper.getMainLooper()).post { block() }
   }
 
   private fun synthParam(param: ExpoJuceNative.SynthParam, value: Double) {

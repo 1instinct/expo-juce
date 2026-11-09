@@ -35,10 +35,19 @@ bool setup(int bufferSize, double sampleRate, double nativeSampleRate);
 void shutdown();
 // "step N: <error>" for the last setup failure.
 std::string setupErrorMessage();
+// App to background: releases held notes and closes the audio device (the stream stops, so
+// nothing renders or holds the output while the app is not visible). No-op if not set up or
+// already in the background.
+void enterBackground();
+// App back in the foreground: reopens the device with the setup it had. No-op unless
+// enterBackground closed it; if the device does not reopen, it stays closed (lastRecoveryError)
+// and the next call tries again.
+void enterForeground();
 
 // ── Diagnostics (any thread) ─────────────────────────────────────
 // JSON object with every key of the JS AudioDiagnostics type (iOS-only session fields are empty
-// or zero), plus the Android fields platform, nativeSampleRate and xrunCount.
+// or zero), plus the Android fields platform, nativeSampleRate, xrunCount, backgrounded,
+// backgroundStops and foregroundRestarts.
 std::string diagnosticsJson();
 // Mixes a 440 Hz tone into the device output. false if not ready or the device is not playing.
 bool playTestTone(double durationMs);
@@ -47,6 +56,8 @@ bool playTestTone(double durationMs);
 void noteOn(int note, int velocity);
 void noteOff(int note);
 void allNotesOff();
+// MIDI note of the last note-on the synth started, -1 if none (getAnalysis().lastNote).
+int lastNoteStarted();
 void setWaveform(const std::string& waveform); // "sine" | "square" | "saw" | "triangle"
 void setFilterCutoff(double hz);
 void setFilterResonance(double q);

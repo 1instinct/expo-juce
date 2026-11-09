@@ -70,6 +70,13 @@ std::atomic<double> sNativeSampleRate{0.0};
 // lastError is a string: guarded by its own small lock (never held while taking another).
 std::mutex sErrorLock;
 std::string sLastError;
+std::string sLastRecoveryError; // also guarded by sErrorLock
+
+// Background: the device is closed while the app is in the background (no stream, no battery
+// drain) and reopened with the same setup when it returns. Message thread only.
+std::atomic<bool> sBackgrounded{false};
+std::atomic<uint64_t> sBackgroundStops{0};
+std::atomic<uint64_t> sForegroundRestarts{0};
 
 // ── Process-lifetime stores (as on iOS) ──
 // Note input: one queue for the life of the process, so producers never need the engine lock.
@@ -126,6 +133,11 @@ std::string lastError() {
     return sLastError;
 }
 
+std::string lastRecoveryError() {
+    std::lock_guard<std::mutex> guard(sErrorLock);
+    return sLastRecoveryError;
+}
+
 void setLastError(std::string value) {
     std::lock_guard<std::mutex> guard(sErrorLock);
     sLastError = std::move(value);
@@ -152,6 +164,7 @@ void setStep(int step, const char* what) {
 
 // Message thread, lifecycle lock held. Deletes everything doSetup built (any subset).
 void teardownEngineLocked() {
+    sBackgrounded.store(false, std::memory_order_relaxed);
     sAcceptingNotes.store(false, std::memory_order_release);
     sIsReady.store(false, std::memory_order_release);
     sAnalysis.setActive(false);
@@ -376,6 +389,47 @@ std::string setupErrorMessage() {
            + (error.empty() ? std::string("unknown error") : error);
 }
 
+void enterBackground() {
+    if (!isMessageThread()) return;
+    if (!sIsReady.load(std::memory_order_acquire) || sBackgrounded.load(std::memory_order_relaxed)) return;
+    LifecycleLock lifecycle;
+    if (sDeviceManager == nullptr) return;
+    // Held notes are released: the first block after the device reopens applies this mark.
+    sAcceptingNotes.store(false, std::memory_order_release);
+    sNoteQueue.pushAllNotesOff();
+    sDeviceManager->closeAudioDevice(); // stops the callback, closes the stream
+    sBackgrounded.store(true, std::memory_order_relaxed);
+    sBackgroundStops.fetch_add(1, std::memory_order_relaxed);
+    HOST_LOG("background: audio device closed");
+}
+
+void enterForeground() {
+    if (!isMessageThread()) return;
+    if (!sBackgrounded.load(std::memory_order_relaxed)) return;
+    LifecycleLock lifecycle;
+    if (!sIsReady.load(std::memory_order_acquire) || sDeviceManager == nullptr) {
+        sBackgrounded.store(false, std::memory_order_relaxed);
+        return;
+    }
+    // Nothing drains the queue while the device is closed, so this thread may drop note-ons that
+    // arrived meanwhile (none are accepted, but a race at the switch could leave one).
+    sNoteQueue.discardPending();
+    sDeviceManager->restartLastAudioDevice(); // same device, rate and buffer as before
+    juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice();
+    if (device == nullptr || !device->isPlaying()) {
+        // Stays backgrounded: the next foreground event tries again.
+        const std::string message = "foreground: the audio device did not reopen";
+        HOST_LOG("%s", message.c_str());
+        std::lock_guard<std::mutex> guard(sErrorLock);
+        sLastRecoveryError = message;
+        return;
+    }
+    sBackgrounded.store(false, std::memory_order_relaxed);
+    sForegroundRestarts.fetch_add(1, std::memory_order_relaxed);
+    sAcceptingNotes.store(true, std::memory_order_release);
+    HOST_LOG("foreground: audio device reopened");
+}
+
 void setExtraDeviceTypeFactory(std::function<std::unique_ptr<juce::AudioIODeviceType>()> factory) {
     sExtraDeviceTypeFactory = std::move(factory);
 }
@@ -479,6 +533,9 @@ std::string diagnosticsJson() {
     d->setProperty("engineState", engineState);
     d->setProperty("lockBusyDrops", number((double)sLockBusyDrops.load(std::memory_order_relaxed)));
     d->setProperty("deadDeviceRestarts", 0.0);
+    d->setProperty("backgrounded", sBackgrounded.load(std::memory_order_relaxed));
+    d->setProperty("backgroundStops", number((double)sBackgroundStops.load(std::memory_order_relaxed)));
+    d->setProperty("foregroundRestarts", number((double)sForegroundRestarts.load(std::memory_order_relaxed)));
     d->setProperty("preferredBufferSize", sRequestedBufferSize.load(std::memory_order_relaxed));
     d->setProperty("preferredSampleRate", number(sRequestedSampleRate.load(std::memory_order_relaxed)));
 
@@ -486,7 +543,7 @@ std::string diagnosticsJson() {
     d->setProperty("sessionReassertCount", 0);
     d->setProperty("interruptionCount", 0);
     d->setProperty("mediaResetCount", 0);
-    d->setProperty("lastRecoveryError", "");
+    d->setProperty("lastRecoveryError", juce::String(lastRecoveryError()));
     d->setProperty("sessionCategory", "");
     d->setProperty("sessionSampleRate", 0.0);
     d->setProperty("sessionIOBufferMs", 0.0);
@@ -517,6 +574,7 @@ void noteOn(int note, int velocity) {
 }
 
 void noteOff(int note) { sNoteQueue.pushNoteOff(note); }
+int lastNoteStarted() { return sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed); }
 void allNotesOff() { sNoteQueue.pushAllNotesOff(); }
 
 void setWaveform(const std::string& waveform) {

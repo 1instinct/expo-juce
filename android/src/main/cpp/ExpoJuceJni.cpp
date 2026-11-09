@@ -96,6 +96,21 @@ EXPOJUCE_JNI(void, nativeShutdown)(JNIEnv* env, jclass) {
     guardedVoid(env, [] { expojuce::host::shutdown(); });
 }
 
+// Main thread (activity lifecycle).
+EXPOJUCE_JNI(void, nativeEnterBackground)(JNIEnv* env, jclass) {
+    if (!sJuceInitialised.load(std::memory_order_acquire)) return;
+    guardedVoid(env, [] { expojuce::host::enterBackground(); });
+}
+
+EXPOJUCE_JNI(void, nativeEnterForeground)(JNIEnv* env, jclass) {
+    if (!sJuceInitialised.load(std::memory_order_acquire)) return;
+    guardedVoid(env, [] { expojuce::host::enterForeground(); });
+}
+
+EXPOJUCE_JNI(jint, nativeLastNote)(JNIEnv*, jclass) {
+    return (jint)expojuce::host::lastNoteStarted();
+}
+
 EXPOJUCE_JNI(jstring, nativeDiagnosticsJson)(JNIEnv* env, jclass) {
     return guarded<jstring>(env, nullptr, [&] { return toJString(env, expojuce::host::diagnosticsJson()); });
 }

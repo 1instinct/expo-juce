@@ -178,7 +178,8 @@ static const char* const kDiagnosticsKeys[] = {
     "fxLimiterGain", "fxNonFiniteResets", "metronomeClicks", "backingTrackLoaded",
     "backingTrackPositionSec", "backingTrackTempoRatio", "drumHits", "drumPeak", "sessionCategory",
     "sessionSampleRate", "sessionIOBufferMs", "sessionOutputLatencyMs", "otherAudioPlaying",
-    "routeOutputs", "platform", "nativeSampleRate", "xrunCount",
+    "routeOutputs", "platform", "nativeSampleRate", "xrunCount", "backgrounded", "backgroundStops",
+    "foregroundRestarts",
 };
 
 static juce::var diagnostics() { return parse(host::diagnosticsJson()); }
@@ -224,6 +225,11 @@ static void testShapesBeforeSetup() {
     host::setFilterCutoff(1200.0);
     check((double)diagnostics()["notesQueued"] == 0.0, "noteOn before setup is not queued");
     check(!host::playTestTone(100.0), "playTestTone before setup: false");
+    host::enterBackground();
+    host::enterForeground();
+    const juce::var after = diagnostics();
+    check((double)after["backgroundStops"] == 0.0 && (double)after["foregroundRestarts"] == 0.0 && !(bool)after["backgrounded"],
+          "background / foreground before setup: no-ops");
 }
 
 static void testNoDevice() {
@@ -304,10 +310,48 @@ static void testPlayback(double nativeRate, int expectedBuffer) {
     std::thread([] { host::noteOff(72); }).join();
     check(waitFor([] { return (int)diagnostics()["activeVoices"] == 0; }, 3000), "note on / off from another thread");
 
+    // Background: the device closes, held notes are released; foreground: it reopens as it was.
+    d = diagnostics();
+    const double stops = (double)d["backgroundStops"], restarts = (double)d["foregroundRestarts"];
+    const int opens = gStats.opens.load();
+    host::noteOn(60, 127);
+    pump(200);
+    host::enterBackground();
+    host::enterBackground(); // idempotent
+    d = diagnostics();
+    check((bool)d["backgrounded"] && (double)d["backgroundStops"] == stops + 1 && (bool)d["isReady"],
+          "background: device closed once (backgroundStops +1), engine still set up");
+    const uint64_t blocks = gStats.blocks.load();
+    pump(200);
+    check(gStats.blocks.load() == blocks, "background: nothing renders");
+    check(!host::playTestTone(50.0), "background: playTestTone false");
+    const double queuedInBackground = (double)d["notesQueued"];
+    host::noteOn(62, 100);
+    check((double)diagnostics()["notesQueued"] == queuedInBackground, "background: noteOn is not queued");
+    host::enterForeground();
+    host::enterForeground(); // idempotent
+    d = diagnostics();
+    check(!(bool)d["backgrounded"] && (double)d["foregroundRestarts"] == restarts + 1 && gStats.opens.load() == opens + 1,
+          "foreground: device reopened once (foregroundRestarts +1)");
+    check(gStats.openedRate.load() == expectedRate && gStats.openedBuffer.load() == expectedBuffer
+              && (double)d["sampleRate"] == expectedRate && (int)d["bufferSize"] == expectedBuffer,
+          "foreground: same sample rate and buffer as before");
+    check(waitFor([] { return (int)diagnostics()["activeVoices"] == 0; }, 3000),
+          "the note held when going to background is released");
+    gStats.peak.store(0.0f);
+    host::noteOn(65, 127);
+    pump(300);
+    check(gStats.peak.load() > 0.05f, "foreground: a new note reaches the output (peak " + std::to_string(gStats.peak.load()) + ")");
+    host::noteOff(65);
+    check(waitFor([] { return (int)diagnostics()["activeVoices"] == 0; }, 3000), "foreground: noteOff releases it");
+    // Shutdown while in the background is clean too.
+    host::enterBackground();
+
     host::shutdown();
     d = diagnostics();
-    check(!(bool)d["isReady"] && d["engineState"].toString() == "uninitialized" && (double)d["callbackCount"] == 0.0,
-          "shutdown: not ready, uninitialized");
+    check(!(bool)d["isReady"] && d["engineState"].toString() == "uninitialized" && (double)d["callbackCount"] == 0.0
+          && !(bool)d["backgrounded"],
+          "shutdown (from the background): not ready, uninitialized, not backgrounded");
     const double queued = (double)d["notesQueued"];
     host::noteOn(60, 100);
     check((double)diagnostics()["notesQueued"] == queued, "noteOn after shutdown is not queued");

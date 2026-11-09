@@ -465,8 +465,11 @@ Differences from iOS:
   diagnostics) over `setup({ sampleRate })`, so the stream is not resampled; `sampleRate` reports
   the rate in use. The buffer is the nearest size the device lists to `bufferSize`, and at least
   two of the device's bursts.
-- Diagnostics add `platform: 'android'`, `nativeSampleRate` and `xrunCount`; the
-  AVAudioSession fields are empty or zero.
+- In the background the audio device is closed (held notes are released, nothing renders) and it
+  reopens with the same setup when the app returns. Note-ons sent while in the background are
+  dropped.
+- Diagnostics add `platform: 'android'`, `nativeSampleRate`, `xrunCount`, `backgrounded`,
+  `backgroundStops` and `foregroundRestarts`; the AVAudioSession fields are empty or zero.
 - No audio-focus handling, interruption recovery or engine rebuilds yet.
 
 Build requirements: the app's NDK (`ndkVersion` from the root project, 27.1.12297006 if unset),

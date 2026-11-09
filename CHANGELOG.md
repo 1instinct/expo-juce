@@ -10,7 +10,9 @@
   The rest of the API is present with the iOS defaults shape (setters return `false`, getters
   return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` and
   `isJucePadViewAvailable()` are `false`). See the README's Android section.
-- `getDiagnostics()` on Android: `platform`, `nativeSampleRate`, `xrunCount`.
+- Android closes the audio device while the app is in the background and reopens it on return.
+- `getDiagnostics()` on Android: `platform`, `nativeSampleRate`, `xrunCount`, `backgrounded`,
+  `backgroundStops`, `foregroundRestarts`.
 - `npm run check:juce-patches`: the patched vendored JUCE files equal pristine 8.0.1 plus
   `src/scripts/juce-patches.cjs`. The lazy MIDI device-list connection (0.8.0-rc.4) is now one of
   those patches, so a re-vendor keeps it.
