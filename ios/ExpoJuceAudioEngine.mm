@@ -258,7 +258,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 // The first CoreMIDI call in a process pays for MIDIProcessXPC::InitOnce — a
 // synchronous XPC handshake that launches midiserver and can take seconds. JUCE
 // requires its MIDI calls on the message thread, so when that cost lands on a
-// MIDI call it blocks the main thread (BEEPER-BUZZ-B).
+// MIDI call it blocks the main thread.
 //
 // That initialisation is process-global and not thread-affine, so touching any
 // cheap CoreMIDI query from a background queue first absorbs the cost there.
