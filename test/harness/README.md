@@ -13,6 +13,15 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
 ./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd)
 ```
 
+`./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
+same git ref rule) on Linux: JUCE's Android device is replaced by a fake device type that renders
+from its own thread in 96-frame bursts, like an Oboe stream. It checks the JSON shapes the Kotlin
+module returns (every `AudioDiagnostics` key, effects / arp / drums / analysis defaults), a setup
+with no device (fails at step 4, `engineState` "failed"), setup off the message thread (refused),
+the native rate preferred over the requested one, the buffer (nearest listed size, at least two
+bursts), a held note reaching the device output, note-off / allNotesOff / notes from another
+thread, the test tone, and shutdown + setup again. Exit code non-zero on any failure.
+
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
   `FxChainProcessor`) are taken from `git show HEAD:ios/...`; pass `-DHARNESS_GIT_REF=WORKTREE`
   (or any ref) to change.

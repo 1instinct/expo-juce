@@ -110,3 +110,23 @@ target_compile_definitions(harness PRIVATE HARNESS_FIXTURES="${CMAKE_CURRENT_SOU
                                            HARNESS_JS_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../src"
                                            # BackingTrack::acquire() test seam, see harness.cpp
                                            BACKING_TRACK_ACQUIRE_HOOK=harnessBackingTrackAcquireHook)
+
+# Android host (android/src/main/cpp/AndroidEngineHost.cpp): its portable part, with JUCE's Android
+# device replaced by a fake device type (host_test.cpp). Same git ref / WORKTREE rule as ios/.
+set(HOST_SNAP "${CMAKE_BINARY_DIR}/host_src")
+file(MAKE_DIRECTORY "${HOST_SNAP}")
+foreach(f AndroidEngineHost.h AndroidEngineHost.cpp)
+  if(HARNESS_GIT_REF STREQUAL "WORKTREE")
+    configure_file("${REPO_ROOT}/android/src/main/cpp/${f}" "${HOST_SNAP}/${f}" COPYONLY)
+  else()
+    execute_process(COMMAND git show "${HARNESS_GIT_REF}:android/src/main/cpp/${f}"
+                    WORKING_DIRECTORY "${REPO_ROOT}" OUTPUT_FILE "${HOST_SNAP}/${f}"
+                    RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "git show ${HARNESS_GIT_REF}:android/src/main/cpp/${f} failed")
+    endif()
+  endif()
+endforeach()
+add_executable(host_test host_test.cpp "${HOST_SNAP}/AndroidEngineHost.cpp" ${ENGINE_CPP})
+target_include_directories(host_test PRIVATE "${HOST_SNAP}" "${SNAP}")
+target_link_libraries(host_test PRIVATE juce_lib)
