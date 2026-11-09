@@ -134,7 +134,7 @@ class ExpoJuceModule : Module() {
 
     Function("setEffectParam") { _: String, _: String, _: Double -> false }
 
-    Function("getEffectsState") { state(ExpoJuceNative.State.EFFECTS) }
+    Function("getEffectsState") { ExpoJuceNative.effectsState }
 
     // ── Metronome / backing track / analysis (not on Android yet) ──
 
@@ -148,13 +148,13 @@ class ExpoJuceModule : Module() {
 
     Function("unloadBackingTrack") {}
 
-    Function("getAnalysis") { state(ExpoJuceNative.State.ANALYSIS) }
+    Function("getAnalysis") { ExpoJuceNative.analysis() }
 
     // ── Arpeggiator (not on Android yet) ───────────────────────────
 
     Function("setArpeggiator") { _: Map<String, Any?> -> false }
 
-    Function("getArpeggiatorState") { state(ExpoJuceNative.State.ARPEGGIATOR) }
+    Function("getArpeggiatorState") { ExpoJuceNative.arpeggiatorState }
 
     // ── Drums (not on Android yet: hasDrums is false) ──────────────
 
@@ -166,7 +166,7 @@ class ExpoJuceModule : Module() {
 
     Function("setDrumKit") { _: Map<String, Any?> -> false }
 
-    Function("getDrumState") { state(ExpoJuceNative.State.DRUMS) }
+    Function("getDrumState") { ExpoJuceNative.drumState }
 
     // ── Transport (not on Android yet: stopped at beat 0, 120 bpm) ──
 
@@ -203,9 +203,6 @@ class ExpoJuceModule : Module() {
   private fun synthParam(param: ExpoJuceNative.SynthParam, value: Double) {
     if (ExpoJuceNative.isLoaded) ExpoJuceNative.nativeSetSynthParam(param.ordinal, value)
   }
-
-  private fun state(which: ExpoJuceNative.State): Map<String, Any?> =
-    if (ExpoJuceNative.isLoaded) ExpoJuceNative.jsonToMap(ExpoJuceNative.nativeStateJson(which.ordinal)) else emptyMap()
 
   private fun unloadedDiagnostics(): Map<String, Any?> = mapOf(
     "platform" to "android",

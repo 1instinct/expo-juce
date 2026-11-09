@@ -61,6 +61,25 @@ internal object ExpoJuceNative {
     return audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toDoubleOrNull() ?: 0.0
   }
 
+  // ── Stored state ──
+  // Effects, arpeggiator and drum settings cannot change on Android yet (their setters are not
+  // implemented), so each shape is converted once. getAnalysis is polled per frame: its shape is
+  // converted once and only the live field (lastNote) is patched into a shallow copy.
+
+  val effectsState: Map<String, Any?> by lazy { stateMap(State.EFFECTS) }
+  val arpeggiatorState: Map<String, Any?> by lazy { stateMap(State.ARPEGGIATOR) }
+  val drumState: Map<String, Any?> by lazy { stateMap(State.DRUMS) }
+  private val analysisShape: Map<String, Any?> by lazy { stateMap(State.ANALYSIS) }
+
+  fun analysis(): Map<String, Any?> {
+    val result = LinkedHashMap(analysisShape)
+    result["lastNote"] = if (isLoaded) nativeLastNote() else -1
+    return result
+  }
+
+  private fun stateMap(which: State): Map<String, Any?> =
+    if (isLoaded) jsonToMap(nativeStateJson(which.ordinal)) else emptyMap()
+
   // ── JSON from the native side → maps / lists for the module's return values ──
 
   fun jsonToMap(json: String?): Map<String, Any?> {
