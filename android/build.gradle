@@ -1,7 +1,7 @@
 apply plugin: 'com.android.library'
 
 group = 'expo.modules.juce'
-version = '0.1.0'
+version = '0.9.0-rc.0'
 
 def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
 apply from: expoModulesCorePlugin
@@ -9,34 +9,48 @@ applyKotlinExpoModulesCorePlugin()
 useCoreDependencies()
 useExpoPublishing()
 
-// If you want to use the managed Android SDK versions from expo-modules-core, set this to true.
-// The Android SDK versions will be bumped from time to time in SDK releases and may introduce breaking changes in your module code.
-// Most of the time, you may like to manage the Android SDK versions yourself.
-def useManagedAndroidSdkVersions = false
-if (useManagedAndroidSdkVersions) {
-  useDefaultAndroidSdkVersions()
-} else {
-  buildscript {
-    // Simple helper that allows the root project to override versions declared by this library.
-    ext.safeExtGet = { prop, fallback ->
-      rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
-    }
-  }
-  project.android {
-    compileSdkVersion safeExtGet("compileSdkVersion", 34)
-    defaultConfig {
-      minSdkVersion safeExtGet("minSdkVersion", 21)
-      targetSdkVersion safeExtGet("targetSdkVersion", 34)
-    }
-  }
+// The ABIs the app builds for (React Native's reactNativeArchitectures property), so the native
+// library is not compiled for architectures the app does not ship.
+def reactNativeArchitectures() {
+  def value = rootProject.getProperties().get("reactNativeArchitectures")
+  return value ? value.split(",").collect { it.trim() } : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
 }
 
+// safeExtGet (ExpoModulesCorePlugin.gradle): the root project's value if it sets one, else the fallback.
 android {
   namespace "expo.modules.juce"
+  compileSdkVersion safeExtGet("compileSdkVersion", 36)
+  // The NDK React Native uses (RN 0.81 default if the app does not set one).
+  ndkVersion safeExtGet("ndkVersion", "27.1.12297006")
+
   defaultConfig {
+    minSdkVersion safeExtGet("minSdkVersion", 24)
+    targetSdkVersion safeExtGet("targetSdkVersion", 36)
     versionCode 1
-    versionName "0.1.0"
+    versionName "0.9.0-rc.0"
+    consumerProguardFiles "proguard-rules.pro"
+
+    externalNativeBuild {
+      cmake {
+        // Same C++ runtime as React Native (libc++_shared.so, shipped by the app).
+        arguments "-DANDROID_STL=c++_shared"
+        abiFilters(*reactNativeArchitectures())
+      }
+    }
   }
+
+  // JUCE + Oboe + the engine (android/CMakeLists.txt). Sources are read from ../ios.
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+    }
+  }
+
+  packagingOptions {
+    // React Native ships libc++_shared.so; the app's copy is the one packaged.
+    excludes += ["**/libc++_shared.so"]
+  }
+
   lintOptions {
     abortOnError false
   }

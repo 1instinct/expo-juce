@@ -238,6 +238,26 @@ void AudioDeviceManager::midiDeviceListChanged()
     sendChangeMessage();
 }
 
+// PATCHED (expo-juce): see the note on midiDeviceListConnection in the header.
+// Making the subscription here rather than in a member initialiser keeps
+// CoreMIDI untouched for hosts that never use MIDI devices.
+void AudioDeviceManager::ensureMidiDeviceListConnection()
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    if (midiDeviceListConnectionCreated)
+        return;
+
+    // Set before make() so that a midiDeviceListChanged() callback arriving
+    // during construction cannot re-enter this function.
+    midiDeviceListConnectionCreated = true;
+
+    midiDeviceListConnection = MidiDeviceListConnection::make ([this]
+    {
+        midiDeviceListChanged();
+    });
+}
+
 //==============================================================================
 static void addIfNotNull (OwnedArray<AudioIODeviceType>& list, AudioIODeviceType* const device)
 {
@@ -470,6 +490,11 @@ String AudioDeviceManager::initialiseFromXML (const XmlElement& xml,
 
 void AudioDeviceManager::openLastRequestedMidiDevices (const Array<MidiDeviceInfo>& desiredInputs, const MidiDeviceInfo& defaultOutput)
 {
+    // PATCHED (expo-juce): restoring MIDI devices from saved state means the
+    // host does want MIDI, so subscribe now. Re-entry from
+    // midiDeviceListChanged() is a no-op once the connection exists.
+    ensureMidiDeviceListConnection();
+
     const auto openDeviceIfAvailable = [&] (const Array<MidiDeviceInfo>& devices,
                                             const MidiDeviceInfo& deviceToOpen,
                                             auto&& doOpen)
@@ -1116,6 +1141,8 @@ double AudioDeviceManager::getCpuUsage() const
 //==============================================================================
 void AudioDeviceManager::setMidiInputDeviceEnabled (const String& identifier, bool enabled)
 {
+    ensureMidiDeviceListConnection();
+
     if (enabled != isMidiInputDeviceEnabled (identifier))
     {
         if (enabled)
@@ -1149,6 +1176,8 @@ bool AudioDeviceManager::isMidiInputDeviceEnabled (const String& identifier) con
 
 void AudioDeviceManager::addMidiInputDeviceCallback (const String& identifier, MidiInputCallback* callbackToAdd)
 {
+    ensureMidiDeviceListConnection();
+
     removeMidiInputDeviceCallback (identifier, callbackToAdd);
 
     if (identifier.isEmpty() || isMidiInputDeviceEnabled (identifier))
@@ -1187,6 +1216,8 @@ void AudioDeviceManager::handleIncomingMidiMessageInt (MidiInput* source, const 
 //==============================================================================
 void AudioDeviceManager::setDefaultMidiOutputDevice (const String& identifier)
 {
+    ensureMidiDeviceListConnection();
+
     if (defaultMidiOutputDeviceInfo.identifier != identifier)
     {
         std::unique_ptr<MidiOutput> oldMidiPort;
