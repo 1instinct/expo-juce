@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, '@aaron.smulktis/develop']
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  js:
+    name: Build and pack
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # `prepare` runs expo-module build, so this also type-checks src/ into build/.
+      # No lint step yet: .eslintrc.js is CommonJS in a "type": "module" package and
+      # `prepare` regenerates it, so `npm run lint` can't load its config.
+      - run: npm ci
+      - name: Check the package contents
+        run: |
+          npm pack --dry-run --json --ignore-scripts | sed -n '/^\[/,$p' > pack.json  # prepare still logs to stdout
+          node -e '
+            const files = require("./pack.json")[0].files.map(f => f.path);
+            const need = ["build/index.js", "build/index.d.ts", "ios/ExpoJuce.podspec",
+                          "ios/juce_modules/juce_core/juce_core.h", "expo-module.config.json"];
+            const missing = need.filter(p => !files.includes(p));
+            if (missing.length) { console.error("missing from tarball:", missing); process.exit(1); }
+            console.log(files.length + " files in tarball");
+          '
+
+  harness:
+    name: Offline audio harness
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install JUCE Linux dev headers
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends ninja-build ccache \
+            libfreetype-dev libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-harness-${{ github.sha }}
+          restore-keys: ccache-harness-
+      # The harness compiles the engine sources from `git show HEAD:ios/...`, i.e. the checked-out commit.
+      - name: Build
+        run: |
+          cmake -S test/harness -B test/harness/build -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build test/harness/build
+      - name: Run
+        run: ./test/harness/build/harness
