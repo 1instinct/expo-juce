@@ -1,6 +1,6 @@
 {
   "name": "expo-juce",
-  "version": "0.8.0-rc.6",
+  "version": "0.9.0-rc.0",
   "description": "Realtime DSP w/C++ & JUCE",
   "type": "module",
   "main": "build/index.js",
@@ -9,8 +9,11 @@
     "build/",
     "ios/",
     "android/build.gradle",
+    "android/CMakeLists.txt",
+    "android/proguard-rules.pro",
     "android/src/",
-    "expo-module.config.json"
+    "expo-module.config.json",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "build": "expo-module build",
@@ -21,6 +24,7 @@
     "prepublishOnly": "expo-module prepublishOnly",
     "expo-module": "expo-module",
     "check:headers": "node test/check-podspec-headers.cjs",
+    "check:juce-patches": "node test/check-juce-patches.cjs",
     "download-juce": "node src/scripts/bundle-juce.js",
     "vendor-juce": "node src/scripts/vendor-juce.cjs",
     "open:ios": "xed example/ios",
@@ -37,7 +41,7 @@
     "url": "https://github.com/1instinct/expo-juce/issues"
   },
   "author": "1instinct (https://github.com/1instinct)",
-  "license": "MIT",
+  "license": "MIT AND (AGPL-3.0-only OR LicenseRef-JUCE-8-EULA)",
   "homepage": "https://github.com/1instinct/expo-juce#readme",
   "devDependencies": {
     "@types/adm-zip": "^0.5.5",

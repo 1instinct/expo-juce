@@ -522,7 +522,7 @@ private:
     // -> MIDIClientCreate(). On a cold CoreMIDI that call blocks on a
     // synchronous XPC handshake with midiserver for seconds, and because JUCE
     // requires MIDI calls on the message thread it blocked the main thread and
-    // tripped Sentry's App Hanging monitor (BEEPER-BUZZ-B).
+    // tripped the app's hang monitor.
     //
     // A default-constructed MidiDeviceListConnection is documented as inactive
     // and touches nothing, so hosts that never use MIDI (this one only uses

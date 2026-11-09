@@ -14,7 +14,7 @@ import type {
   MetronomeOptions,
 } from './ExpoJuce.types';
 
-// The native module (ios/ExpoJuceModule.swift). Functions added after 0.5.0 are optional,
+// The native module (ios/ExpoJuceModule.swift; android/src/main/java/expo/modules/juce/ExpoJuceModule.kt). Functions added after 0.5.0 are optional,
 // because an older binary does not export them: callers check `typeof fn === 'function'`.
 export type ExpoJuceNativeModule = {
   PI: number;
