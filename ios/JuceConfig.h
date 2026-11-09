@@ -76,7 +76,13 @@
 #define JUCE_ALSA 0
 #define JUCE_JACK 0
 #define JUCE_BELA 0
+// Android: JUCE's vendored Oboe (AAudio, OpenSL ES fallback inside Oboe) is the audio backend.
+// JUCE's own OpenSL ES device stays off (the two cannot be enabled together). Apple builds keep both off.
+#if defined(__ANDROID__)
+#define JUCE_USE_ANDROID_OBOE 1
+#else
 #define JUCE_USE_ANDROID_OBOE 0
+#endif
 #define JUCE_USE_ANDROID_OPENSLES 0
 #define JUCE_USE_WINRT_MIDI 0
 #define JUCE_DISABLE_AUDIO_MIXING_WITH_OTHER_APPS 0
