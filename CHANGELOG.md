@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.0-rc.0
+
+### Added
+
+- **Android audio (first slice).** The Android module now builds the engine with the NDK (JUCE 8 +
+  its vendored Oboe + the engine units shared with iOS) and plays through JUCE's Oboe device:
+  `setup` / `shutdown`, notes, the nine synth setters, `playTestTone` and `getDiagnostics`.
+  The rest of the API is present with the iOS defaults shape (setters return `false`, getters
+  return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` and
+  `isJucePadViewAvailable()` are `false`). See the README's Android section.
+- `getDiagnostics()` on Android: `platform`, `nativeSampleRate`, `xrunCount`.
+- `npm run check:juce-patches`: the patched vendored JUCE files equal pristine 8.0.1 plus
+  `src/scripts/juce-patches.cjs`. The lazy MIDI device-list connection (0.8.0-rc.4) is now one of
+  those patches, so a re-vendor keeps it.
+- Harness: `host_test`, the Android host against a fake Oboe-like device.
+
+### Unchanged
+
+- iOS: the only shared-source change is `ios/JuceConfig.h` enabling Oboe under `__ANDROID__`.
+
 ## 0.8.0-rc.3
 
 ### Added

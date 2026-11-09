@@ -375,4 +375,10 @@ export type AudioDiagnostics = {
   otherAudioPlaying: boolean;
   /** AVAudioSession current route output port types. */
   routeOutputs: string[];
+  /** "android" on Android (0.9.0+); absent on iOS. The AVAudioSession fields above are iOS-only: empty / zero on Android. */
+  platform?: 'android';
+  /** Android: the device's native output sample rate (Hz) the engine asked for; 0 = unknown (0.9.0+). */
+  nativeSampleRate?: number;
+  /** Android: output underruns reported by the audio stream since it opened; -1 = unknown (0.9.0+). */
+  xrunCount?: number;
 };

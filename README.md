@@ -5,7 +5,9 @@ Realtime DSP w/C++ & JUCE
 expo-juce embeds [JUCE](https://juce.com) 8 in an Expo / React Native app as an Expo
 module: a JUCE-owned audio device drives an `AudioProcessorGraph` with an 8-voice
 polyphonic synth and a transport, controlled from JS through synchronous JSI calls.
-iOS only for now; the Android and web modules are scaffolds.
+iOS is complete. Android (0.9.0+) is being ported: notes, the synth parameters, the test tone
+and diagnostics play through JUCE's Oboe device; the rest of the API exists on Android but is not
+implemented yet (see [Android](#android-090)). The web module is a stub.
 
 > **Branches.** `main` is a stale scaffold. Current work is on `@aaron.smulktis/develop`;
 > the diagnostics and latency work is on `debug/audio-diagnostics`.
@@ -444,6 +446,33 @@ again after all had been removed (removing the last listener no longer drops the
 Synth settings, effect, metronome and backing-track settings (and the loaded track) and transport state (tempo, position, playing) survive the
 engine's automatic rebuilds after a media-services reset or a stalled device; held notes do not.
 
+### Android (0.9.0+)
+
+The Android module builds the same engine (`ios/*.mm` engine units, the vendored JUCE and its
+Oboe) into `libexpojuce.so` with the NDK (`android/CMakeLists.txt`, run by Gradle's
+`externalNativeBuild`). It plays through JUCE's Oboe device (AAudio, or OpenSL ES on devices
+without it), output only, so no microphone permission is involved.
+
+| | Android 0.9.0 |
+|---|---|
+| `setup` / `shutdown`, `noteOn` / `noteOff` / `allNotesOff`, the nine synth setters, `playTestTone`, `getDiagnostics` | implemented |
+| effects, metronome / backing track, analysis, arpeggiator, drums, transport, beat events | present, not implemented: setters return `false` (nothing applied), getters return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` is `false` |
+| `JucePadView` | not available: `isJucePadViewAvailable()` is `false` |
+
+Differences from iOS:
+
+- The engine prefers the device's native output sample rate (`nativeSampleRate` in
+  diagnostics) over `setup({ sampleRate })`, so the stream is not resampled; `sampleRate` reports
+  the rate in use. The buffer is the nearest size the device lists to `bufferSize`, and at least
+  two of the device's bursts.
+- Diagnostics add `platform: 'android'`, `nativeSampleRate` and `xrunCount`; the
+  AVAudioSession fields are empty or zero.
+- No audio-focus handling, interruption recovery or engine rebuilds yet.
+
+Build requirements: the app's NDK (`ndkVersion` from the root project, 27.1.12297006 if unset),
+CMake (Gradle's default), and the ABIs in `reactNativeArchitectures`. The library uses
+`libc++_shared.so` like React Native, and is 16 KB page aligned.
+
 ## Latency
 
 Budget < 40 ms touch-to-sound, target ≤ 25 ms. Baseline on iPhone 16 Pro speaker: 48 kHz,
@@ -460,7 +489,7 @@ expo-juce/
 ├── src/                     # TypeScript API (index.ts, ExpoJuce.types.ts), web stub, JUCE vendoring scripts
 ├── ios/                     # Swift module, ObjC bridge, ObjC++ engine, JuceModule_*.mm, podspec
 │   └── juce_modules/        # Vendored JUCE 8.0.1 modules
-├── android/                 # Kotlin scaffold (no audio engine yet)
+├── android/                 # Kotlin module, JNI + Android host (src/main/cpp), CMakeLists.txt
 ├── test/harness/            # Offline JUCE graph harness (WSL, CMake)
 ├── example/                 # Old example app (Expo 51, pinned expo-juce 0.1.1) — stale
 ├── docs/
@@ -501,15 +530,23 @@ cannot resolve `file:` dependencies, which is why every native change goes throu
    ```
    See [test/harness/README.md](test/harness/README.md) (case `g2` is an expected-FAIL negative
    control). Extend it for every new graph node.
-3. **ObjC++ / Swift:** careful review (no compiler locally); the EAS build is the first compile.
-4. **Device:** a diagnostics panel built on `getDiagnostics()`
+3. **Android host + NDK:** `./build/host_test` (same directory) runs the Android host against a
+   fake Oboe-like device. The native library also builds with the NDK directly, without Gradle:
+   ```sh
+   cmake -S android -B build-android -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release
+   cmake --build build-android -j16
+   ```
+4. **ObjC++ / Swift / Kotlin:** careful review (no compiler locally); the EAS build is the first compile.
+5. **Device:** a diagnostics panel built on `getDiagnostics()`
    ([docs/latency.md](docs/latency.md#5-a-diagnostics-panel)), then the slow-motion
    measurement in [docs/latency.md](docs/latency.md#6-slow-motion-measurement-procedure).
 
 ### JUCE vendoring
 
 `npm run download-juce` fetches JUCE 8.0.1 into `JUCE/` and `npm run vendor-juce` copies the needed modules into
-`ios/juce_modules` (stripping tests, demos and non-iOS code). Each JUCE module is compiled as
+`ios/juce_modules` (stripping tests and demos; the Android sources stay, the Android build uses them)
+and applies the local patches in `src/scripts/juce-patches.cjs`. `npm run check:juce-patches` checks
+that every patched vendored file equals pristine JUCE 8.0.1 plus those patches. Each JUCE module is compiled as
 its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the module flags and
 `JUCE_STANDALONE_APPLICATION 0`.
 
