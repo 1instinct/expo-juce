@@ -470,6 +470,8 @@ Differences from iOS:
   dropped.
 - Diagnostics add `platform: 'android'`, `nativeSampleRate`, `xrunCount`, `backgrounded`,
   `backgroundStops` and `foregroundRestarts`; the AVAudioSession fields are empty or zero.
+- If the native library cannot be loaded, the getters still return their full default shapes and
+  `getDiagnostics()` reports `isReady: false`, `engineState: 'failed'` and the reason in `lastError`.
 - No audio-focus handling, interruption recovery or engine rebuilds yet.
 
 Build requirements: the app's NDK (`ndkVersion` from the root project, 27.1.12297006 if unset),

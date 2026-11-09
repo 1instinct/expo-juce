@@ -11,6 +11,8 @@
   return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` and
   `isJucePadViewAvailable()` are `false`). See the README's Android section.
 - Android closes the audio device while the app is in the background and reopens it on return.
+- If the Android native library cannot be loaded, the getters return the same shapes as when it is
+  (generated `DefaultShapes.kt`, checked by the harness), with `lastError` saying why.
 - `getDiagnostics()` on Android: `platform`, `nativeSampleRate`, `xrunCount`, `backgrounded`,
   `backgroundStops`, `foregroundRestarts`.
 - `npm run check:juce-patches`: the patched vendored JUCE files equal pristine 8.0.1 plus

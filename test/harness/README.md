@@ -20,7 +20,13 @@ module returns (every `AudioDiagnostics` key, effects / arp / drums / analysis d
 with no device (fails at step 4, `engineState` "failed"), setup off the message thread (refused),
 the native rate preferred over the requested one, the buffer (nearest listed size, at least two
 bursts), a held note reaching the device output, note-off / allNotesOff / notes from another
-thread, the test tone, and shutdown + setup again. Exit code non-zero on any failure.
+thread, the test tone, going to the background and back (device closed and reopened, held notes
+released, a new note still reaching the output), and shutdown + setup again. It also checks that
+`android/src/main/java/expo/modules/juce/DefaultShapes.kt` (the shapes the Kotlin module returns
+when the native library cannot be loaded) matches the host's JSON before setup; after changing
+those shapes, regenerate it from the repo root with
+`test/harness/build/host_test --write-defaults android/src/main/java/expo/modules/juce/DefaultShapes.kt`.
+Exit code non-zero on any failure.
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
   `FxChainProcessor`) are taken from `git show HEAD:ios/...`; pass `-DHARNESS_GIT_REF=WORKTREE`

@@ -10,7 +10,8 @@ import org.json.JSONObject
 /**
  * The native library (android/CMakeLists.txt: JUCE + Oboe + the engine) and its JNI entry points
  * (src/main/cpp/ExpoJuceJni.cpp). Loading is lazy and never throws: if the library cannot be
- * loaded, every call reports "not ready" and [loadError] says why.
+ * loaded, every call reports "not ready", [loadError] says why, and the getters return the same
+ * shapes as the loaded path ([DefaultShapes]), so readers never see missing keys.
  */
 internal object ExpoJuceNative {
   private const val TAG = "ExpoJuce"
@@ -77,8 +78,38 @@ internal object ExpoJuceNative {
     return result
   }
 
-  private fun stateMap(which: State): Map<String, Any?> =
-    if (isLoaded) jsonToMap(nativeStateJson(which.ordinal)) else emptyMap()
+  // The native shape, or the generated default if the library is missing or its JSON is unusable.
+  private fun stateMap(which: State): Map<String, Any?> {
+    val native = if (isLoaded) jsonToMap(nativeStateJson(which.ordinal)) else emptyMap()
+    return native.ifEmpty { jsonToMap(defaultJson(which)) }
+  }
+
+  private fun defaultJson(which: State): String = when (which) {
+    State.EFFECTS -> DefaultShapes.EFFECTS
+    State.ARPEGGIATOR -> DefaultShapes.ARPEGGIATOR
+    State.DRUMS -> DefaultShapes.DRUMS
+    State.ANALYSIS -> DefaultShapes.ANALYSIS
+  }
+
+  // ── Diagnostics ──
+
+  private val defaultDiagnostics: Map<String, Any?> by lazy { jsonToMap(DefaultShapes.DIAGNOSTICS) }
+
+  /**
+   * getDiagnostics(): the native diagnostics, or, if the library is missing (or returned nothing
+   * usable), the not-set-up shape with isReady false, engineState "failed" and lastError set.
+   */
+  fun diagnostics(): Map<String, Any?> {
+    if (isLoaded) {
+      val native = jsonToMap(nativeDiagnosticsJson())
+      if (native.isNotEmpty()) return native
+    }
+    val result = LinkedHashMap(defaultDiagnostics)
+    result["isReady"] = false
+    result["engineState"] = "failed"
+    result["lastError"] = loadError ?: "the native library returned no diagnostics"
+    return result
+  }
 
   // ── JSON from the native side → maps / lists for the module's return values ──
 

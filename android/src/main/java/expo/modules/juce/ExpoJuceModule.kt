@@ -85,13 +85,7 @@ class ExpoJuceModule : Module() {
 
     // ── Diagnostics ────────────────────────────────────────────────
 
-    Function("getDiagnostics") {
-      if (ExpoJuceNative.isLoaded) {
-        ExpoJuceNative.jsonToMap(ExpoJuceNative.nativeDiagnosticsJson())
-      } else {
-        unloadedDiagnostics()
-      }
-    }
+    Function("getDiagnostics") { ExpoJuceNative.diagnostics() }
 
     Function("playTestTone") { durationMs: Double ->
       ExpoJuceNative.isLoaded && ExpoJuceNative.nativePlayTestTone(durationMs)
@@ -203,44 +197,6 @@ class ExpoJuceModule : Module() {
   private fun synthParam(param: ExpoJuceNative.SynthParam, value: Double) {
     if (ExpoJuceNative.isLoaded) ExpoJuceNative.nativeSetSynthParam(param.ordinal, value)
   }
-
-  private fun unloadedDiagnostics(): Map<String, Any?> = mapOf(
-    "platform" to "android",
-    "isReady" to false,
-    "setupStep" to -1,
-    "lastError" to (ExpoJuceNative.loadError ?: ""),
-    "engineState" to "failed",
-    "deviceName" to "",
-    "deviceType" to "",
-    "sampleRate" to 0.0,
-    "bufferSize" to 0,
-    "outputLatencySamples" to 0,
-    "callbackCount" to 0.0,
-    "graphProcessCount" to 0.0,
-    "synthProcessCount" to 0.0,
-    "outputPeak" to 0.0,
-    "synthPeak" to 0.0,
-    "nanCount" to 0.0,
-    "toneSamplesMixed" to 0.0,
-    "notesQueued" to 0.0,
-    "notesConsumed" to 0.0,
-    "notesDropped" to 0.0,
-    "activeVoices" to 0,
-    "lastNoteToRenderMs" to -1.0,
-    "lastTouchToRenderMs" to -1.0,
-    "preferredBufferSize" to 0,
-    "preferredSampleRate" to 0.0,
-    "sessionReassertCount" to 0,
-    "interruptionCount" to 0,
-    "mediaResetCount" to 0,
-    "lastRecoveryError" to "",
-    "sessionCategory" to "",
-    "sessionSampleRate" to 0.0,
-    "sessionIOBufferMs" to 0.0,
-    "sessionOutputLatencyMs" to 0.0,
-    "otherAudioPlaying" to false,
-    "routeOutputs" to emptyList<String>()
-  )
 
   private companion object {
     // A finite number from the JS options object, or null.
