@@ -16,6 +16,13 @@
   those patches, so a re-vendor keeps it.
 - Harness: `host_test`, the Android host against a fake Oboe-like device.
 
+### Changed
+
+- **Licensing is stated in full.** Added `LICENSE` (MIT, for expo-juce's own code) and
+  `THIRD_PARTY_NOTICES.md` (JUCE 8: the JUCE licence or AGPLv3; Oboe: Apache 2.0; libFLAC: BSD).
+  `package.json` `license` is now `MIT AND (AGPL-3.0-only OR LicenseRef-JUCE-8-EULA)`, and both
+  files ship in the package. No code change.
+
 ### Unchanged
 
 - iOS: the only shared-source change is `ios/JuceConfig.h` enabling Oboe under `__ANDROID__`.
