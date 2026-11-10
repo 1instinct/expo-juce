@@ -16,9 +16,6 @@ git push origin HEAD v0.9.0-rc.1
 
 ## npm auth (one-time)
 
-Use one of these:
-
-1. **Trusted publishing (preferred, no secret).** On npmjs.com, open `expo-juce` → Settings → Trusted publishing and add GitHub Actions with organization `1instinct`, repository `expo-juce` and workflow `publish.yml`. Leave the environment empty.
-2. **Token.** Create a granular access token with read/write on `expo-juce` and add it as the repo secret `NPM_TOKEN`.
+Publishing uses npm trusted publishing (OIDC), with no token or secret. On npmjs.com, `expo-juce` → Settings → Trusted publishing lists GitHub Actions with organization `1instinct`, repository `expo-juce` and workflow `publish.yml`, with the environment left empty. Those values have to match exactly; npm only checks them at publish time and fails with `ENEEDAUTH` or `E404`.
 
 The repo is private, so npm provenance attestations aren't generated.

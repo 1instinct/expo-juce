@@ -24,7 +24,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           cache: npm
       - name: Use npm with trusted publishing (11.5.1+)
         run: |
@@ -52,12 +51,11 @@ jobs:
 
       - run: npm ci
 
-      # Auth: npm trusted publishing (OIDC) when it is set up for this workflow on npmjs.com,
-      # otherwise the NPM_TOKEN repo secret (an automation / granular token).
+      # Auth: npm trusted publishing (OIDC), set up for this workflow on npmjs.com. No token and
+      # no setup-node registry-url: a configured (even placeholder) token can bypass the OIDC exchange.
+      # --loglevel verbose prints the OIDC exchange, so a misconfigured publisher shows its reason.
       - name: Publish
-        run: npm publish --access public --tag "${{ steps.version.outputs.dist_tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --tag "${{ steps.version.outputs.dist_tag }}" --loglevel verbose
 
       - name: GitHub release
         run: |
