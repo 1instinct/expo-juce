@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.9.0-rc.0
+
+### Added
+
+- **Android audio (first slice).** The Android module now builds the engine with the NDK (JUCE 8 +
+  its vendored Oboe + the engine units shared with iOS) and plays through JUCE's Oboe device:
+  `setup` / `shutdown`, notes, the nine synth setters, `playTestTone` and `getDiagnostics`.
+  The rest of the API is present with the iOS defaults shape (setters return `false`, getters
+  return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` and
+  `isJucePadViewAvailable()` are `false`). See the README's Android section.
+- Android closes the audio device while the app is in the background and reopens it on return.
+- If the Android native library cannot be loaded, the getters return the same shapes as when it is
+  (generated `DefaultShapes.kt`, checked by the harness), with `lastError` saying why.
+- `getDiagnostics()` on Android: `platform`, `nativeSampleRate`, `xrunCount`, `backgrounded`,
+  `backgroundStops`, `foregroundRestarts`.
+- `npm run check:juce-patches`: the patched vendored JUCE files equal pristine 8.0.1 plus
+  `src/scripts/juce-patches.cjs`. The lazy MIDI device-list connection (0.8.0-rc.4) is now one of
+  those patches, so a re-vendor keeps it.
+- Harness: `host_test`, the Android host against a fake Oboe-like device.
+
+### Changed
+
+- **Licensing is stated in full.** Added `LICENSE` (MIT, for expo-juce's own code) and
+  `THIRD_PARTY_NOTICES.md` (JUCE 8: the JUCE licence or AGPLv3; Oboe: Apache 2.0; libFLAC: BSD).
+  `package.json` `license` is now `MIT AND (AGPL-3.0-only OR LicenseRef-JUCE-8-EULA)`, and both
+  files ship in the package. No code change.
+
+### Unchanged
+
+- iOS: the only shared-source change is `ios/JuceConfig.h` enabling Oboe under `__ANDROID__`.
+
+## 0.8.0-rc.3
+
+### Added
+
+- **Backing tracks follow the tempo.** `loadBackingTrack(uri, gapless, { sourceBpm })` takes the
+  file's own tempo. The track then follows the transport tempo at its own pitch (time stretch,
+  WSOLA over the resident buffer: two read heads at normal speed, a 20 ms crossfade, each new
+  head placed by the transport beat and moved up to 10 ms to the place that best continues the
+  sound). Every beat of the track stays on the transport's beat: a click lands within about 10 ms
+  of it between 0.8× and 1.25× (offline harness, real music), errors never add up, and a tempo
+  change while playing holds from the next grain. Seeks, starts and resumes map onto the track's
+  own beat grid. No allocation and no lock on the audio thread.
+- `BackingTrackInfo.sourceBpm`: the tempo the track follows from (0 if none). `getDiagnostics()`:
+  `backingTrackTempoRatio` (transport tempo / track tempo, 1 = untouched).
+- Harness case `btf`.
+
+### Unchanged
+
+- At exactly its own tempo a track is the file, sample for sample (no stretch runs), and a track
+  loaded without `sourceBpm` plays as before: at its own speed whatever the tempo.
+
+### Compatibility
+
+- The tempo travels inside the `gapless` dictionary, so the native signature is unchanged: this
+  JS on an older binary loads the track as before (no stretch), and `sourceBpm` is then missing
+  from the result. Use its presence, not `typeof`, to tell whether the binary follows the tempo.
+
 ## 0.8.0-rc.2
 
 ### Added

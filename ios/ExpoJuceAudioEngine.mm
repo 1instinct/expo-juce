@@ -3,6 +3,7 @@
 #include "JuceConfig.h"
 #import "ExpoJuceAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMIDI/CoreMIDI.h>
 #import <UIKit/UIKit.h>
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
@@ -42,6 +43,9 @@ static const int64_t kRebuildRetryDelayMs = 1000;
 static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt + 2 retries, then "failed"
 
 @interface ExpoJuceAudioEngine ()
+// Absorbs CoreMIDI's one-time XPC initialisation on a background queue so it
+// cannot block the main thread later. See the definition for why.
++ (void)warmCoreMidiOffMainThread;
 @property (nonatomic, assign) bool isReady;
 @property (nonatomic, readwrite) int setupStep;
 @property (atomic, readwrite, copy) NSString *lastError;
@@ -246,8 +250,35 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 [[ExpoJuceAudioEngine sharedInstance] scheduleBackingTrackCollect];
             });
         });
+        [ExpoJuceAudioEngine warmCoreMidiOffMainThread];
     }
     return self;
+}
+
+// The first CoreMIDI call in a process pays for MIDIProcessXPC::InitOnce — a
+// synchronous XPC handshake that launches midiserver and can take seconds. JUCE
+// requires its MIDI calls on the message thread, so when that cost lands on a
+// MIDI call it blocks the main thread.
+//
+// That initialisation is process-global and not thread-affine, so touching any
+// cheap CoreMIDI query from a background queue first absorbs the cost there.
+// Afterwards MIDIProcess::CheckInitialization on the main thread finds the
+// connection already up and returns immediately.
+//
+// This is belt-and-braces: with midiDeviceListConnection now made lazily (see
+// juce_AudioDeviceManager.h), a host that never uses MIDI devices never calls
+// into CoreMIDI at all. This keeps the main thread clear for when one does —
+// e.g. BLE MIDI. If the warm-up has not finished by then, behaviour is exactly
+// what it is today, so this can only help.
++ (void)warmCoreMidiOffMainThread {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            // Return value deliberately unused; the call is made for the
+            // initialisation it forces, not the count.
+            (void)MIDIGetNumberOfSources();
+        });
+    });
 }
 
 - (BOOL)setup {
@@ -919,7 +950,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     int activeVoices = 0;
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
     double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
-    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0;
+    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0, backingTrackTempoRatio = 1.0;
     double drumPeak = 0.0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
@@ -960,6 +991,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
             if (AuxProcessor* aux = ready ? sAux : nullptr) {
                 metronomeClicks = (double)aux->diag.clicks.load(relaxed);
                 backingTrackPositionSec = aux->diag.trackPositionSec.load(relaxed);
+                backingTrackTempoRatio = aux->diag.trackTempoRatio.load(relaxed);
             }
         }
     }
@@ -999,6 +1031,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"metronomeClicks"] = @(metronomeClicks);
     d[@"backingTrackLoaded"] = @(sBackingTrack.hasTrack() ? YES : NO);
     d[@"backingTrackPositionSec"] = @(backingTrackPositionSec);
+    d[@"backingTrackTempoRatio"] = @(backingTrackTempoRatio);
     // Drum hits the engine has started (cumulative since launch, from the process-lifetime queue).
     d[@"drumHits"] = @((double)sNoteQueue.drumHitsConsumed.load(std::memory_order_relaxed));
     d[@"drumPeak"] = @(drumPeak);
@@ -1191,6 +1224,8 @@ static NSString *backingTrackPath(NSString *uri) {
             source.gapless.trailingSamples = trailing.longLongValue;
             source.hasGapless = source.gapless.loopSamples > 0;
         }
+        // The file's own tempo rides in the same dictionary (older binaries ignore the key).
+        if (NSNumber *bpm = numberFrom(gapless, @"sourceBpm")) source.sourceBpm = bpm.doubleValue;
     }
     // A newer load or an unload supersedes this one (checked while decoding and before publishing).
     const uint64_t generation = sBackingTrack.beginLoad();
@@ -1222,6 +1257,7 @@ static NSString *backingTrackPath(NSString *uri) {
             @"decodedSamples": @((double)info.decodedSamples),
             @"regionRule": [NSString stringWithUTF8String:backingTrackRegionRuleName(info.regionRule)],
             @"decoder": [NSString stringWithUTF8String:info.formatName.c_str()] ?: @"",
+            @"sourceBpm": @(info.sourceBpm),
         }, nil, nil);
     });
 }

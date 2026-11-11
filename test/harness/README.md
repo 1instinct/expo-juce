@@ -10,8 +10,23 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, an, arp, arpv, sp, dr, drs, drb, drm, drd)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd)
 ```
+
+`./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
+same git ref rule) on Linux: JUCE's Android device is replaced by a fake device type that renders
+from its own thread in 96-frame bursts, like an Oboe stream. It checks the JSON shapes the Kotlin
+module returns (every `AudioDiagnostics` key, effects / arp / drums / analysis defaults), a setup
+with no device (fails at step 4, `engineState` "failed"), setup off the message thread (refused),
+the native rate preferred over the requested one, the buffer (nearest listed size, at least two
+bursts), a held note reaching the device output, note-off / allNotesOff / notes from another
+thread, the test tone, going to the background and back (device closed and reopened, held notes
+released, a new note still reaching the output), and shutdown + setup again. It also checks that
+`android/src/main/java/expo/modules/juce/DefaultShapes.kt` (the shapes the Kotlin module returns
+when the native library cannot be loaded) matches the host's JSON before setup; after changing
+those shapes, regenerate it from the repo root with
+`test/harness/build/host_test --write-defaults android/src/main/java/expo/modules/juce/DefaultShapes.kt`.
+Exit code non-zero on any failure.
 
 - Engine sources (`Voice`, `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `BackingTrack`, `AuxProcessor`,
   `FxChainProcessor`) are taken from `git show HEAD:ios/...`; pass `-DHARNESS_GIT_REF=WORKTREE`
@@ -35,7 +50,20 @@ cmake -S . -B build && cmake --build build -j16 && ./build/harness
   top sample-exact, loops, seeks with `setPosition` to beat × 60 / bpm, starts mid-bar at the
   beat's position, pause + resume continues where it stopped, stops, plays once without loop,
   is decoded again from its file after a device-rate change), `btt` (a tempo ramp 120 → 124 bpm
-  while playing leaves the track sample-continuous), `bsf` (replacing and unloading the track
+  while playing leaves a track without a source tempo sample-continuous), `btf` (a track with a
+  source tempo follows the transport: clicks on every beat stay within 20 ms of the transport's
+  beats with no drift over three loops at 0.8–1.5×, 44.1 and 48 kHz; a tempo change 120 → 90 while
+  playing holds; 55 / 220 / 1760 Hz sines keep their pitch within 0.5%, their level within 10%
+  and no step above the sine's own; at the track's own tempo the output equals a track without a
+  tempo sample for sample, and back at its own tempo it is sample-exact on the grid; seeks and
+  pause + resume land on the track's grid; stretched seek / swap / stop are declicked and the old
+  buffer is freed; loop off is silent after one pass; `load()` and a rate reload keep the tempo,
+  nonsense means unknown; 0.0007× realtime; the 124 bpm MP3 fixture with a click on every beat at
+  123 / 100 / 150 bpm: clicks within 12 ms of their beats, median within 7 ms, 20 ms at 70 bpm;
+  level per beat within 1.5 dB; from beat 0 below its tempo, and after a count-in from beat -4
+  with loop off and back on after bar 1, the loop's tail never bleeds into bar 1; a swap to a track
+  without a tempo mid-stretch plays plainly after its fade; loop toggled mid-stretch keeps the sound
+  going with no step; 0 allocations), `bsf` (replacing and unloading the track
   while it plays are crossfaded, never a step above one fade increment; the old buffer survives
   `collect()` until its fade-out ends), `btr` (loop-region rule on all its cases; decodes
   `fixtures/loop-124bpm-44k.mp3` with JUCE's MP3 decoder, prints which length it yields and

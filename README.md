@@ -5,7 +5,9 @@ Realtime DSP w/C++ & JUCE
 expo-juce embeds [JUCE](https://juce.com) 8 in an Expo / React Native app as an Expo
 module: a JUCE-owned audio device drives an `AudioProcessorGraph` with an 8-voice
 polyphonic synth and a transport, controlled from JS through synchronous JSI calls.
-iOS only for now; the Android and web modules are scaffolds.
+iOS is complete. Android (0.9.0+) is being ported: notes, the synth parameters, the test tone
+and diagnostics play through JUCE's Oboe device; the rest of the API exists on Android but is not
+implemented yet (see [Android](#android-090)). The web module is a stub.
 
 > **Branches.** `main` is a stale scaffold. Current work is on `@aaron.smulktis/develop`;
 > the diagnostics and latency work is on `debug/audio-diagnostics`.
@@ -188,6 +190,8 @@ const info = await ExpoJuce.loadBackingTrack(fileUri, {   // gapless info: optio
   loopSamples: 682839, leadingSamples: 4561, trailingSamples: 1496,
 });
 // { durationSec, sampleRate, channels, loopStartSample, loopSamples, decodedSamples, regionRule, decoder }
+// or, with the file's own tempo (0.8.0-rc.3+), it follows the transport tempo:
+// await ExpoJuce.loadBackingTrack(fileUri, gapless, { sourceBpm: 124 });
 ExpoJuce.setBackingTrackOptions({ level: 0.8, loop: true, enabled: true });
 ExpoJuce.startTransport();                                 // the track and the clicks start
 ExpoJuce.unloadBackingTrack();
@@ -226,8 +230,17 @@ ExpoJuce.unloadBackingTrack();
 - **Playback** follows the transport. Track sample 0 is beat 0: when the transport starts or
   is moved (`setTransportPosition`), the track goes to beat × 60 / bpm seconds (modulo its
   length when looping), so pause + resume continues where it stopped and seeks land on the
-  beat grid. While playing, the track simply advances with the audio: a tempo change does not
-  move or stretch it (it keeps its own speed). Starts away from the top, seeks, stops, and
+  beat grid. Without a `sourceBpm`, bpm is the transport's and the track simply advances with
+  the audio: a tempo change does not move or stretch it (it keeps its own speed).
+- **Following the tempo** (0.8.0-rc.3+): with `loadBackingTrack(uri, gapless, { sourceBpm })`,
+  bpm above is the track's own tempo and the track follows the transport tempo at its own pitch
+  (WSOLA: two read heads at normal speed crossfade every 20 ms; each new head starts where the
+  transport beat says the track should be and moves up to 10 ms to continue the sound best).
+  Its beats stay on the transport's: within about 10 ms between 0.8× and 1.25×, never adding
+  up, and a tempo change while playing holds at once. Far from its tempo (towards half or
+  double speed) transients smear and repeat more. At exactly its own tempo there is no stretch:
+  the file plays sample for sample. The result's `sourceBpm` says what the binary took (absent
+  before 0.8.0-rc.3); `getDiagnostics().backingTrackTempoRatio` is transport / track tempo. Starts away from the top, seeks, stops, and
   replacing or unloading the track while it plays are crossfaded over 5 ms. With `loop` off it
   plays once and then stays silent until the transport is moved back.
 - Options: `level` 0–1 (0.8), `loop` (true), `enabled` (true).
@@ -433,6 +446,38 @@ again after all had been removed (removing the last listener no longer drops the
 Synth settings, effect, metronome and backing-track settings (and the loaded track) and transport state (tempo, position, playing) survive the
 engine's automatic rebuilds after a media-services reset or a stalled device; held notes do not.
 
+### Android (0.9.0+)
+
+The Android module builds the same engine (`ios/*.mm` engine units, the vendored JUCE and its
+Oboe) into `libexpojuce.so` with the NDK (`android/CMakeLists.txt`, run by Gradle's
+`externalNativeBuild`). It plays through JUCE's Oboe device (AAudio, or OpenSL ES on devices
+without it), output only, so no microphone permission is involved.
+
+| | Android 0.9.0 |
+|---|---|
+| `setup` / `shutdown`, `noteOn` / `noteOff` / `allNotesOff`, the nine synth setters, `playTestTone`, `getDiagnostics` | implemented |
+| effects, metronome / backing track, analysis, arpeggiator, drums, transport, beat events | present, not implemented: setters return `false` (nothing applied), getters return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` is `false` |
+| `JucePadView` | not available: `isJucePadViewAvailable()` is `false` |
+
+Differences from iOS:
+
+- The engine prefers the device's native output sample rate (`nativeSampleRate` in
+  diagnostics) over `setup({ sampleRate })`, so the stream is not resampled; `sampleRate` reports
+  the rate in use. The buffer is the nearest size the device lists to `bufferSize`, and at least
+  two of the device's bursts.
+- In the background the audio device is closed (held notes are released, nothing renders) and it
+  reopens with the same setup when the app returns. Note-ons sent while in the background are
+  dropped.
+- Diagnostics add `platform: 'android'`, `nativeSampleRate`, `xrunCount`, `backgrounded`,
+  `backgroundStops` and `foregroundRestarts`; the AVAudioSession fields are empty or zero.
+- If the native library cannot be loaded, the getters still return their full default shapes and
+  `getDiagnostics()` reports `isReady: false`, `engineState: 'failed'` and the reason in `lastError`.
+- No audio-focus handling, interruption recovery or engine rebuilds yet.
+
+Build requirements: the app's NDK (`ndkVersion` from the root project, 27.1.12297006 if unset),
+CMake (Gradle's default), and the ABIs in `reactNativeArchitectures`. The library uses
+`libc++_shared.so` like React Native, and is 16 KB page aligned.
+
 ## Latency
 
 Budget < 40 ms touch-to-sound, target ≤ 25 ms. Baseline on iPhone 16 Pro speaker: 48 kHz,
@@ -449,7 +494,7 @@ expo-juce/
 ├── src/                     # TypeScript API (index.ts, ExpoJuce.types.ts), web stub, JUCE vendoring scripts
 ├── ios/                     # Swift module, ObjC bridge, ObjC++ engine, JuceModule_*.mm, podspec
 │   └── juce_modules/        # Vendored JUCE 8.0.1 modules
-├── android/                 # Kotlin scaffold (no audio engine yet)
+├── android/                 # Kotlin module, JNI + Android host (src/main/cpp), CMakeLists.txt
 ├── test/harness/            # Offline JUCE graph harness (WSL, CMake)
 ├── example/                 # Old example app (Expo 51, pinned expo-juce 0.1.1) — stale
 ├── docs/
@@ -490,15 +535,23 @@ cannot resolve `file:` dependencies, which is why every native change goes throu
    ```
    See [test/harness/README.md](test/harness/README.md) (case `g2` is an expected-FAIL negative
    control). Extend it for every new graph node.
-3. **ObjC++ / Swift:** careful review (no compiler locally); the EAS build is the first compile.
-4. **Device:** a diagnostics panel built on `getDiagnostics()`
+3. **Android host + NDK:** `./build/host_test` (same directory) runs the Android host against a
+   fake Oboe-like device. The native library also builds with the NDK directly, without Gradle:
+   ```sh
+   cmake -S android -B build-android -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release
+   cmake --build build-android -j16
+   ```
+4. **ObjC++ / Swift / Kotlin:** careful review (no compiler locally); the EAS build is the first compile.
+5. **Device:** a diagnostics panel built on `getDiagnostics()`
    ([docs/latency.md](docs/latency.md#5-a-diagnostics-panel)), then the slow-motion
    measurement in [docs/latency.md](docs/latency.md#6-slow-motion-measurement-procedure).
 
 ### JUCE vendoring
 
 `npm run download-juce` fetches JUCE 8.0.1 into `JUCE/` and `npm run vendor-juce` copies the needed modules into
-`ios/juce_modules` (stripping tests, demos and non-iOS code). Each JUCE module is compiled as
+`ios/juce_modules` (stripping tests and demos; the Android sources stay, the Android build uses them)
+and applies the local patches in `src/scripts/juce-patches.cjs`. `npm run check:juce-patches` checks
+that every patched vendored file equals pristine JUCE 8.0.1 plus those patches. Each JUCE module is compiled as
 its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the module flags and
 `JUCE_STANDALONE_APPLICATION 0`.
 
@@ -511,4 +564,7 @@ its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the m
 
 ## License
 
-MIT
+expo-juce's own code is MIT (`LICENSE`). It bundles JUCE 8, which is dual licensed under the JUCE
+licence or AGPLv3, so an app built with expo-juce needs a JUCE licence (Starter is free below a
+revenue limit) unless the whole app is released under AGPLv3. Details, and the other bundled
+code (Oboe, libFLAC), are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

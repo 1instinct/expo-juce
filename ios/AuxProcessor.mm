@@ -108,6 +108,67 @@ struct Noise {
 
 double square(double phase) { return std::fmod(phase, 1.0) < 0.5 ? 1.0 : -1.0; }
 
+// Fade-in of the incoming head; 1 - this for the outgoing one (they always sum to 1).
+inline float grainWeight(int phase, int hop) {
+    const float x = (float)phase / (float)hop;
+    return x * x * (3.0f - 2.0f * x);
+}
+
+// Where near `target` the track best continues what `outgoing` is about to play: normalised
+// cross-correlation of the two channels' sum, over `compare` samples, every `stride` samples and
+// then refined to the sample. Of near-equal places the nearest to `target` wins, and with nothing
+// to compare (silence, the ends of a track that does not loop) `target` itself. It never looks below
+// `lowest` (the first pass from the top: before sample 0 would be the loop's tail).
+int64_t bestGrainStart(const BackingTrackBuffer& b, int64_t outgoing, int64_t target, int search, int compare,
+                       int stride, bool loop, int64_t lowest) {
+    constexpr int kMaxPoints = 256;
+    const int64_t len = b.length;
+    const int points = std::min(compare / stride, kMaxPoints);
+    const int64_t span = (int64_t)points * stride;
+    if (len < 2 * (search + span)) return target;
+    if (!loop && (target < search || target + search + span >= len || outgoing < 0 || outgoing + span >= len)) return target;
+
+    const float* left = b.audio.getReadPointer(0);
+    const float* right = b.audio.getReadPointer(1);
+    float reference[kMaxPoints];
+    int64_t at = ((outgoing % len) + len) % len;
+    float energy = 0.0f;
+    for (int k = 0; k < points; ++k) {
+        reference[k] = left[at] + right[at];
+        energy += reference[k] * reference[k];
+        at += stride;
+        if (at >= len) at -= len;
+    }
+    if (energy < 1e-6f) return target;
+
+    const auto score = [&](int offset) {
+        int64_t p = ((target + offset) % len + len) % len;
+        float xy = 0.0f, yy = 0.0f;
+        for (int k = 0; k < points; ++k) {
+            const float y = left[p] + right[p];
+            xy += reference[k] * y;
+            yy += y * y;
+            p += stride;
+            if (p >= len) p -= len;
+        }
+        const float distance = 1.0f - 0.1f * (float)std::abs(offset) / (float)search;
+        return xy / std::sqrt(yy + 1e-9f) * distance;
+    };
+    const int from = (int)std::max<int64_t>(-search, lowest - target);
+    int best = 0;
+    float bestScore = 0.0f; // only a positive match moves it off the target
+    for (int offset = from; offset <= search; offset += stride) {
+        const float s = score(offset);
+        if (s > bestScore) { bestScore = s; best = offset; }
+    }
+    const int coarse = best;
+    for (int offset = std::max(from, coarse - stride + 1); offset <= std::min(search, coarse + stride - 1); ++offset) {
+        const float s = score(offset);
+        if (s > bestScore) { bestScore = s; best = offset; }
+    }
+    return target + best;
+}
+
 // Peak-normalises to `peak` and fades the last millisecond to exactly 0.
 void finishClick(float* c, int n, double fs, double peak) {
     float maxAbs = 0.0f;
@@ -231,6 +292,11 @@ void AuxProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/) {
     metronomeGain.setCurrentAndTargetValue(settings->metronomeLevel.load(std::memory_order_relaxed));
     trackGain.reset(sr, kLevelRampSeconds);
     trackGain.setCurrentAndTargetValue(settings->trackLevel.load(std::memory_order_relaxed));
+    grainHop = std::max(1, (int)std::lround(kGrainHopSeconds * sr));
+    grainSearch = std::max(1, (int)std::lround(kGrainSearchSeconds * sr));
+    grainCompare = std::max(1, (int)std::lround(kGrainCompareSeconds * sr));
+    grainStride = std::max(1, (int)std::lround(sr / 12000.0));
+    grainsActive = false;
     wasPlaying = false;
     havePrevBlock = false;
     trackActive = false;
@@ -337,6 +403,21 @@ void AuxProcessor::startTail(BackingTrackBuffer* buffer, int64_t position) {
     tailBuffer = buffer;
     tailPos = position;
     tailLeft = std::max(1, (int)(kFadeSeconds * sr));
+    tailGrains = grainsActive;
+    tailOutPos = grainOutPos;
+    tailPhase = grainPhase;
+    grainsActive = false;
+}
+
+// The incoming head becomes the outgoing one; a new incoming head starts at `sourcePosition`. From
+// the top (`fromTop`: the transport is at or past beat 0) it never starts before sample 0: below a
+// track's tempo the target of the first grains is negative, and looping that reads the loop's tail.
+void AuxProcessor::startGrain(const BackingTrackBuffer& b, double sourcePosition, bool search, bool loop, bool fromTop) {
+    grainOutPos = trackPos;
+    const int64_t lowest = fromTop ? 0 : INT64_MIN / 2;
+    const int64_t target = std::max((int64_t)std::llround(sourcePosition), lowest);
+    trackPos = search ? bestGrainStart(b, grainOutPos, target, grainSearch, grainCompare, grainStride, loop, lowest) : target;
+    grainPhase = 0;
 }
 
 void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStart, double bpm, bool playing,
@@ -359,17 +440,22 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
     trackGain.setTargetValue(settings->trackLevel.load(r));
     const bool playable = t != nullptr && t->sampleRate == sr && t->length > 0;
     const int fadeLen = std::max(1, (int)(kFadeSeconds * sr));
+    // The track's own tempo, if it has one, is its beat grid; without one it plays at its own speed.
+    const double sourceBpm = playable ? t->sourceBpm : 0.0;
+    const double gridBpm = sourceBpm > 0.0 ? sourceBpm : bpm;
+    const bool follow = sourceBpm > 0.0 && std::fabs(bpm - sourceBpm) > 1e-6 * sourceBpm;
 
     if (playable) {
         const int64_t len = t->length;
         const bool sounding = playing && enabled;
-        // Beat → track position: sample 0 is beat 0, at the current tempo.
-        const int64_t mapped = (int64_t)std::llround(beatStart * 60.0 / std::max(bpm, 1e-6) * sr);
+        // Beat → track position: sample 0 is beat 0.
+        const int64_t mapped = (int64_t)std::llround(beatStart * 60.0 / std::max(gridBpm, 1e-6) * sr);
         if (sounding) {
             if (!trackActive) { // start, resume, or a new buffer
                 trackPos = loop ? ((mapped % len) + len) % len : mapped;
                 mainFadeLeft = (trackPos == 0 && !tailActive) ? 0 : fadeLen;
                 trackActive = true;
+                grainsActive = false;
             } else if (seeked) {
                 startTail(t, trackPos);
                 trackPos = loop ? ((mapped % len) + len) % len : mapped;
@@ -384,6 +470,12 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
         // Not playable (no buffer, or one at another rate): nothing to continue.
         trackActive = false;
     }
+    if (trackActive && follow && !grainsActive) { // the first sample below starts a grain
+        grainsActive = true;
+        grainPhase = grainHop;
+    }
+    if (trackActive && follow) grainsOnGrid = false;
+    diag.trackTempoRatio.store(trackActive && sourceBpm > 0.0 ? bpm / sourceBpm : 1.0, r);
     // A tail on the current buffer no longer needs the protected previous one.
     if (tailActive && tailBuffer == t && tailProtected) { track->releaseTail(); tailProtected = false; }
 
@@ -401,19 +493,48 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
         if (loop) return src[((p % len) + len) % len];
         return (p >= 0 && p < len) ? src[p] : 0.0f;
     };
+    const double beatsPerSample = bpm / (60.0 * sr);
+    const double samplesPerBeat = 60.0 / std::max(gridBpm, 1e-6) * sr;
     for (int i = 0; i < n; ++i) {
         float l = 0.0f, rr = 0.0f;
         if (trackActive) {
             float g = 1.0f;
             if (mainFadeLeft > 0) { g = 1.0f - (float)mainFadeLeft / (float)fadeLen; --mainFadeLeft; }
-            l += read(t, trackPos, 0) * g;
-            rr += read(t, trackPos, 1) * g;
+            if (grainsActive && grainPhase >= grainHop) {
+                if (grainsOnGrid) {
+                    grainsActive = false; // the incoming head is on the grid: the plain path takes it
+                } else {
+                    // The grain's middle, a hop from now, is where its position should be on the beat.
+                    const double beat = beatStart + i * beatsPerSample;
+                    const double source = beat * samplesPerBeat + (beatsPerSample * samplesPerBeat - 1.0) * grainHop;
+                    startGrain(*t, source, follow, loop, beat >= 0.0);
+                    grainsOnGrid = !follow;
+                }
+            }
+            if (grainsActive) {
+                const float w = grainWeight(grainPhase, grainHop);
+                l += (read(t, grainOutPos, 0) * (1.0f - w) + read(t, trackPos, 0) * w) * g;
+                rr += (read(t, grainOutPos, 1) * (1.0f - w) + read(t, trackPos, 1) * w) * g;
+                ++grainOutPos;
+                ++grainPhase;
+            } else {
+                l += read(t, trackPos, 0) * g;
+                rr += read(t, trackPos, 1) * g;
+            }
             ++trackPos;
         }
         if (tailActive) {
             const float g = (float)tailLeft / (float)fadeLen;
-            l += read(tailBuffer, tailPos, 0) * g;
-            rr += read(tailBuffer, tailPos, 1) * g;
+            if (tailGrains && tailPhase < grainHop) {
+                const float w = grainWeight(tailPhase, grainHop);
+                l += (read(tailBuffer, tailOutPos, 0) * (1.0f - w) + read(tailBuffer, tailPos, 0) * w) * g;
+                rr += (read(tailBuffer, tailOutPos, 1) * (1.0f - w) + read(tailBuffer, tailPos, 1) * w) * g;
+                ++tailOutPos;
+                ++tailPhase;
+            } else {
+                l += read(tailBuffer, tailPos, 0) * g;
+                rr += read(tailBuffer, tailPos, 1) * g;
+            }
             ++tailPos;
             if (--tailLeft <= 0) tailActive = false;
         }
