@@ -1,0 +1,66 @@
+name: Publish to npm
+
+# Push a tag `v<package.json version>` to publish. Versions with a prerelease part
+# (0.9.0-rc.1) go to the `next` dist-tag; plain versions (0.9.0) go to `latest`.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # GitHub release
+      id-token: write # npm trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Use npm with trusted publishing (11.5.1+)
+        run: |
+          if ! npx -y semver@7 -r '>=11.5.1' "$(npm --version)" >/dev/null; then
+            npm install -g npm@11.6.2
+          fi
+          npm --version
+
+      - name: Check the tag matches package.json
+        id: version
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+          if [ -n "$(npm view "expo-juce@$version" version 2>/dev/null)" ]; then
+            echo "::error::expo-juce@$version is already on npm"
+            exit 1
+          fi
+          case "$version" in
+            *-*) echo "dist_tag=next" >> "$GITHUB_OUTPUT"; echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "dist_tag=latest" >> "$GITHUB_OUTPUT"; echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - run: npm ci
+
+      # Auth: npm trusted publishing (OIDC), set up for this workflow on npmjs.com. No token and
+      # no setup-node registry-url: a configured (even placeholder) token can bypass the OIDC exchange.
+      # --loglevel verbose prints the OIDC exchange, so a misconfigured publisher shows its reason.
+      - name: Publish
+        run: npm publish --access public --tag "${{ steps.version.outputs.dist_tag }}" --loglevel verbose
+
+      - name: GitHub release
+        run: |
+          flags="--generate-notes --verify-tag"
+          [ "${{ steps.version.outputs.prerelease }}" = "true" ] && flags="$flags --prerelease"
+          gh release create "$GITHUB_REF_NAME" $flags --title "$GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}

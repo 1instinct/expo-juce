@@ -1,5 +1,17 @@
 import { EventEmitter } from 'expo-modules-core';
 
+import type {
+  Analysis,
+  ArpOptions,
+  BackingTrackGapless,
+  BackingTrackInfo,
+  BackingTrackOptions,
+  EffectsState,
+  MetronomeOptions,
+} from './ExpoJuce.types';
+import { defaultEffectsState } from './effectDefaults';
+import { arpDefaults } from './arpDefaults';
+
 const emitter = new EventEmitter({} as any);
 
 export default {
@@ -9,5 +21,47 @@ export default {
   },
   hello() {
     return 'Hello world! 👋';
+  },
+  // No audio engine on web: effects calls are no-ops (false = not applied).
+  setEffectEnabled(_id: string, _enabled: boolean): boolean {
+    return false;
+  },
+  setEffectParam(_id: string, _param: string, _value: number): boolean {
+    return false;
+  },
+  getEffectsState(): EffectsState {
+    return defaultEffectsState();
+  },
+  // No metronome / backing track / analysis on web either.
+  setMetronome(_options: MetronomeOptions): boolean {
+    return false;
+  },
+  setBackingTrackOptions(_options: BackingTrackOptions): void {},
+  async loadBackingTrack(_uri: string, _gapless: BackingTrackGapless | null): Promise<BackingTrackInfo> {
+    const error = new Error('backing tracks are not supported on web');
+    (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';
+    throw error;
+  },
+  unloadBackingTrack(): void {},
+  getAnalysis(): Analysis {
+    return {
+      peak: 0,
+      rms: 0,
+      scope: new Array(128).fill(0),
+      bands: new Array(24).fill(0),
+      sampleRate: 0,
+      lastNote: -1,
+      bpm: 120,
+      beat: 0,
+      playing: false,
+      arp: { active: false, step: 0, steps: 16, note: -1 },
+    };
+  },
+  // No arpeggiator on web: nothing applied, defaults reported.
+  setArpeggiator(_options: Partial<ArpOptions>): boolean {
+    return false;
+  },
+  getArpeggiatorState(): ArpOptions {
+    return arpDefaults();
   },
 };

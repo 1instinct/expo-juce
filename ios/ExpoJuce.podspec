@@ -10,24 +10,65 @@ Pod::Spec.new do |s|
   s.license        = package['license']
   s.author         = package['author']
   s.homepage       = package['homepage']
-  s.platforms      = { :ios => '13.4', :tvos => '13.4' }
+  s.platforms      = { :ios => '13.4' }
   s.swift_version  = '5.4'
-  s.source         = { git: 'https://github.com/Beeper-buzz/expo-juce' }
+  s.source         = { git: 'https://github.com/1instinct/expo-juce' }
   s.static_framework = true
 
   s.dependency 'ExpoModulesCore'
 
-  # Swift/Objective-C compatibility
+  s.source_files = "*.{h,m,mm,swift}"
+
+  # Per-file ARC control: JuceModule_*.mm files compile JUCE source which uses
+  # manual retain/release. Only files listed here get ARC enabled.
+  s.requires_arc = [
+    'ExpoJuceModule.swift',
+    'JucePadView.swift',
+    'ExpoJuceBridge.m',
+    'ExpoJuceAudioEngine.mm',
+    'PolySynthProcessor.mm',
+    'FxChainProcessor.mm',
+    'AuxProcessor.mm',
+    'BackingTrack.mm',
+    'Voice.mm',
+    'VoiceAllocator.mm',
+    'TransportEngine.mm',
+    'ExpoJuce-Bridging-Header.h',
+  ]
+
+  # C++ headers must be private — they include <atomic>, <algorithm>, etc.
+  # which fail when compiled as Objective-C through the module map.
+  s.private_header_files = [
+    "JuceConfig.h",
+    "Voice.h",
+    "VoiceAllocator.h",
+    "PolySynthProcessor.h",
+    "FxChainProcessor.h",
+    "AuxProcessor.h",
+    "BackingTrack.h",
+    "AnalysisRing.h",
+    "TransportEngine.h",
+    "GraphPlayer.h",
+    "NoteEventQueue.h",
+  ]
+
+  # JUCE modules: each compiled as its own translation unit (separate .mm file)
+  # to avoid static symbol collisions between modules.
+  s.preserve_paths = ["juce_modules/**"]
+
+  s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
+                 'Foundation', 'Accelerate', 'CoreMIDI',
+                 'CoreGraphics', 'CoreImage', 'CoreText',
+                 'QuartzCore', 'UIKit', 'WebKit', 'Metal', 'MetalKit'
+  s.weak_frameworks = 'UserNotifications'
+  s.libraries = 'c++'
+
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    'CLANG_ENABLE_OBJC_ARC' => 'YES',
-    'SWIFT_OBJC_BRIDGING_HEADER' => '$(PODS_TARGET_SRCROOT)/ExpoJuce-Bridging-Header.h'
+    'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)" "$(PODS_TARGET_SRCROOT)/juce_modules"',
+    'GCC_WARN_ABOUT_DEPRECATED_DECLARATIONS' => 'NO',
+    'OTHER_CPLUSPLUSFLAGS' => '-Wno-shorten-64-to-32 -Wno-comma -Wno-deprecated-declarations',
   }
-
-  s.source_files = "**/*.{h,m,mm,swift}"
-  
-  # Add AVFoundation framework for audio
-  s.frameworks = 'AVFoundation'
 end

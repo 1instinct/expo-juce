@@ -2,126 +2,437 @@
 
 Realtime DSP w/C++ & JUCE
 
+expo-juce embeds [JUCE](https://juce.com) 8 in an Expo / React Native app as an Expo
+module: a JUCE-owned audio device drives an `AudioProcessorGraph` with an 8-voice
+polyphonic synth and a transport, controlled from JS through synchronous JSI calls.
+iOS only for now; the Android and web modules are scaffolds.
+
+> **Branches.** `main` is a stale scaffold. Current work is on `@aaron.smulktis/develop`;
+> the diagnostics and latency work is on `debug/audio-diagnostics`.
+
+## Architecture
+
+```
+ JS (src/index.ts)          setup / noteOn / params / transport / getDiagnostics
+        │  JSI (Expo Modules API)
+ ExpoJuceModule.swift       Function (sync) / AsyncFunction (setup, shutdown), onBeat events
+        │
+ ExpoJuceBridge (ObjC)      plain ObjC surface for Swift
+        │
+ ExpoJuceAudioEngine (ObjC++) AVAudioSession Playback + MixWithOthers; setup steps 0–11 on main thread
+        │
+ juce::AudioDeviceManager ─► GraphPlayer (AudioIODeviceCallback: graph, peaks, NaNs, test tone)
+        │
+ juce::AudioProcessorGraph  PolySynthProcessor ─► FxChainProcessor ─► audio output node
+                            AuxProcessor (metronome + backing track) ───► audio output node (summed)
+                            ├─ NoteEventQueue: note-on ring (256) drained at block start; releases as marks
+                            ├─ 8 × Voice: dsp::Oscillator → StateVariableTPTFilter (LP) → ADSR
+                            └─ TransportEngine (tempo / position / beat crossings)
+                            FxChainProcessor: drive → crush → eq → chorus → phaser → echo → reverb →
+                            pump → compressor → safety limiter; settings in a process-lifetime store
+                            AuxProcessor: clicks rendered at prepare; track buffer swapped in from
+                            a process-lifetime BackingTrack holder (decoded on a background queue)
+ GraphPlayer also writes the output into an AnalysisRing (getAnalysis: peak / rms / scope)
+```
+
+## Roadmap: Full Audio Workstation
+
+expo-juce is being built toward full audio workstation capabilities. The work is decomposed into independent sub-projects, each building on the previous:
+
+### Sub-project 1: Polyphonic Synth Engine
+**Status:** Done — working on device (iPhone, 2026-10-22)
+
+Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack built on `AudioProcessorGraph`. 8-voice polyphonic synth with per-voice oscillator, SVF filter, and full ADSR envelope. MIDI-style API (`noteOn(note, velocity)` / `noteOff(note)`). JUCE owns device management and output for cross-platform support (iOS, macOS, Windows, Linux).
+
+### Diagnostics, recovery and latency
+**Status:** Diagnostics done (0.5.2-diag.x); recovery and latency margin in 0.5.2 — see the [latency guide](docs/latency.md). TODO: latency measurement and interruption / route-change device checks ([list](docs/latency.md#todo-device-checks-pending-for-052))
+
+`setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. 0.5.2 adds: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (keeping synth settings and transport state across rebuilds).
+
+### Sub-project 2: Effects Chain
+**Status:** In progress (0.6.0) — engine + JS API done and verified in the offline harness; not yet run on a device
+
+One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Also in 0.6.0: an `AuxProcessor` node summed into the output after the effects, with a sample-accurate metronome (5 click styles, bar accent) and a backing track (off-thread decode + resample, gapless MP3 loop regions, lock-free swap, follows transport play / stop / seek; see [Metronome and backing track](#metronome-and-backing-track-060)); `getAnalysis()` (output peak / rms, 128-point scope, last note, transport) for HUDs; a `hitPolygon` touch shape on `JucePadView`. Later: reorderable / per-node effects via modular routing (sub-project 5).
+
+### Sub-project 3: Sample Playback / Drum Machine
+**Status:** Planned — an earlier JUCE sampler prototype is the starting point
+
+`SamplerProcessor` node that loads audio files and triggers playback via `noteOn`. Supports multi-sample mapping (e.g., different samples per MIDI note). Integrates with the transport for sequenced playback.
+
+### Sub-project 4: Audio Input Processing
+**Status:** Planned
+
+Route mic/line input through the `AudioProcessorGraph` for realtime effects processing (guitar pedal board style). The session is currently `Playback` + `MixWithOthers` with no input channels (`initialise(0, 2)`); this sub-project switches to `PlayAndRecord`, opens input channels and adds an input node routed through effects processors.
+
+### Sub-project 5: Modular Routing
+**Status:** Planned
+
+Expose the `AudioProcessorGraph` topology to TypeScript — add, remove, and connect nodes from JS. Enables user-configurable signal chains, parallel processing, send/return buses, and sidechain routing.
+
+### Sub-project 6: Electron / Desktop
+**Status:** Planned
+
+Compile the same C++ engine for macOS, Windows, and Linux. JUCE abstracts platform audio (CoreAudio, WASAPI, ALSA). Package as an Electron native addon. Same graph, same processors, same API — different platform.
+
 ## Quick Start
 
 ### Installation
 
-```bash
-npm install expo-juce
-```
-
-### iOS Setup
-
-After installing, run:
+Requires an Expo dev client or EAS build (not Expo Go). Pin an exact version; prereleases are
+published under a dist-tag:
 
 ```bash
-npx pod-install
+npm install expo-juce@0.5.2-diag.1 --save-exact   # dist-tag "diag"; "latest" is 0.5.1
 ```
 
-### Android Setup
+The native code is compiled by CocoaPods during prebuild / EAS build (`ios/ExpoJuce.podspec`,
+JUCE vendored in `ios/juce_modules`).
 
-No additional setup required.
-
-## Basic Usage
-
-### Playing a Tone
+### Usage
 
 ```tsx
-import { Button } from 'react-native';
 import * as ExpoJuce from 'expo-juce';
 
-function App() {
-  const playTone = () => {
-    const frequency = 440; // A4 note (Hz)
-    const duration = 0.5;  // seconds
-    ExpoJuce.playTone(frequency, duration);
-  };
+// Once, e.g. on first mount. Rejects with code ERR_AUDIO_SETUP, message "step N: <error>".
+await ExpoJuce.setup();
+// 0.5.2+: optional device request (defaults 128 samples / 48 kHz; actual values may differ)
+// await ExpoJuce.setup({ bufferSize: 128, sampleRate: 48000 });
 
-  return <Button title="Play Tone" onPress={playTone} />;
-}
+// Notes — synchronous, never wait on a lock; the audio thread picks them up at the next block
+// (note-offs and allNotesOff are never dropped, even mid-recovery)
+ExpoJuce.noteOn(60, 127);   // note 0–127, velocity 0–127
+ExpoJuce.noteOff(60);
+ExpoJuce.allNotesOff();
+
+// Global synth parameters — synchronous, std::atomic
+ExpoJuce.setWaveform('saw');          // 'sine' | 'square' | 'saw' | 'triangle'
+ExpoJuce.setFilterCutoff(2000);       // Hz, 20–20000 (default 20000)
+ExpoJuce.setFilterResonance(0.3);     // 0–1 → Q 0.707–10
+ExpoJuce.setAttack(10);               // ms, 1–10000 (default 10; 2 from 0.5.2+)
+ExpoJuce.setDecay(1);                 // ms (default 1)
+ExpoJuce.setSustain(1);               // 0–1 (default 1)
+ExpoJuce.setRelease(200);             // ms (default 200)
+ExpoJuce.setDetune(0);                // cents, −1200…1200
+ExpoJuce.setMasterLevel(0.5);         // 0–1 (default 0.5)
+
+// Transport
+ExpoJuce.setTempo(120);               // BPM, 20–400
+ExpoJuce.startTransport();
+const sub = ExpoJuce.addBeatListener(({ beat, bpm }) => { /* … */ });
+ExpoJuce.getTransportPosition(); ExpoJuce.getTempo(); ExpoJuce.isTransportPlaying();
+ExpoJuce.setTransportPosition(0);
+ExpoJuce.stopTransport();
+sub.remove();
+
+// Diagnostics
+const d = ExpoJuce.getDiagnostics();  // AudioDiagnostics snapshot, see src/ExpoJuce.types.ts
+ExpoJuce.playTestTone(500);           // 440 Hz into the device output, bypasses graph + synth;
+                                      // false if the engine/device is not running
+
+await ExpoJuce.shutdown();
 ```
 
-### Available Functions
+### Effects (0.6.0+)
 
-- `hello()` - Returns a greeting string
-- `getApiKey()` - Returns the API key
-- `playTone(frequency: number, duration: number)` - Plays a sine wave tone at the specified frequency for the given duration
-- `setValueAsync(value: string)` - Async function that emits a change event
-- `PI` - Constant value of π
+A master effects chain sits between the synth and the output. All effects are off by
+default; order is fixed (drive → crush → eq → chorus → phaser → echo → reverb → pump →
+compressor), followed by a safety limiter (-0.3 dBFS ceiling, always on, not user-facing).
 
-### Events
+```ts
+ExpoJuce.setEffectEnabled('reverb', true);            // boolean: false = unknown effect
+ExpoJuce.setEffectParam('reverb', 'mix', 0.4);        // boolean: false = unknown effect/param or NaN
+ExpoJuce.setEffectParam('echo', 'division', 1);       // synced echo, 1/8 at the transport tempo
+const fx = ExpoJuce.getEffectsState();                // { reverb: { enabled, params: { size, … } }, … }
+```
 
-Listen to change events:
+- Synchronous and lock-free, any thread. Values are clamped to the ranges below (switches and
+  division indices rounded); `getEffectsState()` reports the stored values.
+- Settings are remembered natively whether or not the engine is running: calls made before
+  `setup()`, or during an automatic engine rebuild, take effect when the chain runs.
+- Turning an effect on or off crossfades it (10 ms); a disabled effect is skipped entirely and
+  an effect turned on starts clean (no stale echo or reverb tail). Echo and reverb spill over:
+  turning them off stops feeding them, and their tail keeps ringing out until it has faded
+  below -90 dBFS (at most 5 s, faded out over the last 50 ms); only then are they bypassed.
+  With every effect off (and tails ended) the output is the synth output, bit for bit (while
+  it stays under the limiter ceiling).
+- Parameter changes are smoothed where they would click (mix, gains, delay time, EQ bands).
+- Echo `sync` and `pump` follow the transport tempo; pump is locked to the transport beat
+  while it plays and free-runs at the tempo while it is stopped.
+- Binaries older than 0.6.0: the setters return `false` and `getEffectsState()` returns the
+  defaults. Web: no-ops.
+
+| effect | params (range, default) |
+|---|---|
+| `drive` | `amount` 0–1 (0.4), `tone` 0–1 (0.6), `mix` 0–1 (1) — pre-gain 1–40×, tanh, tone LP 800 Hz–20 kHz |
+| `crush` | `bits` 2–16 (8), `downsample` 1–32 (4), `noise` 0–1 (0.1), `mix` 0–1 (1) |
+| `eq` | `low` −12–12 dB (0, shelf 120 Hz), `mid` −12–12 dB (0, peak Q 0.9), `midFreq` 200–5000 Hz (1000), `high` −12–12 dB (0, shelf 6 kHz) |
+| `chorus` | `rate` 0.05–5 Hz (0.8), `depth` 0–1 (0.4), `mix` 0–1 (0.5) |
+| `phaser` | `rate` 0.05–5 Hz (0.4), `depth` 0–1 (0.6), `feedback` 0–0.9 (0.5), `mix` 0–1 (0.5) |
+| `echo` | `time` 0.02–2 s (0.375), `sync` 0/1 (1), `division` 0–5 (2; 1/4, 1/8, 1/8 dotted, 1/16, 1/4 dotted, 1/2), `feedback` 0–0.95 (0.4), `tone` 0–1 (0.5), `pingPong` 0/1 (0), `mix` 0–1 (0.35) |
+| `reverb` | `size` 0–1 (0.6), `damping` 0–1 (0.5), `width` 0–1 (1), `mix` 0–1 (0.3) |
+| `pump` | `depth` 0–1 (0.6), `shape` 0–1 (0.5; soft → snappy), `division` 0–3 (0; 1/4, 1/8, 1/2, 1/1) |
+| `compressor` | `threshold` −60–0 dB (−18), `ratio` 1–20 (4), `attack` 0.1–100 ms (10), `release` 10–1000 ms (120), `makeup` 0–24 dB (4) |
+
+`mix` is a dry/wet crossfade (0 = dry). Synced echo time is capped at 2 s.
+
+### Metronome and backing track (0.6.0+)
+
+An aux source next to the synth: its output is summed into the device output **after** the
+effects chain (clicks and the track are not effected). Both follow the transport.
+
+```ts
+ExpoJuce.setMetronome({ enabled: true, style: 'wood', level: 0.7, accent: true, beatsPerBar: 4 }); // false: unknown style
+
+const info = await ExpoJuce.loadBackingTrack(fileUri, {   // gapless info: optional, MP3 only
+  loopSamples: 682839, leadingSamples: 4561, trailingSamples: 1496,
+});
+// { durationSec, sampleRate, channels, loopStartSample, loopSamples, decodedSamples, regionRule, decoder }
+ExpoJuce.setBackingTrackOptions({ level: 0.8, loop: true, enabled: true });
+ExpoJuce.startTransport();                                 // the track and the clicks start
+ExpoJuce.unloadBackingTrack();
+```
+
+- **Metronome**: a click on every beat while the transport plays, starting on the exact
+  sample where the beat falls (any block size), accented on beat 1 of the bar. Styles
+  `classic` (sine blip 1.5 kHz / accent 2.5 kHz), `wood` (resonant noise burst), `beep`
+  (square 1 / 2 kHz), `cowbell` (two squares 540 / 800 Hz through a band-pass), `hat`
+  (high-passed noise). Clicks are rendered once when the engine prepares (no allocation while
+  playing). Options: `enabled` (false), `style` ('classic'), `level` 0–1 (0.8), `accent`
+  (true), `beatsPerBar` 1–16 (4). `setMetronome` returns `false` and applies nothing if
+  `style` is not one of the five.
+- **Backing track**: `loadBackingTrack(uri, gapless?)` takes a local file (`file://` URI or
+  absolute path; download remote files first). It decodes WAV, AIFF, FLAC and MP3 (plus
+  CoreAudio formats such as M4A / AAC on iOS) on a background queue straight to the device
+  rate and swaps the buffer in without blocking or allocating on the audio thread; the old
+  buffer is freed on the main thread after the audio thread has let go of it. Only the
+  playable buffer stays in memory (after a device-rate change the file is decoded again).
+  Limit: 6 minutes (17 280 000 frames per channel at 48 kHz, about 138 MB; the same duration
+  at other rates), and the load is refused if the process has less memory available than the
+  decode needs (about twice the final buffer). A newer load or `unloadBackingTrack()`
+  supersedes a load in flight (it rejects with `ERR_BACKING_TRACK_SUPERSEDED`); other errors:
+  `ERR_BACKING_TRACK_URI`, `_FILE`, `_FORMAT`, `_TOO_LONG`, `_MEMORY`.
+- **Gapless MP3 loops**: MP3 encoders pad the start and end. With `gapless` (the LAME / Xing
+  tag values, frames at the file's rate) the loop region is, by decoded length:
+  - `loopSamples` (the decoder honoured the tag) → `[0, loopSamples)`, `regionRule: 'tag'`;
+  - 1152 + leading + loopSamples + trailing (the decoder ignored the tag and decoded the tag
+    frame) → `[1152 + leading, +loopSamples)`, `'padded'`;
+  - leading + loopSamples + trailing (the decoder skipped the tag frame but kept the encoder
+    padding, as JUCE's own MP3 decoder does) → `[leading, +loopSamples)`, `'paddedNoTagFrame'`;
+  - anything else, or no `gapless` → the whole file, `'whole'` (with `gapless` given, this
+    means the fallback fired and the loop will include the padding).
+
+  The region is cut before resampling; `decodedSamples` / `decoder` tell what the decoder did.
+- **Playback** follows the transport. Track sample 0 is beat 0: when the transport starts or
+  is moved (`setTransportPosition`), the track goes to beat × 60 / bpm seconds (modulo its
+  length when looping), so pause + resume continues where it stopped and seeks land on the
+  beat grid. While playing, the track simply advances with the audio: a tempo change does not
+  move or stretch it (it keeps its own speed). Starts away from the top, seeks, stops, and
+  replacing or unloading the track while it plays are crossfaded over 5 ms. With `loop` off it
+  plays once and then stays silent until the transport is moved back.
+- Options: `level` 0–1 (0.8), `loop` (true), `enabled` (true).
+- Metronome and backing-track options and the loaded track are kept natively for the life of
+  the app: they work before `setup()` and survive engine rebuilds.
+- Binaries older than 0.6.0: the setters are no-ops (`setMetronome` returns `false`) and
+  `loadBackingTrack` rejects with `ERR_UNSUPPORTED`. Web: the same.
+
+### Arpeggiator (0.7.0+)
+
+A sample-accurate arpeggiator between the note queue and the voices. While it is enabled, every
+note the synth receives (pads, keys, `noteOn`) joins its held list instead of sounding, and the
+arp plays the held notes step by step on the transport's grid; disabled, notes play directly as
+before (voices that were sounding when the arp was enabled keep sounding until released).
+
+```ts
+ExpoJuce.setArpeggiator({ enabled: true, mode: 'upDown', rate: '1/16', octaves: 2, gate: 0.6 });
+ExpoJuce.setArpeggiator({ pattern: [true, false, true, true], swing: 0.2, ratchet: 2 }); // partial
+const state = ExpoJuce.getArpeggiatorState(); // every option as stored (ArpOptions)
+ExpoJuce.ARP_DEFAULTS;                        // the defaults below
+```
+
+- Options (`ArpOptions`, omitted keys keep their value, numbers are clamped; `setArpeggiator`
+  returns `false` and applies nothing for an unknown `mode` / `rate` or a `pattern` that is not
+  1–16 booleans):
+  - `enabled` (false)
+  - `mode` ('up'): `'up'` held notes ascending, `'down'`, `'upDown'` (up, then the interior
+    reversed: `[60, 64, 72, 76]` → `60 64 72 76 72 64`), `'played'` (press order), `'random'`
+    (a uniform pick per step), `'chord'` (every held note on every step)
+  - `rate` ('1/16'): `'1/4'`, `'1/8'`, `'1/8T'`, `'1/8D'`, `'1/16'`, `'1/16T'`, `'1/32'`
+    (1, 2, 3, 4/3, 4, 6, 8 steps per beat)
+  - `octaves` 1–4 (1): the cycle repeats +12 per extra octave
+  - `gate` 0.05–1.5 of a step (0.6): note length; above 1 the note overlaps the next step
+    (legato; a one-note cycle retriggers the same voice)
+  - `swing` 0–0.5 of a step (0): odd steps start that much later
+  - `latch` (false): the list is kept when every note is released; the next press replaces it
+  - `pattern` 1–16 booleans (16 × true), all or nothing: a false step is a rest and does not
+    advance the cycle
+  - `accent` 0–1 (0): steps other than the first of the pattern play at
+    velocity × (1 − 0.6 × accent)
+  - `ratchet` 1–4 (1): hits per step, each with `gate` of its share
+  - `transposeSteps` 0–8 (0) and `transposeDistance` −12..12 (0): each pass through the pattern
+    rises by `transposeDistance` semitones, wrapping after `transposeSteps` passes
+- Timing: step `k` starts `k × L` after the arp starts (`L = 60 / bpm / stepsPerBeat`), on the
+  exact sample whatever the block size. While the transport plays the steps sit on the beat grid
+  (`beat × stepsPerBeat` integer; a chord landing up to ¼ step after a grid line plays at once,
+  later ones wait for the next line) and a tempo change re-derives the grid from the new bpm.
+  Stopped, the grid starts at the first note-on and runs free at the current tempo.
+- The cycle restarts when the held list goes from empty to non-empty; adding or removing notes
+  while it plays takes effect at the next step. `allNotesOff()` stops the arp and clears its
+  list (a latched list included). Disabling stops the sounding arp notes at once.
+- 16 voices (`MAX_VOICES`), so a 16-note `chord` or ratchets with long releases do not steal.
+- Options are kept natively for the life of the app in one store the synth reads once per block:
+  they work before `setup()`, survive engine rebuilds and apply within a block even while a
+  rebuild is in progress. Binaries older than 0.7.0: `setArpeggiator` returns `false`,
+  `getArpeggiatorState` returns `ARP_DEFAULTS`. Web: the same.
+
+### Analysis (0.6.0+)
+
+```ts
+const a = ExpoJuce.getAnalysis();
+// { peak, rms, scope: number[128], bands: number[24], sampleRate, lastNote, bpm, beat, playing,
+//   arp: { active, step, steps, note } }
+```
+
+Synchronous and lock-free, cheap enough to call every animation frame (from one place: each
+call consumes the levels). `peak` (peak hold) and `rms` (both channels) cover the output
+since the previous call (synth, effects, metronome and backing track as sent to the device);
+`scope` is 128 points, oldest first, taken every 16th sample from the last 2048 output samples
+(mono, may tear across a block; it is for display). `bpm` / `beat` / `playing` are the
+transport as of the last rendered block. `lastNote` is the last note the synth started (-1 if
+none). Zeros when the engine is not running.
+
+0.7.0+ adds `bands`: 24 log-spaced spectrum bands between 40 Hz and 16 kHz, each 0–1 for
+−60..0 dBFS of the loudest FFT bin in the band, from a Hann-windowed 2048-point FFT of the same
+output samples, computed on the calling thread (about 50 µs per call). Band edges are
+`edge_0 = 40`, `edge_i = max(40 × 400^(i/24), edge_(i−1) + sampleRate / 2048)`,
+`edge_24 = 16000`: the lowest bands are one FFT bin wide (23.4 Hz at 48 kHz) until the
+geometric spacing takes over around 140 Hz, so no two bands read the same bin. `sampleRate` is
+the device rate the bands were computed at. `arp` is the arpeggiator as of the last block:
+`active` (enabled and holding notes), `step` (pattern slot of the last step started), `steps`
+(pattern length), `note` (last note the arp started, -1 if none). Older binaries: 24 zeros,
+`sampleRate` 0, `arp` inactive.
+
+### `JucePadView` (0.5.2+)
+
+A native view that plays a note on touch from the iOS main thread, without the JS thread,
+and reports to JS afterwards for visuals and haptics. Multi-touch safe: note off is sent when
+the last touch on the view lifts.
 
 ```tsx
-import { addChangeListener } from 'expo-juce';
+import { JucePadView } from 'expo-juce';
 
-const subscription = addChangeListener((event) => {
-  console.log('Value changed:', event.value);
-});
-
-// Clean up
-subscription.remove();
+<JucePadView
+  note={60}
+  velocity={127}
+  enabled
+  onNoteOn={() => {/* light the pad, haptic */}}
+  onNoteOff={() => {/* unlight */}}
+  style={{ width: 80, height: 80 }}
+/>
 ```
 
-## Low-Latency Audio
+Check the shipped type definitions for the exact event payloads once 0.5.2 is published.
 
-The module is configured for low-latency audio playback:
-- 5ms buffer size
-- Real-time audio processing thread
-- AVAudioEngine on iOS
-- Optimized for minimal latency
+`hitPolygon` (0.6.0+) makes the touch area non-rectangular: a flat `[x0, y0, x1, y1, …]`
+polygon normalised to the view (0–1). Touches outside it (including on its children) pass
+through to the views underneath, so pads with overlapping bounding boxes do not steal each
+other's touches. Empty, odd-length or fewer than 3 points: the whole view.
+
+```tsx
+<JucePadView note={62} hitPolygon={[0.5, 0, 1, 0.5, 0.5, 1, 0, 0.5]} style={{ width: 96, height: 96 }} />
+```
+
+### Diagnostics
+
+`getDiagnostics()` returns setup state (`isReady`, `setupStep`, `lastError`), device
+(`deviceName`, `sampleRate`, `bufferSize`, `outputLatencySamples`), counters
+(`callbackCount`, `graphProcessCount`, `synthProcessCount`, `notesQueued/Consumed/Dropped`,
+`nanCount`, `toneSamplesMixed`), peaks (`outputPeak`, `synthPeak`), timing
+(`lastNoteToRenderMs`) and the AVAudioSession state (`sessionCategory`, `sessionSampleRate`,
+`sessionIOBufferMs`, `sessionOutputLatencyMs`, `otherAudioPlaying`, `routeOutputs`). 0.5.2+ adds
+`lastTouchToRenderMs`, `preferredBufferSize`, `preferredSampleRate`, `sessionReassertCount`, `interruptionCount`,
+`mediaResetCount`, `lastRecoveryError`, `engineState`. A debug screen in the app can show them
+as a pass/fail ladder — see [docs/latency.md](docs/latency.md#5-a-diagnostics-panel).
+
+0.6.0+ adds `fxProcessCount`, `fxLimiterGain` (1 = the safety limiter is idle),
+`fxNonFiniteResets`, `metronomeClicks`, `backingTrackLoaded` and `backingTrackPositionSec`.
+
+Synth settings, effect, metronome and backing-track settings (and the loaded track) and transport state (tempo, position, playing) survive the
+engine's automatic rebuilds after a media-services reset or a stalled device; held notes do not.
+
+## Latency
+
+Budget < 40 ms touch-to-sound, target ≤ 25 ms. Baseline on iPhone 16 Pro speaker: 48 kHz,
+257-sample buffer, panel estimate 24.2 ms (before the touch path). The signal path, every
+change, how to read the panel and the **slow-motion measurement procedure** are in
+[docs/latency.md](docs/latency.md).
 
 ## Development
 
-### Running the Example App
+### Repository structure
+
+```
+expo-juce/
+├── src/                     # TypeScript API (index.ts, ExpoJuce.types.ts), web stub, JUCE vendoring scripts
+├── ios/                     # Swift module, ObjC bridge, ObjC++ engine, JuceModule_*.mm, podspec
+│   └── juce_modules/        # Vendored JUCE 8.0.1 modules
+├── android/                 # Kotlin scaffold (no audio engine yet)
+├── test/harness/            # Offline JUCE graph harness (WSL, CMake)
+├── example/                 # Old example app (Expo 51, pinned expo-juce 0.1.1) — stale
+├── docs/
+│   └── latency.md           # Latency guide and measurement procedure
+└── package.json
+```
+
+### Build and publish (Windows)
+
+There is no Mac or Xcode on the dev machine. The `expo-module-scripts` lifecycle scripts are
+bash and fail under npm on Windows, so build and publish by hand from Git Bash:
 
 ```bash
-cd example
-yarn install
-yarn ios  # or yarn android
+npm install
+# 1. bump "version" in package.json, e.g. 0.5.2-diag.2
+CI=1 bash node_modules/expo-module-scripts/bin/expo-module-build   # tsc → build/
+npm publish --tag next --ignore-scripts --otp=<code>               # npm 2FA code required
 ```
 
-### Building the Module
+`--ignore-scripts` skips `prepublishOnly`, so step 1's build is mandatory. Prereleases go
+under a dist-tag (`next`, earlier `diag`) so `latest` is not moved.
 
-```bash
-npm run build
-```
+Then in the consuming app: `npm install expo-juce@<version> --save-exact`, check that
+`package-lock.json` still has its macOS-only optional entries (a lockfile regenerated on
+Windows can drop them, and EAS's `npm ci` on macOS then fails), and run a new EAS build (EAS
+cannot resolve `file:` dependencies, which is why every native change goes through npm).
 
-# API documentation
+### Verifying without Xcode
 
-- [Documentation for the main branch](https://github.com/expo/expo/blob/main/docs/pages/versions/unversioned/sdk/juce.md)
-- [Documentation for the latest stable release](https://docs.expo.dev/versions/latest/sdk/juce/)
+1. **TypeScript:** `npx tsc --noEmit` here and in the consuming app.
+2. **Engine C++:** the offline harness compiles the vendored JUCE headless with `Voice`,
+   `VoiceAllocator`, `TransportEngine`, `PolySynthProcessor`, `FxChainProcessor` and a copy of
+   `GraphPlayer`, replays the `doSetup` order (synth → fx → output) and drives the callback with
+   iOS-like block sizes; separate cases check every effect, bypass and echo sync. From `test/harness` in
+   WSL (or any Linux shell):
+   ```sh
+   cmake -S . -B build && cmake --build build -j16 && ./build/harness
+   ```
+   See [test/harness/README.md](test/harness/README.md) (case `g2` is an expected-FAIL negative
+   control). Extend it for every new graph node.
+3. **ObjC++ / Swift:** careful review (no compiler locally); the EAS build is the first compile.
+4. **Device:** a diagnostics panel built on `getDiagnostics()`
+   ([docs/latency.md](docs/latency.md#5-a-diagnostics-panel)), then the slow-motion
+   measurement in [docs/latency.md](docs/latency.md#6-slow-motion-measurement-procedure).
 
-# Installation in managed Expo projects
+### JUCE vendoring
 
-For [managed](https://docs.expo.dev/archive/managed-vs-bare/) Expo projects, please follow the installation instructions in the [API documentation for the latest stable release](#api-documentation). If you follow the link and there is no documentation available then this library is not yet usable within managed projects &mdash; it is likely to be included in an upcoming Expo SDK release.
+`npm run download-juce` fetches JUCE 8.0.1 into `JUCE/` and `npm run vendor-juce` copies the needed modules into
+`ios/juce_modules` (stripping tests, demos and non-iOS code). Each JUCE module is compiled as
+its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the module flags and
+`JUCE_STANDALONE_APPLICATION 0`.
 
-# Installation in bare React Native projects
+## Documentation
 
-For bare React Native projects, you must ensure that you have [installed and configured the `expo` package](https://docs.expo.dev/bare/installing-expo-modules/) before continuing.
+- [docs/latency.md](docs/latency.md) — latency budget, signal path, changes, panel fields, slow-motion measurement
+- [test/harness/README.md](test/harness/README.md) — the offline engine harness
 
-### Add the package to your npm dependencies
+## License
 
-```
-npm install expo-juce
-```
-
-### Configure for iOS
-
-Run `npx pod-install` after installing the npm package.
-
-
-### Configure for Android
-
-## Running the Example App
-
-1. `cd example`
-1. `cd ios`
-1. `npx pod-install`
-1. Open workspace in XCode
-1. Update `ENABLE_USER_SCRIPT_SANDBOXING` to NO in Build Settings
-
-# Contributing
-
-Contributions are very welcome! Please refer to guidelines described in the [contributing guide]( https://github.com/expo/expo#contributing).
+MIT

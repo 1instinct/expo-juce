@@ -1,58 +1,269 @@
 import ExpoModulesCore
 
 public class ExpoJuceModule: Module {
-  public func definition() -> ModuleDefinition {
-    // Sets the name of the module that JavaScript code will use to refer to the module. Takes a string as an argument.
-    // Can be inferred from module's class name, but it's recommended to set it explicitly for clarity.
-    // The module will be accessible from `requireNativeModule('ExpoJuce')` in JavaScript.
-    Name("ExpoJuce")
-    
-    // Initialize tone generator when module is created
-    OnCreate {
-      ExpoJuceBridge.initialize()
+  private var hasListeners = false
+
+  // Reads a finite number from an options dictionary passed from JS.
+  private static func numberOption(_ options: [String: Any]?, _ key: String) -> Double? {
+    guard let value = options?[key] else {
+      return nil
     }
-    
+    var number: Double?
+    if let double = value as? Double {
+      number = double
+    } else if let int = value as? Int {
+      number = Double(int)
+    } else if let nsNumber = value as? NSNumber {
+      number = nsNumber.doubleValue
+    }
+    guard let result = number, result.isFinite else {
+      return nil
+    }
+    return result
+  }
+
+  public func definition() -> ModuleDefinition {
+    Name("ExpoJuce")
+
     OnDestroy {
+      ExpoJuceBridge.stopBeatTimer()
       ExpoJuceBridge.shutdown()
     }
 
-    // Sets constant properties on the module. Can take a dictionary or a closure that returns a dictionary.
     Constants([
       "PI": Double.pi
     ])
 
-    // Defines event names that the module can send to JavaScript.
-    Events("onChange")
+    Events("onChange", "onBeat")
 
-    // Defines a JavaScript synchronous function that runs the native code on the JavaScript thread.
     Function("hello") {
-      return "Hello world! 👋"
+      return "Hello world!"
     }
 
-    Function("getApiKey") {
-      return "api-key"
+    OnStartObserving {
+      self.hasListeners = true
+      ExpoJuceBridge.startBeatTimer()
     }
 
-    Function("playTone") { (frequency: Double, duration: Double) -> String in
-      ExpoJuceBridge.playTone(withFrequency: frequency, duration: duration)
-      return "Playing tone at \(frequency)Hz for \(duration)s"
+    OnStopObserving {
+      self.hasListeners = false
+      ExpoJuceBridge.stopBeatTimer()
     }
 
-    // Defines a JavaScript function that always returns a Promise and whose native code
-    // is by default dispatched on the different thread than the JavaScript runtime runs on.
+    // ── Lifecycle ──────────────────────────────────────────────────
+
+    // options: { bufferSize?: number; sampleRate?: number } (defaults 128 / 48000).
+    AsyncFunction("setup") { [weak self] (options: [String: Any]?, promise: Promise) in
+      let requestedBufferSize = ExpoJuceModule.numberOption(options, "bufferSize") ?? 128
+      let bufferSize = Int32(min(max(requestedBufferSize, 0), 4096))
+      let sampleRate = ExpoJuceModule.numberOption(options, "sampleRate") ?? 48000
+      DispatchQueue.main.async {
+        guard ExpoJuceBridge.setup(bufferSize: bufferSize, sampleRate: sampleRate) else {
+          promise.reject("ERR_AUDIO_SETUP", ExpoJuceBridge.setupErrorMessage())
+          return
+        }
+        ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
+          guard let self = self, self.hasListeners else { return }
+          self.sendEvent("onBeat", [
+            "beat": beat,
+            "bpm": bpm,
+          ])
+        }
+        promise.resolve(NSNull())
+      }
+    }
+
+    AsyncFunction("shutdown") {
+      ExpoJuceBridge.shutdown()
+    }.runOnQueue(.main)
+
+    // ── Diagnostics ────────────────────────────────────────────────
+
+    Function("getDiagnostics") { () -> [String: Any] in
+      return ExpoJuceBridge.getDiagnostics()
+    }
+
+    Function("playTestTone") { (durationMs: Double) -> Bool in
+      return ExpoJuceBridge.playTestTone(durationMs: durationMs)
+    }
+
+    // ── Synth (MIDI-style) ─────────────────────────────────────────
+    // Thread-safe: PolySynthProcessor uses a lock-free SPSC queue
+
+    Function("noteOn") { (note: Int, velocity: Int) in
+      ExpoJuceBridge.note(on: Int32(note), velocity: Int32(velocity))
+    }
+
+    Function("noteOff") { (note: Int) in
+      ExpoJuceBridge.noteOff(Int32(note))
+    }
+
+    Function("allNotesOff") {
+      ExpoJuceBridge.allNotesOff()
+    }
+
+    // ── Global Synth Params ────────────────────────────────────────
+    // Thread-safe: all params are std::atomic
+
+    Function("setWaveform") { (waveform: String) in
+      ExpoJuceBridge.setWaveform(waveform)
+    }
+
+    Function("setFilterCutoff") { (hz: Double) in
+      ExpoJuceBridge.setFilterCutoff(hz)
+    }
+
+    Function("setFilterResonance") { (q: Double) in
+      ExpoJuceBridge.setFilterResonance(q)
+    }
+
+    Function("setAttack") { (ms: Double) in
+      ExpoJuceBridge.setAttack(ms)
+    }
+
+    Function("setDecay") { (ms: Double) in
+      ExpoJuceBridge.setDecay(ms)
+    }
+
+    Function("setSustain") { (level: Double) in
+      ExpoJuceBridge.setSustain(level)
+    }
+
+    Function("setRelease") { (ms: Double) in
+      ExpoJuceBridge.setRelease(ms)
+    }
+
+    Function("setDetune") { (cents: Double) in
+      ExpoJuceBridge.setDetune(cents)
+    }
+
+    Function("setMasterLevel") { (level: Double) in
+      ExpoJuceBridge.setMasterLevel(level)
+    }
+
+    // ── Effects ────────────────────────────────────────────────────
+    // Lock-free: atomics in a process-lifetime store, remembered before setup and across
+    // engine rebuilds. false = unknown effect / parameter or non-finite value.
+
+    Function("setEffectEnabled") { (effect: String, enabled: Bool) -> Bool in
+      return ExpoJuceBridge.setEffectEnabled(effect, enabled: enabled)
+    }
+
+    Function("setEffectParam") { (effect: String, param: String, value: Double) -> Bool in
+      return ExpoJuceBridge.setEffectParam(effect, param: param, value: value)
+    }
+
+    Function("getEffectsState") { () -> [String: Any] in
+      return ExpoJuceBridge.getEffectsState()
+    }
+
+    // ── Metronome / backing track / analysis ───────────────────────
+    // Options are lock-free and remembered before setup and across rebuilds.
+
+    // false (nothing applied) for an unknown style.
+    Function("setMetronome") { (options: [String: Any]) -> Bool in
+      return ExpoJuceBridge.setMetronome(options)
+    }
+
+    Function("setBackingTrackOptions") { (options: [String: Any]) in
+      ExpoJuceBridge.setBackingTrackOptions(options)
+    }
+
+    // Decode + resample run on a background queue; a newer load or unload supersedes this one
+    // (rejects with ERR_BACKING_TRACK_SUPERSEDED).
+    AsyncFunction("loadBackingTrack") { (uri: String, gapless: [String: Any]?, promise: Promise) in
+      ExpoJuceBridge.loadBackingTrack(uri, gapless: gapless) { result, code, message in
+        if let result = result {
+          promise.resolve(result)
+        } else {
+          promise.reject(code ?? "ERR_BACKING_TRACK", message ?? "backing track load failed")
+        }
+      }
+    }
+
+    Function("unloadBackingTrack") {
+      ExpoJuceBridge.unloadBackingTrack()
+    }
+
+    Function("getAnalysis") { () -> [String: Any] in
+      return ExpoJuceBridge.getAnalysis()
+    }
+
+    // ── Arpeggiator (0.7.0+) ───────────────────────────────────────
+    // Options are lock-free and remembered before setup and across rebuilds. false (nothing
+    // applied) for an unknown mode / rate.
+
+    Function("setArpeggiator") { (options: [String: Any]) -> Bool in
+      return ExpoJuceBridge.setArpeggiator(options)
+    }
+
+    Function("getArpeggiatorState") { () -> [String: Any] in
+      return ExpoJuceBridge.getArpeggiatorState()
+    }
+
+    // ── Transport ──────────────────────────────────────────────────
+
+    Function("startTransport") {
+      ExpoJuceBridge.startTransport()
+    }
+
+    Function("stopTransport") {
+      ExpoJuceBridge.stopTransport()
+    }
+
+    Function("setTempo") { (bpm: Double) in
+      ExpoJuceBridge.setTempo(bpm)
+    }
+
+    Function("setTransportPosition") { (beat: Double) in
+      ExpoJuceBridge.setTransportPosition(beat)
+    }
+
+    Function("getTransportPosition") { () -> Double in
+      return ExpoJuceBridge.getTransportPosition()
+    }
+
+    Function("getTempo") { () -> Double in
+      return ExpoJuceBridge.getTempo()
+    }
+
+    Function("isTransportPlaying") { () -> Bool in
+      return ExpoJuceBridge.isTransportPlaying()
+    }
+
+    // ── Async / View ───────────────────────────────────────────────
+
     AsyncFunction("setValueAsync") { (value: String) in
-      // Send an event to JavaScript.
       self.sendEvent("onChange", [
         "value": value
       ])
     }
 
-    // Enables the module to be used as a native view. Definition components that are accepted as part of the
-    // view definition: Prop, Events.
-    View(ExpoJuceView.self) {
-      // Defines a setter for the `name` prop.
-      Prop("name") { (view: ExpoJuceView, prop: String) in
-        print(prop)
+    // Lets JS detect a binary that has JucePadView (older binaries lack this function).
+    Function("hasJucePadView") { () -> Bool in
+      return true
+    }
+
+    // Native touch pad (see JucePadView.swift). The module's only view, so it is the default
+    // view: requireNativeViewManager('ExpoJuce').
+    View(JucePadView.self) {
+      Events("onNoteOn", "onNoteOff")
+
+      Prop("note") { (view: JucePadView, note: Int) in
+        view.note = note
+      }
+
+      Prop("velocity") { (view: JucePadView, velocity: Int?) in
+        view.velocity = velocity ?? 100
+      }
+
+      Prop("enabled") { (view: JucePadView, enabled: Bool?) in
+        view.enabled = enabled ?? true
+      }
+
+      // Normalised flat [x0, y0, x1, y1, …]; empty / odd / < 3 points = whole rect.
+      Prop("hitPolygon") { (view: JucePadView, polygon: [Double]?) in
+        view.hitPolygon = polygon ?? []
       }
     }
   }
