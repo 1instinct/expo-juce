@@ -9,8 +9,9 @@ iOS is complete. Android (0.9.0+) is being ported: notes, the synth parameters, 
 and diagnostics play through JUCE's Oboe device; the rest of the API exists on Android but is not
 implemented yet (see [Android](#android-090)). The web module is a stub.
 
-> **Branches.** `main` is a stale scaffold. Current work is on `@aaron.smulktis/develop`;
-> the diagnostics and latency work is on `debug/audio-diagnostics`.
+> **Branches and releases.** `main` is the current line; work lands on it by PR. Pushing a tag
+> `v<version>` publishes to npm (`next` for `-rc` versions, `latest` otherwise); see
+> [RELEASING.md](RELEASING.md).
 
 ## Architecture
 
