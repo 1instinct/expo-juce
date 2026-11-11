@@ -14,6 +14,7 @@
 #include "AnalysisRing.h"
 #include "Arpeggiator.h"
 #include "SpectrumAnalyser.h"
+#include "DrumMachine.h"
 
 #include <atomic>
 #include <chrono>
@@ -61,6 +62,24 @@ void free(void* p) {
     if (tCountAllocs && p != nullptr) gRenderFrees.fetch_add(1, std::memory_order_relaxed);
     __libc_free(p);
 }
+}
+
+//==============================================================================
+// BackingTrack::acquire() test seam (CMake defines BACKING_TRACK_ACQUIRE_HOOK as this name). A
+// test arms gAcquireHook; the next acquire() runs it once, between its first read of the
+// published pointer and the re-validation, i.e. as if the control thread published right then.
+// What the hook does is not counted as a render allocation.
+static std::function<void()> gAcquireHook;
+static int gAcquireHookCalls = 0;
+void harnessBackingTrackAcquireHook() {
+    if (!gAcquireHook) return;
+    const bool counting = tCountAllocs;
+    tCountAllocs = false;
+    auto hook = std::move(gAcquireHook);
+    gAcquireHook = nullptr;
+    ++gAcquireHookCalls;
+    hook();
+    tCountAllocs = counting;
 }
 
 //==============================================================================
@@ -1346,6 +1365,547 @@ static bool runBackingTrackTempoRamp() {
     return pass;
 }
 
+// ── Backing track following the tempo ──
+// A click on every beat of a track at `srcBpm`: 6 ms of 1 kHz at 0.8, otherwise exact silence.
+static std::unique_ptr<BackingTrackBuffer> clickTrack(double srcBpm, double sr, int beats) {
+    auto t = std::make_unique<BackingTrackBuffer>();
+    const double perBeat = 60.0 / srcBpm * sr;
+    const int L = (int)std::llround(perBeat * beats);
+    t->sampleRate = sr;
+    t->length = L;
+    t->audio.setSize(2, L);
+    t->audio.clear();
+    const int burst = (int)(0.006 * sr);
+    for (int k = 0; k < beats; ++k) {
+        const int at = (int)std::llround(k * perBeat);
+        for (int i = 0; i < burst && at + i < L; ++i) {
+            const float v = 0.8f * (float)std::sin(juce::MathConstants<double>::twoPi * 1000.0 * i / sr);
+            t->audio.setSample(0, at + i, v);
+            t->audio.setSample(1, at + i, v);
+        }
+    }
+    return t;
+}
+
+// A steady sine, a whole number of periods long, so its own loop seam is invisible.
+static std::unique_ptr<BackingTrackBuffer> sineTrack(double freq, double sr, double seconds, float amp = 0.5f) {
+    auto t = std::make_unique<BackingTrackBuffer>();
+    const int periods = (int)std::llround(freq * seconds);
+    const int L = (int)std::llround(periods * sr / freq);
+    t->sampleRate = sr;
+    t->length = L;
+    t->audio.setSize(2, L);
+    for (int i = 0; i < L; ++i) {
+        const float v = amp * (float)std::sin(juce::MathConstants<double>::twoPi * periods * (double)i / (double)L);
+        t->audio.setSample(0, i, v);
+        t->audio.setSample(1, i, v);
+    }
+    return t;
+}
+
+// Where each beat's click sounds, in samples from the start of the render: the first sample over
+// half the click's level within ±windowSec of `gridAt(beat)`. -1 if none.
+static std::vector<int> clickOnsets(const std::vector<float>& l, int firstBeat, int beats, double sr, double windowSec,
+                                    const std::function<double(int)>& gridAt) {
+    std::vector<int> out;
+    const int w = (int)(windowSec * sr);
+    for (int k = firstBeat; k < firstBeat + beats; ++k) {
+        const int g = (int)std::llround(gridAt(k));
+        int found = -1;
+        for (int i = std::max(0, g - w); i < std::min((int)l.size(), g + w); ++i)
+            if (std::fabs(l[(size_t)i]) > 0.4f) { found = i; break; }
+        out.push_back(found);
+    }
+    return out;
+}
+
+// Frequency from positive-going zero crossings over [from, to).
+static double risingCrossingHz(const std::vector<float>& l, int from, int to, double sr) {
+    int first = -1, last = -1, crossings = 0;
+    for (int i = from + 1; i < to; ++i) {
+        if (l[(size_t)i - 1] < 0.0f && l[(size_t)i] >= 0.0f) {
+            if (first < 0) first = i;
+            last = i;
+            ++crossings;
+        }
+    }
+    return crossings > 1 ? (crossings - 1) * sr / (double)(last - first) : 0.0;
+}
+
+// A track with a source tempo keeps its beats on the transport's beats at any tempo, with its
+// pitch unchanged, and is the untouched file at its own tempo.
+static bool runBackingTrackFollow() {
+    const std::vector<int> blocks = {471, 127, 1024, 333};
+    int failures = 0;
+    uint64_t allocs = 0, frees = 0;
+    std::string detail;
+    const auto check = [&](bool ok, const std::string& what) {
+        if (!ok) ++failures;
+        detail += std::string("  ") + (ok ? "ok   " : "FAIL ") + what + "\n";
+    };
+    struct Rig {
+        BackingTrack holder;
+        AuxProcessor aux;
+        TransportEngine transport;
+        Rig(double sr, double bpm) {
+            transport.setTempo(bpm);
+            aux.setBackingTrack(&holder);
+            aux.setTransport(&transport);
+            aux.auxSettings().setTrackLevel(1.0);
+            aux.setRateAndBufferSizeDetails(sr, 512);
+            aux.prepareToPlay(sr, 512);
+        }
+        void install(std::unique_ptr<BackingTrackBuffer> t, double sourceBpm) {
+            t->sourceBpm = sourceBpm;
+            holder.install(std::move(t), {}, holder.beginLoad());
+        }
+    };
+    const auto render = [&](Rig& r, double sr, int total, std::vector<float>& l, const std::function<void(int)>& before = {}) {
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        renderAux(r.aux, r.transport, sr, total, blocks, l, nullptr, before);
+        allocs += gRenderAllocs.load(); frees += gRenderFrees.load();
+    };
+
+    // 1. Beat lock at steady tempos, both ways and at both rates: every click within the limit
+    //    of its beat, and no drift from the first beats to the last.
+    struct Lock { double src, bpm, sr; };
+    for (const Lock c : {Lock{100, 120, 48000}, Lock{100, 80, 48000}, Lock{100, 150, 48000}, Lock{124, 100, 44100}, Lock{84, 90, 48000}}) {
+        Rig r(c.sr, c.bpm);
+        r.install(clickTrack(c.src, c.sr, 32), c.src);
+        r.transport.start();
+        const int beats = 96; // three times around the loop
+        const double perBeat = 60.0 / c.bpm * c.sr;
+        std::vector<float> l;
+        render(r, c.sr, (int)(perBeat * (beats + 1)), l);
+        const auto on = clickOnsets(l, 0, beats, c.sr, 0.05, [&](int k) { return k * perBeat; });
+        double worst = 0.0, early = 0.0, late = 0.0;
+        int missing = 0;
+        for (int k = 0; k < beats; ++k) {
+            if (on[(size_t)k] < 0) { ++missing; continue; }
+            const double err = (on[(size_t)k] - k * perBeat) / c.sr * 1000.0;
+            worst = std::max(worst, std::fabs(err));
+            if (k < 16) early += err / 16.0;
+            if (k >= beats - 16) late += err / 16.0;
+        }
+        char text[160];
+        std::snprintf(text, sizeof(text), "track %.0f at %.0f bpm, %.0f Hz: worst click %.1f ms from its beat, drift %.2f ms, missing %d",
+                      c.src, c.bpm, c.sr, worst, late - early, missing);
+        check(missing == 0 && worst <= 20.0 && std::fabs(late - early) <= 3.0, text);
+    }
+
+    // 2. A tempo change while playing takes effect: 120 → 90 bpm on bar 5, the clicks are on the
+    //    new grid at once, and bar 1 of the second time round is still on its beat.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(clickTrack(100, sr, 16), 100);
+        r.transport.start();
+        const int change = 16 * 24000;
+        bool changed = false;
+        std::vector<float> l;
+        render(r, sr, change + 34 * 32000, l, [&](int done) {
+            if (!changed && done >= change) { r.transport.setTempo(90); changed = true; }
+        });
+        const auto on = clickOnsets(l, 17, 32, sr, 0.05, [&](int k) { return change + (k - 16) * 32000.0; });
+        double worst = 0.0;
+        int missing = 0;
+        for (int k = 0; k < 32; ++k) {
+            if (on[(size_t)k] < 0) { ++missing; continue; }
+            worst = std::max(worst, std::fabs(on[(size_t)k] - (change + (k + 1) * 32000.0)) / sr * 1000.0);
+        }
+        char text[120];
+        std::snprintf(text, sizeof(text), "tempo 120 -> 90 while playing: worst click %.1f ms from its beat, missing %d", worst, missing);
+        check(missing == 0 && worst <= 25.0, text);
+    }
+
+    // 3. Pitch stays, level stays, no clicks: a steady sine through the stretch.
+    for (const double bpm : {120.0, 80.0, 133.0}) {
+        for (const double freq : {55.0, 220.0, 1760.0}) {
+            const double sr = 48000.0;
+            Rig r(sr, bpm);
+            r.install(sineTrack(freq, sr, 1.0), 100);
+            r.transport.start();
+            const int total = 3 * 48000;
+            std::vector<float> l;
+            render(r, sr, total, l);
+            const double hz = risingCrossingHz(l, 4800, total, sr);
+            float lowest = 1.0f, highest = 0.0f, step = 0.0f;
+            const int win = std::max(1024, (int)(3.0 * sr / freq));
+            for (int from = 4800; from + win < total; from += win / 2) {
+                double e = 0.0;
+                for (int i = from; i < from + win; ++i) e += (double)l[(size_t)i] * l[(size_t)i];
+                const float rms = (float)std::sqrt(e / win);
+                lowest = std::min(lowest, rms);
+                highest = std::max(highest, rms);
+            }
+            for (int i = 1; i < total; ++i) step = std::max(step, std::fabs(l[(size_t)i] - l[(size_t)i - 1]));
+            const float idealRms = 0.5f / std::sqrt(2.0f);
+            const float idealStep = 0.5f * (float)(juce::MathConstants<double>::twoPi * freq / sr);
+            char text[170];
+            std::snprintf(text, sizeof(text), "%.0f Hz sine at %.0f bpm (track 100): %.2f Hz, rms %.3f..%.3f (ideal %.3f), largest step %.4f (sine's own %.4f)",
+                          freq, bpm, hz, lowest, highest, idealRms, step, idealStep);
+            check(std::fabs(hz / freq - 1.0) < 0.005 && lowest > 0.9f * idealRms && highest < 1.1f * idealRms
+                  && step < idealStep * 1.25f + 0.002f, text);
+        }
+    }
+
+    // 4. At its own tempo it is the file: the same samples as with no source tempo at all, across
+    //    a start, a seek and a pause + resume.
+    {
+        const double sr = 48000.0;
+        const auto run = [&](double sourceBpm, std::vector<float>& l) {
+            Rig r(sr, 100);
+            r.install(makeTrack(30000, sr), sourceBpm);
+            r.transport.start();
+            int phase = 0;
+            render(r, sr, 200000, l, [&](int done) {
+                if (phase == 0 && done >= 60000) { r.transport.setPosition(10.25); ++phase; }
+                if (phase == 1 && done >= 90000) { r.transport.stop(); ++phase; }
+                if (phase == 2 && done >= 100000) { r.transport.start(); ++phase; }
+            });
+        };
+        std::vector<float> plain, own;
+        run(0.0, plain);
+        run(100.0, own);
+        int diffs = 0;
+        for (size_t i = 0; i < plain.size(); ++i) diffs += plain[i] == own[i] ? 0 : 1;
+        check(diffs == 0, "track at its own tempo == no source tempo, sample for sample: " + std::to_string(diffs) + " differ");
+    }
+
+    // 5. Back at its own tempo it returns to the file, sample-exact and on the grid. A change at a
+    //    known beat: 120 → 100 bpm, then every sample equals the track at beat × 60 / 100.
+    {
+        const double sr = 48000.0;
+        const int L = 300000;
+        juce::AudioBuffer<float> ref;
+        { auto t = makeTrack(L, sr); ref.makeCopyOf(t->audio); }
+        Rig r(sr, 120);
+        r.install(makeTrack(L, sr), 100);
+        r.transport.start();
+        bool changed = false;
+        int changeAt = -1;
+        double beatAtChange = 0.0;
+        std::vector<float> l;
+        render(r, sr, 240000, l, [&](int done) {
+            if (!changed && done >= 96000) {
+                beatAtChange = done * 120.0 / 60.0 / sr;
+                r.transport.setTempo(100);
+                changeAt = done;
+                changed = true;
+            }
+        });
+        // Two hand-overs at most, then the plain path.
+        const int settled = changeAt + (int)(2.0 * AuxProcessor::kGrainHopSeconds * sr) + 2048;
+        int off = 0;
+        for (int i = settled; i < 240000; ++i) {
+            const double beat = beatAtChange + (i - changeAt) * 100.0 / 60.0 / sr;
+            const int64_t p = std::llround(beat * 60.0 / 100.0 * sr);
+            off += l[(size_t)i] == ref.getSample(0, (int)(p % L)) ? 0 : 1;
+        }
+        check(off == 0, "back at its own tempo: sample-exact on the grid, " + std::to_string(off) + " samples off");
+    }
+
+    // 6. Seek and pause + resume while stretched land on the track's own grid, not the transport's.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(clickTrack(100, sr, 64), 100);
+        r.transport.start();
+        int seekAt = -1, pauseAt = -1, resumeAt = -1;
+        std::vector<float> l;
+        render(r, sr, 400000, l, [&](int done) {
+            if (seekAt < 0 && done >= 50000) { r.transport.setPosition(16.5); seekAt = done; }
+            if (pauseAt < 0 && done >= 150000) { r.transport.stop(); pauseAt = done; }
+            if (pauseAt >= 0 && resumeAt < 0 && done >= 200000) { r.transport.start(); resumeAt = done; }
+        });
+        const auto worstFrom = [&](double beatBase, int base, int count) {
+            double worst = 0.0;
+            for (int k = 0; k < count; ++k) {
+                const int beat = (int)std::ceil(beatBase) + k;
+                const double at = base + (beat - beatBase) * 24000.0;
+                const auto on = clickOnsets(l, 0, 1, sr, 0.05, [&](int) { return at; });
+                worst = std::max(worst, on[0] < 0 ? 1000.0 : std::fabs(on[0] - at) / sr * 1000.0);
+            }
+            return worst;
+        };
+        const double afterSeek = worstFrom(16.5, seekAt, 3);
+        const double beatAtPause = 16.5 + (pauseAt - seekAt) / 24000.0;
+        const double afterResume = worstFrom(beatAtPause, resumeAt, 3);
+        char text[120];
+        std::snprintf(text, sizeof(text), "stretched: clicks after a seek within %.1f ms, after pause + resume within %.1f ms", afterSeek, afterResume);
+        check(afterSeek <= 20.0 && afterResume <= 20.0, text);
+    }
+
+    // 7. Starting, seeking, stopping and swapping a stretched track are declicked.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(sineTrack(220.0, sr, 1.0), 100);
+        r.transport.start();
+        int phase = 0;
+        std::vector<float> l;
+        render(r, sr, 192000, l, [&](int done) {
+            if (phase == 0 && done >= 48000) { r.transport.setPosition(3.3); ++phase; }
+            if (phase == 1 && done >= 96000) { r.holder.install([&] { auto t = sineTrack(220.0, sr, 1.5); t->sourceBpm = 100; return t; }(), {}, r.holder.beginLoad()); ++phase; }
+            if (phase == 2 && done >= 144000) { r.transport.stop(); ++phase; }
+        });
+        float step = 0.0f;
+        for (size_t i = 1; i < l.size(); ++i) step = std::max(step, std::fabs(l[i] - l[i - 1]));
+        char text[120];
+        std::snprintf(text, sizeof(text), "stretched seek, swap, stop: largest step %.4f (sine's own 0.0144)", step);
+        check(step < 0.05f, text);
+        int collected = -1;
+        for (int i = 0; i < 3 && collected != 0; ++i) collected = r.holder.collect();
+        check(collected == 0, "replaced buffer freed after its fade-out");
+    }
+
+    // 8. Loop off: one stretched pass, then silence.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.aux.auxSettings().setTrackLoop(false);
+        r.install(sineTrack(220.0, sr, 1.0), 100); // 1 s of track = 1 / 1.2 s on this transport
+        r.transport.start();
+        std::vector<float> l;
+        render(r, sr, 96000, l);
+        const int end = (int)(48000 / 1.2);
+        const int after = end + (int)((AuxProcessor::kGrainHopSeconds * 2.0 + AuxProcessor::kGrainSearchSeconds) * sr);
+        float sounding = 0.0f, past = 0.0f;
+        for (int i = 0; i < end - 2400; ++i) sounding = std::max(sounding, std::fabs(l[(size_t)i]));
+        for (int i = after; i < 96000; ++i) past = std::max(past, std::fabs(l[(size_t)i]));
+        char text[100];
+        std::snprintf(text, sizeof(text), "loop off: peak %.2f during the pass, %.5f after it", sounding, past);
+        check(sounding > 0.4f && past == 0.0f, text);
+    }
+
+    // 9. The tempo travels with the file: load() puts it on the buffer, a device-rate reload keeps
+    //    it, and nonsense means "unknown".
+    {
+        const double sr = 48000.0;
+        juce::AudioBuffer<float> ref;
+        { auto t = makeTrack(30000, sr); ref.makeCopyOf(t->audio); }
+        const std::string path = writeWav(ref, sr, "ejfx-bt-follow.wav");
+        BackingTrackSource source;
+        source.path = path;
+        source.sourceBpm = 128.5;
+        BackingTrackInfo info;
+        std::string error;
+        auto buffer = BackingTrack::load(source, sr, {}, info, error);
+        const bool onLoad = buffer != nullptr && buffer->sourceBpm == 128.5 && info.sourceBpm == 128.5;
+        BackingTrack holder;
+        holder.install(std::move(buffer), source, holder.beginLoad());
+        holder.requestRate(44100.0);
+        const bool reloaded = holder.reload();
+        const BackingTrackBuffer* after = holder.publishedBuffer();
+        const bool onReload = reloaded && after != nullptr && after->sampleRate == 44100.0 && after->sourceBpm == 128.5;
+        bool nonsense = true;
+        for (const double v : {-10.0, std::nan(""), std::numeric_limits<double>::infinity()}) {
+            source.sourceBpm = v;
+            auto b = BackingTrack::load(source, sr, {}, info, error);
+            nonsense = nonsense && b != nullptr && b->sourceBpm == 0.0 && info.sourceBpm == 0.0;
+        }
+        holder.unload();
+        holder.collect();
+        juce::File(juce::String(path)).deleteFile();
+        check(onLoad, "load() puts the tempo on the buffer and in the info");
+        check(onReload, "a device-rate reload keeps the tempo");
+        check(nonsense, "negative, NaN and infinite tempos mean unknown");
+    }
+
+    // 10. Cost: the stretch on a dense track, 128-sample blocks, 20 s, well under real time, with
+    //     no block near its budget (a search lands inside one block).
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.install(makeTrack(480000, sr), 100);
+        r.transport.start();
+        juce::AudioBuffer<float> buf(2, 128);
+        juce::MidiBuffer midi;
+        double total = 0.0, worst = 0.0;
+        for (int i = 0; i < (int)(20.0 * sr / 128); ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            r.transport.advanceBlock(128, sr);
+            r.aux.processBlock(buf, midi);
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            total += s;
+            worst = std::max(worst, s);
+        }
+        char text[120];
+        std::snprintf(text, sizeof(text), "cost: %.4f x realtime, worst block %.3f ms of its 2.667 ms", total / 20.0, worst * 1000.0);
+        check(total / 20.0 < 0.05, text);
+    }
+
+    // 11. Real music (the 124 bpm MP3 fixture, 48 kHz) at 124, 123, 100, 150 and 70 bpm, with a click on
+    //     every beat: each click within 12 ms of its beat (the search reaches 10 ms; 20 ms at 70 bpm,
+    //     close to half speed), the median within 7 ms (the search now
+    //     sees real music); the level per beat stays within 1.5 dB of the source's.
+    {
+        const double sr = 48000.0;
+        BackingTrackSource source;
+        source.path = std::string(HARNESS_FIXTURES) + "/loop-124bpm-44k.mp3";
+        source.hasGapless = true;
+        source.gapless = {682839, 4561, 1496};
+        source.sourceBpm = 124.0;
+        BackingTrackInfo info;
+        std::string error;
+        auto loaded = BackingTrack::load(source, sr, {}, info, error);
+        if (loaded == nullptr) {
+            check(false, "fixture decode: " + error);
+        } else {
+            juce::AudioBuffer<float> ref;
+            ref.makeCopyOf(loaded->audio);
+            const int L = loaded->length;
+            // The music at half level plus a click on every beat (the click track of part 1).
+            juce::AudioBuffer<float> mixed;
+            mixed.makeCopyOf(ref);
+            mixed.applyGain(0.5f);
+            {
+                auto clicks = clickTrack(124.0, sr, (int)std::floor(L / (60.0 / 124.0 * sr)));
+                for (int ch = 0; ch < 2; ++ch) mixed.addFrom(ch, 0, clicks->audio, ch, 0, std::min(L, clicks->length));
+            }
+            for (const double bpm : {124.0, 123.0, 100.0, 150.0, 70.0}) {
+                Rig r(sr, bpm);
+                auto copy = std::make_unique<BackingTrackBuffer>();
+                copy->audio.makeCopyOf(mixed);
+                copy->sampleRate = sr;
+                copy->length = L;
+                r.install(std::move(copy), 124.0);
+                r.transport.start();
+                const double outPerBeat = 60.0 / bpm * sr, srcPerBeat = 60.0 / 124.0 * sr;
+                const int beats = 24;
+                std::vector<float> l;
+                render(r, sr, (int)(outPerBeat * (beats + 1)), l);
+                // A 1 kHz click (6 ms) on every source beat rides on the music; the matched filter
+                // finds it in the output within 40 ms of its beat.
+                const int burst = (int)(0.006 * sr), reach = (int)(0.04 * sr);
+                const auto clickAt = [&](double beatAt) {
+                    double best = -1.0;
+                    int at = 0;
+                    for (int d = -reach; d <= reach; ++d) {
+                        double acc = 0.0;
+                        for (int j = 0; j < burst; ++j)
+                            acc += l[(size_t)((int)beatAt + d + j)] * std::sin(juce::MathConstants<double>::twoPi * 1000.0 * j / sr);
+                        if (acc > best) { best = acc; at = d; }
+                    }
+                    return at;
+                };
+                std::vector<double> lags;
+                double worstDb = 0.0;
+                // The level is compared on the music alone: 30 ms clear of the clicks at both ends of a beat.
+                const int skipOut = (int)(0.03 * sr), skipSrc = (int)(0.03 * sr);
+                for (int k = 1; k < beats - 1; ++k) {
+                    lags.push_back(std::fabs(clickAt(std::llround(k * outPerBeat)) / sr * 1000.0));
+                    double eo = 0.0, es = 0.0;
+                    for (int i = skipOut; i < (int)outPerBeat - skipOut; ++i) eo += (double)l[(size_t)(k * outPerBeat) + i] * l[(size_t)(k * outPerBeat) + i];
+                    for (int i = skipSrc; i < (int)srcPerBeat - skipSrc; ++i) { const float v = mixed.getSample(0, ((int)(k * srcPerBeat) + i) % L); es += (double)v * v; }
+                    worstDb = std::max(worstDb, std::fabs(10.0 * std::log10((eo / (outPerBeat - 2 * skipOut) + 1e-12) / (es / (srcPerBeat - 2 * skipSrc) + 1e-12))));
+                }
+                std::vector<double> sorted = lags;
+                std::sort(sorted.begin(), sorted.end());
+                const double median = sorted[sorted.size() / 2], worst = sorted.back();
+                char text[160];
+                std::snprintf(text, sizeof(text), "fixture 124 bpm at %.0f bpm: clicks on the music (%d beats) off their beat by median %.1f ms, worst %.1f ms; level per beat within %.2f dB",
+                              bpm, (int)lags.size(), median, worst, worstDb);
+                // Near half speed (70 bpm) a click may land a little further off: it is in up to four grains.
+                check(median <= 7.0 && worst <= (bpm < 80.0 ? 20.0 : 12.0) && worstDb <= 1.5, text);
+            }
+        }
+    }
+
+    // 12. Bar 1 is the file's first sample, never the loop's tail: a track silent for its first half
+    //     and loud in its last, from beat 0 at 80 and 120 bpm (loop on), and after a count-in from
+    //     beat -4 with loop off that comes back on 30 ms after bar 1: exact silence until the
+    //     loud half is due.
+    for (const double bpm : {80.0, 120.0}) {
+        for (const bool countIn : {false, true}) {
+            const double sr = 48000.0;
+            Rig r(sr, bpm);
+            auto t = std::make_unique<BackingTrackBuffer>();
+            t->sampleRate = sr;
+            t->length = 48000;
+            t->audio.setSize(2, 48000);
+            t->audio.clear();
+            for (int i = 24000; i < 48000; ++i)
+                for (int ch = 0; ch < 2; ++ch) t->audio.setSample(ch, i, 0.5f * (float)std::sin(i * 0.05));
+            r.install(std::move(t), 100);
+            if (countIn) { r.aux.auxSettings().setTrackLoop(false); r.transport.setPosition(-4.0); }
+            r.transport.start();
+            const int bar1 = countIn ? (int)std::llround(4 * 60.0 / bpm * sr) : 0;
+            bool restored = !countIn;
+            std::vector<float> l;
+            render(r, sr, bar1 + 48000, l, [&](int done) {
+                if (!restored && done >= bar1 + (int)(0.03 * sr)) { r.aux.auxSettings().setTrackLoop(true); restored = true; }
+            });
+            // The loud half starts 0.5 s into the track: 0.5 × 100 / bpm s after bar 1, less the search.
+            const int quietUntil = bar1 + (int)((0.5 * 100.0 / bpm - AuxProcessor::kGrainSearchSeconds - 0.005) * sr);
+            float before = 0.0f;
+            for (int i = 0; i < quietUntil; ++i) before = std::max(before, std::fabs(l[(size_t)i]));
+            char text[140];
+            std::snprintf(text, sizeof(text), "%s at %.0f bpm: peak %.5f before the track's loud half is due (its tail must not bleed in)",
+                          countIn ? "count-in from beat -4, loop back on after bar 1," : "start at beat 0", bpm, before);
+            check(before == 0.0f, text);
+        }
+    }
+
+    // 13. A swap to a track without a tempo while stretching: after the 5 ms crossfade the new
+    //     track plays plainly, sample after sample, and the ratio reads 1.
+    {
+        const double sr = 48000.0;
+        const int L = 200000;
+        juce::AudioBuffer<float> ref;
+        { auto t = makeTrack(L, sr, 1.7); ref.makeCopyOf(t->audio); }
+        Rig r(sr, 120);
+        r.install(sineTrack(220.0, sr, 2.0), 100);
+        r.transport.start();
+        int swapAt = -1;
+        std::vector<float> l;
+        render(r, sr, 120000, l, [&](int done) {
+            if (swapAt < 0 && done >= 30000) { r.holder.install(makeTrack(L, sr, 1.7), {}, r.holder.beginLoad()); swapAt = done; }
+        });
+        const int from = swapAt + 2048;
+        int p0 = -1;
+        for (int p = 0; p < L && p0 < 0; ++p)
+            if (ref.getSample(0, p) == l[(size_t)from] && ref.getSample(0, (p + 1) % L) == l[(size_t)from + 1]) p0 = p;
+        int off = p0 < 0 ? -1 : 0;
+        for (int i = from; p0 >= 0 && i < 120000; ++i) off += l[(size_t)i] == ref.getSample(0, (p0 + i - from) % L) ? 0 : 1;
+        const double ratio = r.aux.diag.trackTempoRatio.load();
+        check(off == 0 && ratio == 1.0, "swap to a track without a tempo mid-stretch: plain after the fade, "
+              + std::to_string(off) + " samples off, ratio " + std::to_string(ratio));
+    }
+
+    // 14. Loop toggled while stretching: on, off and on again inside the track keep the sound going
+    //     with no step above the sine's own; with loop on it plays on past the end.
+    {
+        const double sr = 48000.0;
+        Rig r(sr, 120);
+        r.aux.auxSettings().setTrackLoop(false);
+        r.install(sineTrack(220.0, sr, 1.0), 100);
+        r.transport.start();
+        int phase = 0;
+        std::vector<float> l;
+        render(r, sr, 144000, l, [&](int done) {
+            if (phase == 0 && done >= 9000) { r.aux.auxSettings().setTrackLoop(true); ++phase; }
+            if (phase == 1 && done >= 18000) { r.aux.auxSettings().setTrackLoop(false); ++phase; }
+            if (phase == 2 && done >= 27000) { r.aux.auxSettings().setTrackLoop(true); ++phase; }
+        });
+        float step = 0.0f, lowest = 1.0f;
+        for (size_t i = 1; i < l.size(); ++i) step = std::max(step, std::fabs(l[i] - l[i - 1]));
+        for (int from = 4800; from + 4800 <= 144000; from += 2400) {
+            double e = 0.0;
+            for (int i = from; i < from + 4800; ++i) e += (double)l[(size_t)i] * l[(size_t)i];
+            lowest = std::min(lowest, (float)std::sqrt(e / 4800));
+        }
+        char text[140];
+        std::snprintf(text, sizeof(text), "loop toggled mid-stretch: largest step %.4f (sine's own 0.0144), lowest rms %.3f past the end too", step, lowest);
+        check(step < 0.02f && lowest > 0.3f, text);
+    }
+
+    check(allocs == 0 && frees == 0, "render: " + std::to_string(allocs) + " allocations, " + std::to_string(frees) + " frees");
+    std::printf("btf   backing track follows the tempo  %-4s\n%s", failures == 0 ? "PASS" : "FAIL", detail.c_str());
+    std::fflush(stdout);
+    return failures == 0;
+}
+
 // Swaps are declicked: while a track of constant +0.5 plays, a track of constant -0.5 replaces
 // it (crossfade, never a step larger than one fade increment), then an unload fades it out. The
 // old buffer stays alive while it fades out (collect() keeps it), and is freed afterwards.
@@ -1482,6 +2042,82 @@ static bool runBackingTrackLimits() {
     std::printf("btl   frame cap + available-memory check  %-4s too long: \"%s\"; low memory: \"%s\"; live %d\n",
                 pass ? "PASS" : "FAIL", tooLong.c_str(), noMemory.c_str(), live);
     std::fflush(stdout);
+    return pass;
+}
+
+// A swap that lands inside acquire(), after its first read of the published pointer and before
+// the re-validation (the seam runs the control side right there): the reader moves to the new
+// buffer (or to none, for an unload) in that block and fades the old one out, so collect() must
+// keep the old buffer until the fade-out ends. Then it is freed. Deterministic replay of the
+// race the threaded `bts` case hits at random (a freed buffer read by the fade-out).
+static bool runBackingTrackSwapInAcquire() {
+    const double sr = 48000.0;
+    const int fade = (int)(AuxProcessor::kFadeSeconds * sr);
+    BackingTrack holder;
+    TransportEngine transport;
+    AuxProcessor aux;
+    aux.setBackingTrack(&holder);
+    aux.setTransport(&transport);
+    aux.auxSettings().setTrackLevel(1.0);
+    aux.setRateAndBufferSizeDetails(sr, 128);
+    aux.prepareToPlay(sr, 128);
+    transport.start();
+    juce::AudioBuffer<float> buf(2, 128);
+    juce::MidiBuffer midi;
+    uint64_t allocs = 0;
+    auto block = [&] {
+        tCountAllocs = true;
+        transport.advanceBlock(128, sr);
+        aux.processBlock(buf, midi);
+        tCountAllocs = false;
+        allocs += gRenderAllocs.exchange(0) + gRenderFrees.exchange(0);
+    };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    gAcquireHookCalls = 0;
+    holder.install(constantTrack(20000, sr, 0.5f), {}, holder.beginLoad());
+    for (int i = 0; i < 10; ++i) block();
+    const float before = buf.getSample(0, 127);
+
+    // Replace inside acquire(): the old buffer fades out over `fade` samples (2 blocks).
+    auto next = constantTrack(20000, sr, -0.5f);
+    gAcquireHook = [&] { holder.install(std::move(next), {}, holder.beginLoad()); };
+    block();
+    const float firstAfter = buf.getSample(0, 0); // ≈ 0.5: the old buffer still sounds at full gain
+    const int pendingSwap = holder.collect();     // 1: the fading buffer is still in use
+    const int liveSwap = BackingTrackBuffer::live.load();
+    // With the old buffer freed the next blocks would read freed memory: stop there.
+    const bool swapKept = pendingSwap == 1 && liveSwap == 2;
+    int pendingSwapAfter = -2, liveSwapAfter = -1, pendingUnload = -2, liveUnload = -1, pendingEnd = -2, liveEnd = -1;
+    if (swapKept) {
+        for (int i = 0; i < fade / 128 + 3; ++i) block();
+        pendingSwapAfter = holder.collect(); // 0: fade-out over, freed
+        liveSwapAfter = BackingTrackBuffer::live.load();
+        // Unload inside acquire(): the same for the fade-out to silence.
+        gAcquireHook = [&] { holder.unload(); };
+        block();
+        pendingUnload = holder.collect();
+        liveUnload = BackingTrackBuffer::live.load();
+        if (pendingUnload == 1 && liveUnload == 1) {
+            for (int i = 0; i < fade / 128 + 3; ++i) block();
+            pendingEnd = holder.collect();
+            liveEnd = BackingTrackBuffer::live.load();
+        }
+    }
+    gAcquireHook = nullptr;
+    const bool seam = gAcquireHookCalls == (swapKept ? 2 : 1);
+    const bool pass = seam && swapKept && before == 0.5f && std::fabs(firstAfter - 0.5f) < 0.01f
+                   && pendingSwapAfter == 0 && liveSwapAfter == 1 && pendingUnload == 1 && liveUnload == 1
+                   && pendingEnd == 0 && liveEnd == 0 && allocs == 0;
+    std::printf("bsr   swap / unload inside acquire(): old buffer kept for its fade-out, then freed  %-4s"
+                " seam calls %d; swap: retired %d live %d, after fade %d live %d; unload: retired %d live %d,"
+                " after fade %d live %d; first sample after swap %.4f; allocs %llu\n",
+                pass ? "PASS" : "FAIL", gAcquireHookCalls, pendingSwap, liveSwap, pendingSwapAfter, liveSwapAfter,
+                pendingUnload, liveUnload, pendingEnd, liveEnd, firstAfter, (unsigned long long)allocs);
+    std::fflush(stdout);
+    if (!swapKept) {
+        // The aux still holds the freed buffer as its tail: detach it without rendering again.
+        aux.setBackingTrack(nullptr);
+    }
     return pass;
 }
 
@@ -2379,6 +3015,594 @@ static bool runSpectrum() {
     return pass;
 }
 
+//==============================================================================
+// Drum machine (ios/DrumMachine.h, pure C++) and the drum part through PolySynthProcessor.
+
+// Renders `total` samples of `dm` in `block`-sample blocks into `out` (allocation-counted);
+// `before(done)` runs before each block.
+static void renderDrums(DrumMachine& dm, int total, int block, std::vector<float>& out,
+                        const std::function<void(int)>& before = {}) {
+    out.assign((size_t)total, 0.0f);
+    for (int done = 0; done < total;) {
+        const int n = std::min(block, total - done);
+        if (before) before(done);
+        tCountAllocs = true;
+        dm.render(&out[(size_t)done], n);
+        tCountAllocs = false;
+        done += n;
+    }
+}
+
+static double rmsOf(const std::vector<float>& x, int from, int to) {
+    from = std::max(0, from);
+    to = std::min((int)x.size(), to);
+    if (to <= from) return 0.0;
+    double acc = 0.0;
+    for (int i = from; i < to; ++i) acc += (double)x[(size_t)i] * x[(size_t)i];
+    return std::sqrt(acc / (to - from));
+}
+
+// Sample after which the output is exactly 0 to the end (0 if it is all 0).
+static int lastNonZero(const std::vector<float>& x) {
+    for (int i = (int)x.size() - 1; i >= 0; --i)
+        if (x[(size_t)i] != 0.0f) return i + 1;
+    return 0;
+}
+
+static bool cleanSamples(const std::vector<float>& x, float limit) {
+    for (float v : x)
+        if (!std::isfinite(v) || std::fabs(v) > limit || std::fpclassify(v) == FP_SUBNORMAL) return false;
+    return true;
+}
+
+static bool runDrums() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+
+    // 1. Every voice: sounds from sample 0, its envelope decays, ends in exact silence (the voice
+    //    goes idle), finite, bounded, no subnormals; decay 0 < 0.5 < 1 in length.
+    std::string lengths;
+    for (int voice = 0; voice < kDrumVoices; ++voice) {
+        int len[3] = {0, 0, 0};
+        const double decays[3] = {0.0, 0.5, 1.0};
+        const std::string name = kDrumVoiceNames[voice];
+        for (int d = 0; d < 3; ++d) {
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.params().setVoiceParam(voice, kDrumParamDecay, decays[d]);
+            std::vector<float> out;
+            renderDrums(dm, (int)(6.0 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(voice, 127); });
+            const std::string tag = name + " decay " + std::to_string(decays[d]).substr(0, 3);
+            check(cleanSamples(out, 4.0f), tag + " finite/no subnormal/bounded");
+            const double first = rmsOf(out, 0, (int)(0.02 * sr));
+            check(first > 0.005, tag + " sounds in its first 20 ms (rms " + std::to_string(first) + ")");
+            check(out[0] != 0.0f || out[1] != 0.0f || out[2] != 0.0f, tag + " starts on sample 0");
+            len[d] = lastNonZero(out);
+            check(len[d] < (int)(5.5 * sr), tag + " ends in exact silence");
+            check(!dm.isVoiceActive(voice), tag + " idle after its tail");
+            // Decays: each 50 ms window after the first 60 ms is quieter than the one 100 ms before.
+            const int w = (int)(0.05 * sr);
+            bool decaying = true;
+            for (int a = (int)(0.06 * sr); a + 3 * w < len[d]; a += w)
+                if (rmsOf(out, a + 2 * w, a + 3 * w) > rmsOf(out, a, a + w) * 1.05 + 1e-6) decaying = false;
+            check(decaying, tag + " envelope decays");
+        }
+        check(len[0] < len[1] && len[1] < len[2], name + " decay scales its length");
+        lengths += " " + name + ":" + std::to_string((int)std::lround(len[1] * 1000.0 / sr));
+    }
+
+    // 2. Choke: an open hat rings past 300 ms alone; a closed hat 50 ms in ends it within 40 ms.
+    {
+        DrumMachine alone, choked;
+        alone.prepare(sr); choked.prepare(sr);
+        alone.params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0); // isolate the open hat
+        choked.params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0);
+        std::vector<float> a, c;
+        renderDrums(alone, (int)(0.5 * sr), 128, a, [&](int done) { if (done == 0) alone.trigger(kDrumOpenHat, 127); });
+        const int chokeAt = 2400 / 128 * 128 + 128; // first block start after 50 ms
+        renderDrums(choked, (int)(0.5 * sr), 128, c, [&](int done) {
+            if (done == 0) choked.trigger(kDrumOpenHat, 127);
+            if (done == chokeAt) choked.trigger(kDrumClosedHat, 127);
+        });
+        check(rmsOf(a, (int)(0.3 * sr), (int)(0.35 * sr)) > 1e-3, "open hat rings alone");
+        check(lastNonZero(c) < chokeAt + (int)(0.04 * sr), "closed hat chokes the open hat within 40 ms (ended at "
+              + std::to_string(lastNonZero(c)) + ")");
+        check(!choked.isVoiceActive(kDrumOpenHat), "choked open hat idle");
+        // An open hat does not choke the closed hat.
+        DrumMachine dm;
+        dm.prepare(sr);
+        std::vector<float> o;
+        renderDrums(dm, 256, 128, o, [&](int done) {
+            if (done == 0) { dm.trigger(kDrumClosedHat, 127); dm.trigger(kDrumOpenHat, 127); }
+        });
+        check(dm.isVoiceActive(kDrumClosedHat) && dm.isVoiceActive(kDrumOpenHat), "open hat does not choke closed hat");
+    }
+
+    // 3. Retrigger restarts the voice: after the declick, a second hit is sample-exact the same as a
+    //    hit on a fresh machine (low tom, tone 0: no noise); the declick has no larger step than the attack.
+    {
+        DrumMachine re, fresh;
+        re.prepare(sr); fresh.prepare(sr);
+        re.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        fresh.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        const int at = 128 * 40;
+        std::vector<float> r, f;
+        renderDrums(re, at + 9600, 128, r, [&](int done) { if (done == 0 || done == at) re.trigger(kDrumLowTom, 100); });
+        renderDrums(fresh, 9600, 128, f, [&](int done) { if (done == 0) fresh.trigger(kDrumLowTom, 100); });
+        bool same = true;
+        for (int i = DrumMachine::kDeclickSamples; i < 9600; ++i)
+            if (r[(size_t)(at + i)] != f[(size_t)i]) { same = false; break; }
+        check(same, "retrigger == fresh hit after the declick");
+        float jump = 0.0f;
+        for (int i = at - 4; i < at + DrumMachine::kDeclickSamples + 4; ++i)
+            jump = std::max(jump, std::fabs(r[(size_t)i] - r[(size_t)i - 1]));
+        float freshJump = 0.0f;
+        for (int i = 1; i < 200; ++i) freshJump = std::max(freshJump, std::fabs(f[(size_t)i] - f[(size_t)i - 1]));
+        check(jump <= freshJump + 0.05f, "retrigger declick step " + std::to_string(jump));
+        check(re.diag.hits.load() == 2, "hits counted");
+    }
+
+    // 4. Parameters clamp; non-finite / out of range are ignored.
+    {
+        DrumParamStore s;
+        check(s.setVoiceParam(0, kDrumParamTune, 100.0) && s.voice(0).tune == 24.0f, "tune clamps to 24");
+        check(s.setVoiceParam(0, kDrumParamTune, -100.0) && s.voice(0).tune == -24.0f, "tune clamps to -24");
+        check(s.setVoiceParam(1, kDrumParamDecay, 2.0) && s.voice(1).decay == 1.0f, "decay clamps to 1");
+        check(s.setVoiceParam(1, kDrumParamTone, -1.0) && s.voice(1).tone == 0.0f, "tone clamps to 0");
+        check(s.setVoiceParam(7, kDrumParamLevel, 1.5) && s.voice(7).level == 1.0f, "level clamps to 1");
+        check(!s.setVoiceParam(2, kDrumParamLevel, std::nan("")) && s.voice(2).level == kDrumVoiceDefaults.level, "NaN ignored");
+        check(!s.setVoiceParam(2, kDrumParamTune, INFINITY) && s.voice(2).tune == 0.0f, "inf ignored");
+        check(!s.setVoiceParam(kDrumVoices, kDrumParamLevel, 0.5) && !s.setVoiceParam(-1, kDrumParamLevel, 0.5), "voice out of range");
+        check(!s.setVoiceParam(0, kDrumParamCount, 0.5), "param out of range");
+        check(s.setKitLevel(-1.0) && s.kit().level == 0.0f, "kit level clamps");
+        check(s.setKitDrive(5.0) && s.kit().drive == 1.0f, "drive clamps");
+        check(!s.setKitLevel(std::nan("")) && s.kit().level == 0.0f, "kit NaN ignored");
+        s.setKitMute(true);
+        check(s.kit().mute, "mute stored");
+        s.reset();
+        check(s.voice(0).tune == 0.0f && s.kit().level == kDrumKitDefaults.level && !s.kit().mute, "reset");
+        check(drumParamIndex("tune") == 0 && drumParamIndex("level") == 3 && drumParamIndex("lev") == -1
+              && drumParamIndex("levels") == -1 && drumParamIndex(nullptr) == -1, "param names");
+    }
+
+    // 5. Extremes (tune ±24, decay 0/1, tone 0/1, level 1, drive 1, all voices at once, odd blocks):
+    //    finite, bounded, no subnormal output, ends silent.
+    for (int combo = 0; combo < 4; ++combo) {
+        DrumMachine dm;
+        dm.prepare(sr);
+        for (int v = 0; v < kDrumVoices; ++v) {
+            dm.params().setVoiceParam(v, kDrumParamTune, (combo & 1) ? 24.0 : -24.0);
+            dm.params().setVoiceParam(v, kDrumParamDecay, (combo & 2) ? 1.0 : 0.0);
+            dm.params().setVoiceParam(v, kDrumParamTone, (combo & 1) ? 0.0 : 1.0);
+            dm.params().setVoiceParam(v, kDrumParamLevel, 1.0);
+        }
+        dm.params().setKitLevel(1.0);
+        dm.params().setKitDrive(combo == 3 ? 1.0 : 0.0);
+        std::vector<float> out;
+        renderDrums(dm, (int)(6.0 * sr), 471, out, [&](int done) {
+            if (done == 0 || done == 471 * 30) for (int v = 0; v < kDrumVoices; ++v) dm.trigger(v, 127);
+        });
+        check(cleanSamples(out, 8.0f), "extremes combo " + std::to_string(combo) + " finite/bounded");
+        check(lastNonZero(out) < (int)out.size(), "extremes combo " + std::to_string(combo) + " ends silent");
+    }
+
+    // 6. Kit mute silences exactly; unmute brings the sound back; muting mid-sound ramps over one
+    //    block; voice level 0 is silent.
+    {
+        DrumMachine dm;
+        dm.prepare(sr);
+        dm.params().setKitMute(true);
+        std::vector<float> out;
+        renderDrums(dm, 4800, 128, out, [&](int done) { if (done == 0) dm.trigger(kDrumKick, 127); });
+        bool zero = true;
+        for (float v : out) zero = zero && v == 0.0f;
+        check(zero, "muted kit is exact 0");
+        dm.params().setKitMute(false);
+        renderDrums(dm, 4800, 128, out, [&](int done) { if (done == 0) dm.trigger(kDrumKick, 127); });
+        check(rmsOf(out, 128, 4800) > 0.01, "unmuted kit sounds");
+        dm.params().setKitMute(true);
+        renderDrums(dm, 1280, 128, out);
+        zero = true;
+        for (int i = 128; i < 1280; ++i) zero = zero && out[(size_t)i] == 0.0f;
+        check(zero && out[0] != 0.0f, "mute mid-sound: one-block ramp then exact 0");
+        dm.params().setKitMute(false);
+        dm.params().setVoiceParam(kDrumSnare, kDrumParamLevel, 0.0);
+        DrumMachine quiet;
+        quiet.prepare(sr);
+        quiet.params().setVoiceParam(kDrumSnare, kDrumParamLevel, 0.0);
+        renderDrums(quiet, (int)(1.0 * sr), 128, out, [&](int done) { if (done == 0) quiet.trigger(kDrumSnare, 127); });
+        zero = true;
+        for (float v : out) zero = zero && v == 0.0f;
+        check(zero, "voice level 0 is exact 0");
+    }
+
+    // 7. Out-of-range hits are ignored; an idle machine leaves the buffer untouched; velocity scales;
+    //    peak / hit counters move and the peak decays; drive changes the sound.
+    {
+        DrumMachine dm;
+        dm.prepare(sr);
+        dm.trigger(kDrumVoices, 127); dm.trigger(-1, 127);
+        check(dm.diag.hits.load() == 0 && dm.activeVoiceCount() == 0, "out-of-range hit ignored");
+        std::vector<float> buf(128, 0.25f);
+        dm.render(buf.data(), 128);
+        bool untouched = true;
+        for (float v : buf) untouched = untouched && v == 0.25f;
+        check(untouched, "idle machine leaves the buffer untouched");
+        std::vector<float> loud, soft;
+        DrumMachine a, b;
+        a.prepare(sr); b.prepare(sr);
+        a.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        b.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        renderDrums(a, 4800, 128, loud, [&](int done) { if (done == 0) a.trigger(kDrumLowTom, 127); });
+        renderDrums(b, 4800, 128, soft, [&](int done) { if (done == 0) b.trigger(kDrumLowTom, 32); });
+        const double ratio = rmsOf(soft, 0, 4800) / std::max(1e-9, rmsOf(loud, 0, 4800));
+        check(std::fabs(ratio - 32.0 / 127.0) < 0.01, "velocity scales linearly (" + std::to_string(ratio) + ")");
+        check(a.diag.hits.load() == 1 && a.diag.peak.load() > 0.1f, "peak diag moves");
+        const float p0 = a.diag.peak.load();
+        std::vector<float> rest;
+        renderDrums(a, (int)(1.0 * sr), 128, rest);
+        check(a.diag.peak.load() < p0 * 0.5f, "peak diag decays");
+        DrumMachine c;
+        c.prepare(sr);
+        c.params().setVoiceParam(kDrumLowTom, kDrumParamTone, 0.0);
+        c.params().setKitDrive(1.0);
+        std::vector<float> driven;
+        renderDrums(c, 4800, 128, driven, [&](int done) { if (done == 0) c.trigger(kDrumLowTom, 127); });
+        bool differs = false;
+        for (int i = 0; i < 4800; ++i) differs = differs || driven[(size_t)i] != loud[(size_t)i];
+        check(differs, "drive changes the sound");
+    }
+
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    check(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
+    const bool pass = failures == 0;
+    std::printf("dr    drums: every voice decays to exact silence, decay scales, choke, retrigger, clamps, extremes,"
+                " mute, velocity, diag  %-4s %d failed checks; lengths ms (decay 0.5):%s allocs %llu%s\n",
+                pass ? "PASS" : "FAIL", failures, lengths.c_str(), (unsigned long long)allocs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// The drum part through PolySynthProcessor and its note queue: a hit pushed from another thread
+// renders in the next block, with or without the arpeggiator; drums stay out of the synth peak and
+// the note counters; releases do not touch drums; out-of-range hits are not queued; discardPending
+// and a full ring count hits apart from notes.
+static bool runDrumsInSynth() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    auto block = [&](PolySynthProcessor& synth, juce::AudioBuffer<float>& buf, int n) {
+        juce::MidiBuffer midi;
+        buf.setSize(2, n, false, false, true);
+        tCountAllocs = true;
+        synth.processBlock(buf, midi);
+        tCountAllocs = false;
+        return buf.getMagnitude(0, 0, n);
+    };
+    for (int arpOn = 0; arpOn < 2; ++arpOn) {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        NoteEventQueue queue;
+        synth.setNoteQueue(&queue);
+        synth.setTransport(&transport);
+        synth.setRateAndBufferSizeDetails(sr, 512);
+        synth.prepareToPlay(sr, 512);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = arpOn == 1;
+        synth.arp().setSettings(s);
+        juce::AudioBuffer<float> buf(2, 512);
+        const std::string tag = arpOn ? " (arp on)" : " (arp off)";
+        check(block(synth, buf, 128) == 0.0f, "silent before the hit" + tag);
+        std::thread producer([&] { queue.pushDrumHit(kDrumKick, 127); });
+        producer.join();
+        const float p = block(synth, buf, 128);
+        check(p > 0.05f, "hit renders within one block" + tag + " peak " + std::to_string(p));
+        check(buf.getSample(0, 0) != 0.0f || buf.getSample(0, 1) != 0.0f, "hit starts at the block's first sample" + tag);
+        bool stereo = true;
+        for (int i = 0; i < 128; ++i) stereo = stereo && buf.getSample(0, i) == buf.getSample(1, i);
+        check(stereo, "both channels" + tag);
+        check(synth.diag.peak.load() == 0.0f, "drums not in the synth peak" + tag);
+        check(synth.drums().diag.peak.load() > 0.05f, "drum peak diag" + tag);
+        check(queue.drumHitsQueued.load() == 1 && queue.drumHitsConsumed.load() == 1, "drum counters" + tag);
+        check(queue.notesQueued.load() == 0 && queue.notesConsumed.load() == 0, "note counters untouched" + tag);
+        check(!synth.arp().isActive(), "arp never gets drum hits" + tag);
+        check(synth.diag.lastNoteToRenderMs.load() >= 0.0, "hit latency recorded" + tag);
+        check(!queue.pushDrumHit(kDrumVoices, 100) && !queue.pushDrumHit(-1, 100) && queue.drumHitsQueued.load() == 1,
+              "out-of-range voice not queued" + tag);
+        // A synth note and a drum hit in the same block; allNotesOff never touches drums.
+        synth.noteOn(60, 100);
+        synth.drumHit(kDrumSnare, 100);
+        synth.allNotesOff();
+        block(synth, buf, 128);
+        check(synth.drums().isVoiceActive(kDrumSnare), "allNotesOff leaves the drum hit" + tag);
+        // Kit mute through a shared store (as the engine attaches its process-lifetime one).
+        DrumParamStore store;
+        synth.drums().setParamStore(&store);
+        store.setKitMute(true);
+        block(synth, buf, 128);
+        for (int i = 0; i < 100; ++i) block(synth, buf, 128); // let the synth voice release
+        synth.drumHit(kDrumKick, 127);
+        const float muted = block(synth, buf, 128);
+        check(muted == 0.0f, "kit mute through the store silences" + tag + " " + std::to_string(muted));
+    }
+    {
+        NoteEventQueue queue;
+        queue.pushNoteOn(60, 100);
+        queue.pushDrumHit(1, 100);
+        queue.pushDrumHit(2, 100);
+        queue.discardPending();
+        check(queue.notesDiscarded.load() == 1 && queue.drumHitsDiscarded.load() == 2, "discardPending counts by kind");
+        int full = 0;
+        for (int i = 0; i < NoteEventQueue::kSize + 5; ++i) full += queue.pushDrumHit(0, 100) ? 0 : 1;
+        check(full == 6 && queue.drumHitsDropped.load() == 6, "full ring drops hits (counted) " + std::to_string(full));
+        check(queue.notesDropped.load() == 0, "drops counted apart from notes");
+    }
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    check(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
+    const bool pass = failures == 0;
+    std::printf("drs   drums through PolySynthProcessor + note queue (arp off / on), counters, mute  %-4s %d failed"
+                " checks allocs %llu%s\n", pass ? "PASS" : "FAIL", failures, (unsigned long long)allocs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Render budget: every voice retriggered every 250 ms at decay 1 (so all always sound), drive on,
+// 48 kHz / 128-sample blocks, 20 s of audio. Must render far faster than realtime.
+static bool runDrumBudget() {
+    const double sr = 48000.0;
+    DrumMachine dm;
+    dm.prepare(sr);
+    for (int v = 0; v < kDrumVoices; ++v) dm.params().setVoiceParam(v, kDrumParamDecay, 1.0);
+    dm.params().setKitDrive(0.5);
+    const int total = (int)(20.0 * sr);
+    const int every = (int)(0.25 * sr) / 128 * 128;
+    std::vector<float> buf(128);
+    int minActive = kDrumVoices;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int done = 0; done < total; done += 128) {
+        if (done % every == 0) for (int v = 0; v < kDrumVoices; ++v) dm.trigger(v, 127);
+        std::fill(buf.begin(), buf.end(), 0.0f);
+        dm.render(buf.data(), 128);
+        minActive = std::min(minActive, dm.activeVoiceCount());
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double ratio = secs / 20.0;
+    const double perBlockUs = secs * 1e6 / (double)(total / 128);
+    const bool pass = ratio < 0.05 && minActive == kDrumVoices;
+    std::printf("drb   drums render budget: all voices sounding, 48k/128, 20 s  %-4s %.4f x realtime (%.2f us per"
+                " 2667 us block, limit 0.05), min active %d\n", pass ? "PASS" : "FAIL", ratio, perBlockUs, minActive);
+    std::fflush(stdout);
+    return pass;
+}
+
+// Fundamental of `x` over [from, to) from its rising zero crossings (linearly interpolated).
+static double zeroCrossingHz(const std::vector<float>& x, int from, int to, double sr) {
+    double first = -1.0, last = -1.0;
+    int crossings = 0;
+    for (int i = std::max(1, from); i < std::min((int)x.size(), to); ++i) {
+        const float a = x[(size_t)i - 1], b = x[(size_t)i];
+        if (a < 0.0f && b >= 0.0f) {
+            const double t = (double)(i - 1) + (double)a / (double)(a - b);
+            if (first < 0.0) first = t;
+            last = t;
+            ++crossings;
+        }
+    }
+    return crossings > 1 ? (double)(crossings - 1) * sr / (last - first) : 0.0;
+}
+
+// Mid tom (voice 8, 0.8.0-rc.2): a ninth voice on the tom model. Sounds and decays to exact
+// silence; its pitch is between the low and high tom, centred (log scale) between them; tune
+// moves it; the hat choke and the other toms are unaffected; index 8 is accepted by the store,
+// the machine and the note queue, 9 is not.
+static bool runMidTom() {
+    const double sr = 48000.0;
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    const int mid = 8;
+    double hz[3] = {0.0, 0.0, 0.0};
+    if (kDrumVoices < 9) {
+        check(false, "kDrumVoices " + std::to_string(kDrumVoices) + " < 9");
+    } else {
+        check(std::string(kDrumVoiceNames[mid]) == "midTom", "voice 8 is named midTom");
+        check(std::string(kDrumVoiceNames[kDrumLowTom]) == "lowTom" && std::string(kDrumVoiceNames[kDrumHighTom]) == "highTom"
+              && std::string(kDrumVoiceNames[kDrumRim]) == "rim" && std::string(kDrumVoiceNames[kDrumKick]) == "kick",
+              "voices 0-7 keep their names");
+
+        // Sounds from sample 0, decays to exact silence, goes idle.
+        {
+            DrumMachine dm;
+            dm.prepare(sr);
+            std::vector<float> out;
+            renderDrums(dm, (int)(4.0 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(mid, 127); });
+            check(cleanSamples(out, 4.0f), "finite/bounded/no subnormal");
+            check(rmsOf(out, 0, (int)(0.02 * sr)) > 0.05, "non-silent in its first 20 ms");
+            check(rmsOf(out, (int)(0.3 * sr), (int)(0.35 * sr)) < rmsOf(out, (int)(0.05 * sr), (int)(0.1 * sr)) * 0.5,
+                  "decays");
+            const int end = lastNonZero(out);
+            check(end > (int)(0.2 * sr) && end < (int)(3.0 * sr), "ends in exact silence (" + std::to_string(end) + ")");
+            check(!dm.isVoiceActive(mid) && dm.activeVoiceCount() == 0, "idle after its tail");
+            check(dm.diag.hits.load() == 1, "hit counted");
+        }
+
+        // Pitch (tone 0: no attack noise), 250-350 ms after the hit (the pitch drop is over).
+        const int toms[3] = {kDrumLowTom, mid, kDrumHighTom};
+        for (int t = 0; t < 3; ++t) {
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.params().setVoiceParam(toms[t], kDrumParamTone, 0.0);
+            std::vector<float> out;
+            renderDrums(dm, (int)(0.4 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(toms[t], 127); });
+            hz[t] = zeroCrossingHz(out, (int)(0.25 * sr), (int)(0.35 * sr), sr);
+        }
+        check(hz[0] < hz[1] && hz[1] < hz[2], "low < mid < high");
+        const double centre = 0.5 * (std::log2(hz[0]) + std::log2(hz[2]));
+        check(std::fabs(std::log2(hz[1]) - centre) * 12.0 < 0.25, "mid within a quarter semitone of the toms' centre");
+        {
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.params().setVoiceParam(mid, kDrumParamTone, 0.0);
+            dm.params().setVoiceParam(mid, kDrumParamTune, 12.0);
+            std::vector<float> out;
+            renderDrums(dm, (int)(0.4 * sr), 128, out, [&](int done) { if (done == 0) dm.trigger(mid, 127); });
+            const double up = zeroCrossingHz(out, (int)(0.25 * sr), (int)(0.35 * sr), sr);
+            check(std::fabs(up / std::max(1.0, hz[1]) - 2.0) < 0.01, "tune +12 doubles the pitch (" + std::to_string(up) + ")");
+        }
+
+        // Level 0 is exact 0; velocity scales linearly.
+        {
+            DrumMachine dm, soft;
+            dm.prepare(sr); soft.prepare(sr);
+            dm.params().setVoiceParam(mid, kDrumParamLevel, 0.0);
+            std::vector<float> out;
+            renderDrums(dm, 9600, 128, out, [&](int done) { if (done == 0) dm.trigger(mid, 127); });
+            bool zero = true;
+            for (float v : out) zero = zero && v == 0.0f;
+            check(zero, "level 0 is exact 0");
+            DrumMachine loud;
+            loud.prepare(sr);
+            loud.params().setVoiceParam(mid, kDrumParamTone, 0.0);
+            soft.params().setVoiceParam(mid, kDrumParamTone, 0.0);
+            std::vector<float> l, s;
+            renderDrums(loud, 4800, 128, l, [&](int done) { if (done == 0) loud.trigger(mid, 127); });
+            renderDrums(soft, 4800, 128, s, [&](int done) { if (done == 0) soft.trigger(mid, 32); });
+            const double ratio = rmsOf(s, 0, 4800) / std::max(1e-9, rmsOf(l, 0, 4800));
+            check(std::fabs(ratio - 32.0 / 127.0) < 0.01, "velocity scales linearly");
+        }
+
+        // Hat choke unaffected: with the mid tom sounding, a closed hat still ends the open hat within
+        // 40 ms; the mid tom (tone 0) renders sample for sample as it does alone (not choked).
+        {
+            DrumMachine alone, both;
+            alone.prepare(sr); both.prepare(sr);
+            for (DrumMachine* m : {&alone, &both}) {
+                m->params().setVoiceParam(mid, kDrumParamTone, 0.0);
+                m->params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0);
+                m->params().setVoiceParam(kDrumOpenHat, kDrumParamLevel, 0.0);
+            }
+            const int chokeAt = 2400 / 128 * 128 + 128;
+            std::vector<float> a, b;
+            renderDrums(alone, (int)(0.5 * sr), 128, a, [&](int done) { if (done == 0) alone.trigger(mid, 127); });
+            renderDrums(both, (int)(0.5 * sr), 128, b, [&](int done) {
+                if (done == 0) { both.trigger(mid, 127); both.trigger(kDrumOpenHat, 127); }
+                if (done == chokeAt) both.trigger(kDrumClosedHat, 127);
+            });
+            check(a == b, "closed / open hats do not touch the mid tom");
+            check(both.isVoiceActive(mid), "mid tom still sounding after the choke");
+            check(!both.isVoiceActive(kDrumOpenHat), "open hat choked with the mid tom sounding");
+
+            DrumMachine hats;
+            hats.prepare(sr);
+            hats.params().setVoiceParam(kDrumClosedHat, kDrumParamLevel, 0.0);
+            std::vector<float> c;
+            renderDrums(hats, (int)(0.5 * sr), 128, c, [&](int done) {
+                if (done == 0) { hats.trigger(kDrumOpenHat, 127); hats.trigger(mid, 127); }
+                if (done == chokeAt) hats.trigger(kDrumClosedHat, 127);
+            });
+            check(lastNonZero(c) > chokeAt + (int)(0.04 * sr), "mid tom keeps sounding past the choke");
+            check(!hats.isVoiceActive(kDrumOpenHat) && hats.isVoiceActive(mid),
+                  "closed hat chokes the open hat, not the mid tom (open hat audible)");
+
+            // A mid tom hit does not choke the open hat or either tom.
+            DrumMachine dm;
+            dm.prepare(sr);
+            std::vector<float> o;
+            renderDrums(dm, 256, 128, o, [&](int done) {
+                if (done == 0) { dm.trigger(kDrumOpenHat, 127); dm.trigger(kDrumLowTom, 127); dm.trigger(kDrumHighTom, 127); }
+                if (done == 128) dm.trigger(mid, 127);
+            });
+            check(dm.isVoiceActive(kDrumOpenHat) && dm.isVoiceActive(kDrumLowTom) && dm.isVoiceActive(kDrumHighTom)
+                  && dm.isVoiceActive(mid), "mid tom chokes nothing");
+        }
+
+        // Index range: 8 accepted, 9 rejected (store, machine, queue).
+        {
+            DrumParamStore s;
+            check(s.setVoiceParam(mid, kDrumParamDecay, 0.25) && s.voice(mid).decay == 0.25f, "store accepts voice 8");
+            check(!s.setVoiceParam(9, kDrumParamDecay, 0.25) && !s.setVoiceParam(-1, kDrumParamDecay, 0.25),
+                  "store rejects 9 / -1");
+            s.reset();
+            check(s.voice(mid).decay == kDrumVoiceDefaults.decay, "reset covers voice 8");
+            DrumMachine dm;
+            dm.prepare(sr);
+            dm.trigger(9, 127);
+            check(dm.activeVoiceCount() == 0 && dm.diag.hits.load() == 0, "machine ignores voice 9");
+            NoteEventQueue q;
+            check(q.pushDrumHit(mid, 100), "queue accepts voice 8");
+            check(!q.pushDrumHit(9, 100) && q.drumHitsQueued.load() == 1, "queue rejects voice 9");
+        }
+    }
+
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    check(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
+    const bool pass = failures == 0;
+    std::printf("drm   drums: mid tom (voice 8) sounds, decays, pitch between the toms, tune, choke unaffected,"
+                " range  %-4s %d failed checks; Hz low %.1f mid %.1f high %.1f allocs %llu%s\n",
+                pass ? "PASS" : "FAIL", failures, hz[0], hz[1], hz[2], (unsigned long long)allocs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// src/drumDefaults.ts lists the same defaults as kDrumVoiceDefaults / kDrumKitDefaults.
+static bool runDrumDefaultsMatchJs() {
+    const juce::File file(juce::String(HARNESS_JS_SRC) + "/drumDefaults.ts");
+    const juce::String text = file.loadFileAsString();
+    auto body = [&](const char* name) {
+        const juce::String from = text.fromFirstOccurrenceOf(juce::String("export const ") + name, false, false);
+        return from.fromFirstOccurrenceOf("({", false, false).upToFirstOccurrenceOf("})", false, false);
+    };
+    auto value = [](const juce::String& b, const char* key, bool& found) {
+        juce::StringArray pairs;
+        pairs.addTokens(b, ",", "");
+        pairs.trim();
+        for (const juce::String& p : pairs)
+            if (p.upToFirstOccurrenceOf(":", false, false).trim() == key) {
+                found = true;
+                return p.fromFirstOccurrenceOf(":", false, false).trim();
+            }
+        found = false;
+        return juce::String();
+    };
+    int mismatches = 0;
+    std::string detail;
+    auto num = [&](const juce::String& b, const char* key, float want) {
+        bool found = false;
+        const juce::String v = value(b, key, found);
+        if (!found || std::fabs(v.getDoubleValue() - (double)want) > 1e-6) { ++mismatches; detail += std::string(" ") + key; }
+    };
+    const juce::String voice = body("DRUM_VOICE_DEFAULTS"), kit = body("DRUM_KIT_DEFAULTS");
+    num(voice, "tune", kDrumVoiceDefaults.tune);
+    num(voice, "decay", kDrumVoiceDefaults.decay);
+    num(voice, "tone", kDrumVoiceDefaults.tone);
+    num(voice, "level", kDrumVoiceDefaults.level);
+    num(kit, "level", kDrumKitDefaults.level);
+    num(kit, "drive", kDrumKitDefaults.drive);
+    bool found = false;
+    if (value(kit, "mute", found) != juce::String(kDrumKitDefaults.mute ? "true" : "false") || !found) {
+        ++mismatches;
+        detail += " mute";
+    }
+    // export const DRUM_VOICE_COUNT = <n>;
+    const juce::String count = text.fromFirstOccurrenceOf("export const DRUM_VOICE_COUNT", false, false)
+                                   .fromFirstOccurrenceOf("=", false, false).upToFirstOccurrenceOf(";", false, false).trim();
+    if (count.isEmpty() || count.getIntValue() != kDrumVoices) {
+        ++mismatches;
+        detail += " DRUM_VOICE_COUNT(" + count.toStdString() + ")";
+    }
+    const bool pass = file.existsAsFile() && mismatches == 0;
+    std::printf("drd   src/drumDefaults.ts == DrumMachine.h defaults and voice count  %-4s %d mismatches%s\n", pass ? "PASS" : "FAIL",
+                mismatches, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the cases named on the command line run (none: every case).
 static std::vector<std::string> gOnlyCases;
 static bool want(const char* id) {
@@ -2460,9 +3684,11 @@ int main(int argc, char** argv) {
     if (want("met")) unexpected += runMetronome();
     if (want("bt")) unexpected += runBackingTrackPlayback() ? 0 : 1;
     if (want("btt")) unexpected += runBackingTrackTempoRamp() ? 0 : 1;
+    if (want("btf")) unexpected += runBackingTrackFollow() ? 0 : 1;
     if (want("bsf")) unexpected += runBackingTrackSwapFade() ? 0 : 1;
     if (want("btr")) unexpected += runBackingTrackRegion() ? 0 : 1;
     if (want("btl")) unexpected += runBackingTrackLimits() ? 0 : 1;
+    if (want("bsr")) unexpected += runBackingTrackSwapInAcquire() ? 0 : 1;
     if (want("bts")) unexpected += runBackingTrackSwapStress() ? 0 : 1;
     if (want("aux0")) unexpected += runAuxSilent() ? 0 : 1;
     if (want("rsa")) unexpected += runAuxRebuildState() ? 0 : 1;
@@ -2470,6 +3696,11 @@ int main(int argc, char** argv) {
     if (want("arp")) unexpected += runArp() ? 0 : 1;
     if (want("arpv")) unexpected += runArpVoices() ? 0 : 1;
     if (want("sp")) unexpected += runSpectrum() ? 0 : 1;
+    if (want("dr")) unexpected += runDrums() ? 0 : 1;
+    if (want("drs")) unexpected += runDrumsInSynth() ? 0 : 1;
+    if (want("drb")) unexpected += runDrumBudget() ? 0 : 1;
+    if (want("drm")) unexpected += runMidTom() ? 0 : 1;
+    if (want("drd")) unexpected += runDrumDefaultsMatchJs() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

@@ -3,6 +3,7 @@
 #include "JuceConfig.h"
 #import "ExpoJuceAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMIDI/CoreMIDI.h>
 #import <UIKit/UIKit.h>
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
@@ -15,6 +16,7 @@
 #include "AnalysisRing.h"
 #include "TransportEngine.h"
 #include "Arpeggiator.h"
+#include "DrumMachine.h"
 #include "SpectrumAnalyser.h"
 #include <atomic>
 #include <cmath>
@@ -41,6 +43,9 @@ static const int64_t kRebuildRetryDelayMs = 1000;
 static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt + 2 retries, then "failed"
 
 @interface ExpoJuceAudioEngine ()
+// Absorbs CoreMIDI's one-time XPC initialisation on a background queue so it
+// cannot block the main thread later. See the definition for why.
++ (void)warmCoreMidiOffMainThread;
 @property (nonatomic, assign) bool isReady;
 @property (nonatomic, readwrite) int setupStep;
 @property (atomic, readwrite, copy) NSString *lastError;
@@ -63,7 +68,10 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 @property (nonatomic, assign) int rebuildAttempts;     // attempts in the current recovery
 @property (nonatomic, assign) int recoveryGeneration;  // bumped to cancel scheduled retries
 @property (nonatomic, copy) BeatCallback recoveryBeatCallback; // beat callback kept across retries
-@property (nonatomic, assign) BOOL recoveryTimerWasRunning;
+// Main thread: the beat timer was asked for (public startBeatTimer: listeners exist) and not
+// stopped since (public stopBeatTimer: the last listener left). Internal stops (rebuild,
+// shutdown) keep it; a successful rebuild restarts the timer only if it is still set.
+@property (nonatomic, assign) BOOL beatTimerWanted;
 // Synth settings + transport state taken before a rebuild's first teardown and kept across
 // failed attempts; restored when the engine is built again (by a retry or an explicit setup).
 @property (nonatomic, assign) BOOL hasRecoveryState;
@@ -72,6 +80,9 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 // Main thread: a deferred free of retired backing-track buffers is scheduled.
 @property (nonatomic, assign) BOOL backingTrackCollectScheduled;
 - (void)scheduleBackingTrackCollect;
+// Main thread: the beat timer itself, without changing beatTimerWanted.
+- (void)resumeBeatTimer;
+- (void)cancelBeatTimer;
 @end
 
 // Raw pointers — no JUCE smart pointers at file scope.
@@ -148,6 +159,12 @@ static float sLastBands[SpectrumAnalyser::kBands] = {};
 // it once per block. Nothing is copied into the synth, so a setArpeggiator during a rebuild (the
 // window withSynth would drop) is seen by the next block like any other.
 static ArpSettingsStore sArpOptions;
+
+// ── Drum parameters ──
+// Same pattern again: per-voice and kit parameters as relaxed atomics in a process-lifetime store
+// (no lock, works before setup, survives rebuilds), attached to each synth's drum part, which reads
+// it once per block. Drum hits themselves go through sNoteQueue like note-ons.
+static DrumParamStore sDrumParams;
 
 static dispatch_queue_t backingTrackQueue() {
     static dispatch_queue_t queue;
@@ -233,8 +250,35 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 [[ExpoJuceAudioEngine sharedInstance] scheduleBackingTrackCollect];
             });
         });
+        [ExpoJuceAudioEngine warmCoreMidiOffMainThread];
     }
     return self;
+}
+
+// The first CoreMIDI call in a process pays for MIDIProcessXPC::InitOnce — a
+// synchronous XPC handshake that launches midiserver and can take seconds. JUCE
+// requires its MIDI calls on the message thread, so when that cost lands on a
+// MIDI call it blocks the main thread.
+//
+// That initialisation is process-global and not thread-affine, so touching any
+// cheap CoreMIDI query from a background queue first absorbs the cost there.
+// Afterwards MIDIProcess::CheckInitialization on the main thread finds the
+// connection already up and returns immediately.
+//
+// This is belt-and-braces: with midiDeviceListConnection now made lazily (see
+// juce_AudioDeviceManager.h), a host that never uses MIDI devices never calls
+// into CoreMIDI at all. This keeps the main thread clear for when one does —
+// e.g. BLE MIDI. If the warm-up has not finished by then, behaviour is exactly
+// what it is today, so this can only help.
++ (void)warmCoreMidiOffMainThread {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            // Return value deliberately unused; the call is made for the
+            // initialisation it forces, not the count.
+            (void)MIDIGetNumberOfSources();
+        });
+    });
 }
 
 - (BOOL)setup {
@@ -407,6 +451,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sSynth->setNoteQueue(&sNoteQueue);
     sSynth->setAnalysis(&sAnalysis);
     sSynth->arp().setSettingsStore(&sArpOptions); // the live options, before and across rebuilds
+    sSynth->drums().setParamStore(&sDrumParams);  // same for the drum part
 
     self.setupStep = 7;
     NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth, fx chain)");
@@ -570,10 +615,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     self.engineFailed = NO;
     self.recoveryBeatCallback = nil;
     self.hasRecoveryState = NO;
+    // Also before setup (or after a failed one): the timer may run without an engine.
+    [self cancelBeatTimer];
     if (!self.isReady) return;
 
     NSLog(@"[ExpoJuceAudioEngine] Shutting down...");
-    [self stopBeatTimer];
     {
         LifecycleLock lifecycle;
         sNoteQueue.pushAllNotesOff();
@@ -812,7 +858,6 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (self.isRecovering || self.rebuildRetryPending) return;
     if (!self.isReady) return;
     self.recoveryBeatCallback = self.beatCallback;
-    self.recoveryTimerWasRunning = (self.beatTimer != nil) ? YES : NO;
     {
         LifecycleLock lifecycle;
         [self captureRecoveryStateLocked];
@@ -828,8 +873,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     self.rebuildAttempts = self.rebuildAttempts + 1;
     NSLog(@"[ExpoJuceAudioEngine] rebuilding engine (%@), attempt %d", context, self.rebuildAttempts);
 
-    // Beat timer stop is main-thread work outside the lock; it also clears beatCallback.
-    [self stopBeatTimer];
+    // Beat timer stop is main-thread work outside the lock (the callback is restored below).
+    [self cancelBeatTimer];
     BOOL ok = NO;
     {
         LifecycleLock lifecycle;
@@ -845,7 +890,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (ok) {
         [self registerSessionObservers]; // no-op if still registered
         self.beatCallback = self.recoveryBeatCallback;
-        if (self.recoveryTimerWasRunning) [self startBeatTimer];
+        // Only if listeners still want it (the last one may have left during a retry wait).
+        if (self.beatTimerWanted) [self resumeBeatTimer];
         self.recoveryBeatCallback = nil;
         self.engineFailed = NO;
         self.isRecovering = NO;
@@ -904,7 +950,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     int activeVoices = 0;
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
     double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
-    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0;
+    double metronomeClicks = 0.0, backingTrackPositionSec = -1.0, backingTrackTempoRatio = 1.0;
+    double drumPeak = 0.0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
         if (acquireUserLock(lock)) {
@@ -934,6 +981,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                 activeVoices = synth->diag.activeVoices.load(relaxed);
                 lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
                 lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
+                drumPeak = (double)synth->drums().diag.peak.load(relaxed);
             }
             if (FxChainProcessor* fx = ready ? sFx : nullptr) {
                 fxProcessCount = (double)fx->diag.processCount.load(relaxed);
@@ -943,6 +991,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
             if (AuxProcessor* aux = ready ? sAux : nullptr) {
                 metronomeClicks = (double)aux->diag.clicks.load(relaxed);
                 backingTrackPositionSec = aux->diag.trackPositionSec.load(relaxed);
+                backingTrackTempoRatio = aux->diag.trackTempoRatio.load(relaxed);
             }
         }
     }
@@ -982,6 +1031,10 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"metronomeClicks"] = @(metronomeClicks);
     d[@"backingTrackLoaded"] = @(sBackingTrack.hasTrack() ? YES : NO);
     d[@"backingTrackPositionSec"] = @(backingTrackPositionSec);
+    d[@"backingTrackTempoRatio"] = @(backingTrackTempoRatio);
+    // Drum hits the engine has started (cumulative since launch, from the process-lifetime queue).
+    d[@"drumHits"] = @((double)sNoteQueue.drumHitsConsumed.load(std::memory_order_relaxed));
+    d[@"drumPeak"] = @(drumPeak);
 
     // engineState: recovering (rebuild running or retry scheduled) > ready > failed > uninitialized.
     // `ready` is false when the lock was busy, which only happens during a lifecycle section.
@@ -1171,6 +1224,8 @@ static NSString *backingTrackPath(NSString *uri) {
             source.gapless.trailingSamples = trailing.longLongValue;
             source.hasGapless = source.gapless.loopSamples > 0;
         }
+        // The file's own tempo rides in the same dictionary (older binaries ignore the key).
+        if (NSNumber *bpm = numberFrom(gapless, @"sourceBpm")) source.sourceBpm = bpm.doubleValue;
     }
     // A newer load or an unload supersedes this one (checked while decoding and before publishing).
     const uint64_t generation = sBackingTrack.beginLoad();
@@ -1202,6 +1257,7 @@ static NSString *backingTrackPath(NSString *uri) {
             @"decodedSamples": @((double)info.decodedSamples),
             @"regionRule": [NSString stringWithUTF8String:backingTrackRegionRuleName(info.regionRule)],
             @"decoder": [NSString stringWithUTF8String:info.formatName.c_str()] ?: @"",
+            @"sourceBpm": @(info.sourceBpm),
         }, nil, nil);
     });
 }
@@ -1298,6 +1354,61 @@ static NSString *backingTrackPath(NSString *uri) {
     };
 }
 
+// ── Drums ──
+// Hits: through sNoteQueue without the lock, like noteOn (accepted only while the engine is
+// ready). Parameters: sDrumParams, the process-lifetime store (no lock, works before setup).
+// Absent keys, keys of the wrong type and non-finite numbers are left unchanged.
+
+- (void)drumHit:(int)voice velocity:(int)velocity {
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
+    sNoteQueue.pushDrumHit(voice, velocity);
+}
+
+- (void)drumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
+    const juce::int64 touchTicks = (touchTimestamp > 0.0)
+        ? juce::Time::secondsToHighResolutionTicks(touchTimestamp)
+        : (juce::int64)0;
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
+    sNoteQueue.pushDrumHit(voice, velocity, touchTicks);
+}
+
+- (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params {
+    if (voice < 0 || voice >= kDrumVoices) return NO;
+    for (int p = 0; p < kDrumParamCount; ++p) {
+        if (NSNumber *v = numberFrom(params, @(kDrumParamNames[p]))) sDrumParams.setVoiceParam(voice, p, v.doubleValue);
+    }
+    return YES;
+}
+
+- (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params {
+    if (NSNumber *v = numberFrom(params, @"level")) sDrumParams.setKitLevel(v.doubleValue);
+    if (NSNumber *v = numberFrom(params, @"drive")) sDrumParams.setKitDrive(v.doubleValue);
+    if (NSNumber *v = numberFrom(params, @"mute")) sDrumParams.setKitMute(v.boolValue ? true : false);
+    return YES;
+}
+
+- (NSDictionary<NSString *, id> *)drumState {
+    NSMutableArray<NSDictionary<NSString *, NSNumber *> *> *voices = [NSMutableArray arrayWithCapacity:kDrumVoices];
+    for (int v = 0; v < kDrumVoices; ++v) {
+        const DrumVoiceParams p = sDrumParams.voice(v);
+        [voices addObject:@{
+            @"tune": @(fxValueForJS(p.tune)),
+            @"decay": @(fxValueForJS(p.decay)),
+            @"tone": @(fxValueForJS(p.tone)),
+            @"level": @(fxValueForJS(p.level)),
+        }];
+    }
+    const DrumKitParams kit = sDrumParams.kit();
+    return @{
+        @"kit": @{
+            @"level": @(fxValueForJS(kit.level)),
+            @"mute": @(kit.mute ? YES : NO),
+            @"drive": @(fxValueForJS(kit.drive)),
+        },
+        @"voices": voices,
+    };
+}
+
 // ── Analysis ──
 // Any thread, no lock: everything is read from the process-lifetime sAnalysis (levels and scope
 // written by GraphPlayer, transport as of the last block written by the aux node, arp state
@@ -1376,6 +1487,8 @@ static NSString *backingTrackPath(NSString *uri) {
 // Do not hand-write it as `self.beatCallback = callback` — that calls itself forever.
 // The beat timer (and beatCallback) are main-thread state: start/stop called from another
 // thread (Expo's OnStartObserving / OnStopObserving / OnDestroy) re-dispatch to main.
+// The timer may start before setup (an observer subscribed first): it idles until a synth exists.
+// Stopping it keeps beatCallback, so a later start (the next observer) delivers events again.
 
 - (void)startBeatTimer {
     if (![NSThread isMainThread]) {
@@ -1383,8 +1496,23 @@ static NSString *backingTrackPath(NSString *uri) {
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf startBeatTimer]; });
         return;
     }
+    self.beatTimerWanted = YES;
+    [self resumeBeatTimer];
+}
+
+- (void)stopBeatTimer {
+    if (![NSThread isMainThread]) {
+        __weak ExpoJuceAudioEngine *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf stopBeatTimer]; });
+        return;
+    }
+    self.beatTimerWanted = NO;
+    [self cancelBeatTimer];
+}
+
+// Main thread. Creates the timer if it is not running (beatTimerWanted unchanged).
+- (void)resumeBeatTimer {
     if (self.beatTimer) return;
-    if (!sSynth) return;
 
     self.beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(self.beatTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
@@ -1394,23 +1522,21 @@ static NSString *backingTrackPath(NSString *uri) {
         if (!strongSelf || !sSynth) return;
         BeatCallback cb = strongSelf.beatCallback;
         if (sSynth->beatState.crossed.exchange(false) && cb) {
-            cb(sSynth->beatState.beat.load(), sSynth->beatState.bpm.load());
+            const double beat = sSynth->beatState.beat.load();
+            // Fractional transport position now (main thread: sTransport cannot change under us).
+            const double position = sTransport ? sTransport->getPosition() : beat;
+            cb(beat, sSynth->beatState.bpm.load(), position);
         }
     });
     dispatch_resume(self.beatTimer);
 }
 
-- (void)stopBeatTimer {
-    if (![NSThread isMainThread]) {
-        __weak ExpoJuceAudioEngine *weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf stopBeatTimer]; });
-        return;
-    }
+// Main thread. Cancels the timer, keeping beatTimerWanted and the callback.
+- (void)cancelBeatTimer {
     if (self.beatTimer) {
         dispatch_source_cancel(self.beatTimer);
         self.beatTimer = nil;
     }
-    self.beatCallback = nil;
 }
 
 - (void)dealloc { [self shutdown]; }

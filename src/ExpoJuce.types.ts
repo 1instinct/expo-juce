@@ -6,8 +6,11 @@ export type ChangeEventPayload = {
 };
 
 export type BeatEventPayload = {
+  /** Transport position in beats (fractional) at the end of the audio block that crossed a beat. */
   beat: number;
   bpm: number;
+  /** Transport position in beats (fractional) when the event was sent (0.8.0+; absent on older binaries). */
+  position?: number;
 };
 
 export type SetupOptions = {
@@ -28,9 +31,18 @@ export type PadNoteOffEvent = {
   note: number;
 };
 
+/** What a `JucePadView` plays (0.8.0+). */
+export type PadMode = 'notes' | 'drums';
+
 export type JucePadViewProps = {
-  /** MIDI note triggered while the pad is touched. */
+  /** MIDI note triggered while the pad is touched; in `drums` mode the drum voice (0–8). */
   note: number;
+  /**
+   * `notes` (default): the pad holds `note` on the synth while touched. `drums`: every touch-down
+   * hits drum voice `note` natively (one-shot, same velocity; `onNoteOn` per hit, `onNoteOff` when
+   * the last touch lifts). Changing the mode releases the pad. Binaries older than 0.8.0 ignore it.
+   */
+  mode?: PadMode;
   /** MIDI velocity 0-127 (default 100). */
   velocity?: number;
   /** When false, touches pass through and no note is played (default true). */
@@ -137,6 +149,22 @@ export type BackingTrackInfo = {
   regionRule?: BackingTrackRegionRule;
   /** Decoder used (e.g. "CoreAudio", "MP3 file", "WAV file"). */
   decoder?: string;
+  /**
+   * The tempo the track follows from (0.8.0-rc.3+): the `sourceBpm` passed in, 0 if none was or it
+   * was not a positive finite number. Absent on older binaries, which play every track at its own
+   * speed: use its presence to tell whether the running binary follows the tempo.
+   */
+  sourceBpm?: number;
+};
+
+/** `loadBackingTrack()` options beyond the file (0.8.0-rc.3+; older binaries ignore them). */
+export type BackingTrackLoadOptions = {
+  /**
+   * The file's own tempo. With it the track follows the transport tempo at its own pitch (time
+   * stretch), locked to the beat; at exactly this tempo it plays untouched. 0 / omitted: the track
+   * plays at its own speed whatever the tempo.
+   */
+  sourceBpm?: number;
 };
 
 /** `setBackingTrackOptions()` options; omitted keys keep their current value. */
@@ -189,6 +217,34 @@ export type ArpOptions = {
   /** −12..12 semitones added per pass (default 0). */
   transposeDistance: number;
 };
+
+/**
+ * One drum voice's parameters (0.8.0+). Voices in pad order: 0 kick, 1 snare, 2 closed hat,
+ * 3 open hat, 4 clap, 5 low tom, 6 high tom, 7 rim, 8 mid tom (0.8.0-rc.2+).
+ */
+export type DrumVoiceParams = {
+  /** Semitones, −24..24 (default 0). */
+  tune: number;
+  /** 0–1 (default 0.5): scales the voice's envelopes, 0 = ×0.25, 0.5 = ×1, 1 = ×4. */
+  decay: number;
+  /** 0–1 (default 0.5): voice-specific brightness / noise mix (see README "Drums"). */
+  tone: number;
+  /** 0–1 (default 0.8). */
+  level: number;
+};
+
+/** Kit-wide drum parameters (0.8.0+). */
+export type DrumKitParams = {
+  /** 0–1 (default 0.8). */
+  level: number;
+  /** Silences the kit (default false). */
+  mute: boolean;
+  /** 0–1 soft saturation of the kit sum (default 0 = clean). */
+  drive: number;
+};
+
+/** `getDrumState()` (0.8.0+): the kit and every voice (9; 8 before 0.8.0-rc.2), as stored natively (after clamping). */
+export type DrumState = { kit: DrumKitParams; voices: DrumVoiceParams[] };
 
 /** Arpeggiator state in `Analysis.arp` (0.7.0+), as of the last rendered block. */
 export type ArpAnalysis = {
@@ -306,6 +362,12 @@ export type AudioDiagnostics = {
   backingTrackLoaded?: boolean;
   /** Backing-track playback position in seconds; -1 when not playing (0.6.0+). */
   backingTrackPositionSec?: number;
+  /** Transport tempo / the playing track's own tempo; 1 = untouched or no tempo (0.8.0-rc.3+). */
+  backingTrackTempoRatio?: number;
+  /** Drum hits the engine has started (cumulative since launch, 0.8.0+). */
+  drumHits?: number;
+  /** Peak of the drum part, before the effects (decaying hold, 0.8.0+). */
+  drumPeak?: number;
   sessionCategory: string;
   sessionSampleRate: number;
   sessionIOBufferMs: number;
@@ -313,4 +375,16 @@ export type AudioDiagnostics = {
   otherAudioPlaying: boolean;
   /** AVAudioSession current route output port types. */
   routeOutputs: string[];
+  /** "android" on Android (0.9.0+); absent on iOS. The AVAudioSession fields above are iOS-only: empty / zero on Android. */
+  platform?: 'android';
+  /** Android: the device's native output sample rate (Hz) the engine asked for; 0 = unknown (0.9.0+). */
+  nativeSampleRate?: number;
+  /** Android: output underruns reported by the audio stream since it opened; -1 = unknown (0.9.0+). */
+  xrunCount?: number;
+  /** Android: the app is in the background and the audio device is closed (0.9.0+). */
+  backgrounded?: boolean;
+  /** Android: times the device was closed because the app went to the background (0.9.0+). */
+  backgroundStops?: number;
+  /** Android: times it was reopened when the app came back (0.9.0+). */
+  foregroundRestarts?: number;
 };

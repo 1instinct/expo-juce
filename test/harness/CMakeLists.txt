@@ -39,7 +39,7 @@ foreach(u IN LISTS ENGINE_UNITS)
   list(APPEND ENGINE_CPP "${SNAP}/${u}.cpp")
 endforeach()
 # Header-only engine units (pure C++), e.g. the device callback GraphPlayer.
-set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser)
+set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser DrumMachine)
 foreach(u IN LISTS ENGINE_HEADERS)
   set(out "${SNAP}/${u}.h")
   if(HARNESS_GIT_REF STREQUAL "WORKTREE")
@@ -107,4 +107,39 @@ add_executable(harness harness.cpp ${ENGINE_CPP})
 target_include_directories(harness PRIVATE "${SNAP}")
 target_link_libraries(harness PRIVATE juce_lib)
 target_compile_definitions(harness PRIVATE HARNESS_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
-                                           HARNESS_JS_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+                                           HARNESS_JS_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../src"
+                                           # BackingTrack::acquire() test seam, see harness.cpp
+                                           BACKING_TRACK_ACQUIRE_HOOK=harnessBackingTrackAcquireHook)
+
+# Android host (android/src/main/cpp/AndroidEngineHost.cpp): its portable part, with JUCE's Android
+# device replaced by a fake device type (host_test.cpp). Same git ref / WORKTREE rule as ios/.
+set(HOST_SNAP "${CMAKE_BINARY_DIR}/host_src")
+file(MAKE_DIRECTORY "${HOST_SNAP}")
+foreach(f AndroidEngineHost.h AndroidEngineHost.cpp)
+  if(HARNESS_GIT_REF STREQUAL "WORKTREE")
+    configure_file("${REPO_ROOT}/android/src/main/cpp/${f}" "${HOST_SNAP}/${f}" COPYONLY)
+  else()
+    execute_process(COMMAND git show "${HARNESS_GIT_REF}:android/src/main/cpp/${f}"
+                    WORKING_DIRECTORY "${REPO_ROOT}" OUTPUT_FILE "${HOST_SNAP}/${f}"
+                    RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "git show ${HARNESS_GIT_REF}:android/src/main/cpp/${f} failed")
+    endif()
+  endif()
+endforeach()
+# The generated Kotlin defaults the test compares with (host_test --write-defaults).
+set(DEFAULT_SHAPES_REL "android/src/main/java/expo/modules/juce/DefaultShapes.kt")
+if(HARNESS_GIT_REF STREQUAL "WORKTREE")
+  configure_file("${REPO_ROOT}/${DEFAULT_SHAPES_REL}" "${HOST_SNAP}/DefaultShapes.kt" COPYONLY)
+else()
+  execute_process(COMMAND git show "${HARNESS_GIT_REF}:${DEFAULT_SHAPES_REL}"
+                  WORKING_DIRECTORY "${REPO_ROOT}" OUTPUT_FILE "${HOST_SNAP}/DefaultShapes.kt"
+                  RESULT_VARIABLE rc)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "git show ${HARNESS_GIT_REF}:${DEFAULT_SHAPES_REL} failed")
+  endif()
+endif()
+add_executable(host_test host_test.cpp "${HOST_SNAP}/AndroidEngineHost.cpp" ${ENGINE_CPP})
+target_include_directories(host_test PRIVATE "${HOST_SNAP}" "${SNAP}")
+target_compile_definitions(host_test PRIVATE EXPOJUCE_DEFAULT_SHAPES_KT="${HOST_SNAP}/DefaultShapes.kt")
+target_link_libraries(host_test PRIVATE juce_lib)

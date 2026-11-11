@@ -40,6 +40,9 @@ public class ExpoJuceModule: Module {
       return "Hello world!"
     }
 
+    // Called when the first listener (of any event) subscribes and when the last one is removed.
+    // The timer may start before setup (it idles until the engine exists); stopping it keeps the
+    // beat callback, so the next subscriber gets events again without another setup.
     OnStartObserving {
       self.hasListeners = true
       ExpoJuceBridge.startBeatTimer()
@@ -62,12 +65,17 @@ public class ExpoJuceModule: Module {
           promise.reject("ERR_AUDIO_SETUP", ExpoJuceBridge.setupErrorMessage())
           return
         }
-        ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm in
+        ExpoJuceBridge.setBeatCallback { [weak self] beat, bpm, position in
           guard let self = self, self.hasListeners else { return }
           self.sendEvent("onBeat", [
             "beat": beat,
             "bpm": bpm,
+            "position": position,
           ])
+        }
+        // Listeners that subscribed before setup: start (or keep) the beat timer now.
+        if self?.hasListeners == true {
+          ExpoJuceBridge.startBeatTimer()
         }
         promise.resolve(NSNull())
       }
@@ -201,6 +209,39 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.getArpeggiatorState()
     }
 
+    // ── Drums (0.8.0+) ─────────────────────────────────────────────
+    // Hits go through the lock-free note queue (any thread); parameters are lock-free and
+    // remembered before setup and across rebuilds.
+
+    Function("hasDrums") { () -> Bool in
+      return true
+    }
+
+    // voice 0–8 (anything else, including a non-integer, is ignored); velocity clamped to 1–127.
+    Function("drumHit") { (voice: Double, velocity: Double) -> Void in
+      guard voice.isFinite, velocity.isFinite, voice.rounded() == voice, voice >= 0, voice <= 8 else {
+        return
+      }
+      let clampedVelocity = Int32(min(max(velocity.rounded(), 1), 127))
+      ExpoJuceBridge.drumHit(Int32(voice), velocity: clampedVelocity)
+    }
+
+    // Partial update; unknown keys ignored, values clamped. false for a voice outside 0–8.
+    Function("setDrumVoice") { (voice: Double, params: [String: Any]) -> Bool in
+      guard voice.isFinite, voice.rounded() == voice, voice >= 0, voice <= 8 else {
+        return false
+      }
+      return ExpoJuceBridge.setDrumVoice(Int32(voice), params: params)
+    }
+
+    Function("setDrumKit") { (params: [String: Any]) -> Bool in
+      return ExpoJuceBridge.setDrumKit(params)
+    }
+
+    Function("getDrumState") { () -> [String: Any] in
+      return ExpoJuceBridge.getDrumState()
+    }
+
     // ── Transport ──────────────────────────────────────────────────
 
     Function("startTransport") {
@@ -251,6 +292,11 @@ public class ExpoJuceModule: Module {
 
       Prop("note") { (view: JucePadView, note: Int) in
         view.note = note
+      }
+
+      // "notes" (default) or "drums": in drums mode a touch hits drum voice `note` (0–8).
+      Prop("mode") { (view: JucePadView, mode: String?) in
+        view.drumMode = (mode == "drums")
       }
 
       Prop("velocity") { (view: JucePadView, velocity: Int?) in

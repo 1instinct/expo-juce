@@ -50,6 +50,9 @@ Pod::Spec.new do |s|
     "TransportEngine.h",
     "GraphPlayer.h",
     "NoteEventQueue.h",
+    "Arpeggiator.h",
+    "SpectrumAnalyser.h",
+    "DrumMachine.h",
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)

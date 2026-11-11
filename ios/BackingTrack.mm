@@ -191,6 +191,9 @@ std::unique_ptr<BackingTrackBuffer> BackingTrack::load(const BackingTrackSource&
         return nullptr;
     }
 
+    const double sourceBpm = std::isfinite(src.sourceBpm) && src.sourceBpm > 0.0 ? src.sourceBpm : 0.0;
+    out->sourceBpm = sourceBpm;
+    info.sourceBpm = sourceBpm;
     info.durationSec = (double)region.length / rate;
     info.sampleRate = rate;
     info.channels = channels;

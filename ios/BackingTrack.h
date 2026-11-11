@@ -28,6 +28,13 @@
 #include <string>
 #include <vector>
 
+// Test seam: the offline harness defines BACKING_TRACK_ACQUIRE_HOOK as the name of a function it
+// provides; acquire() calls it between its first read of the published pointer and the
+// re-validation, so a test can publish at exactly that point. Undefined in the module: no code.
+#ifdef BACKING_TRACK_ACQUIRE_HOOK
+void BACKING_TRACK_ACQUIRE_HOOK();
+#endif
+
 // MP3 gapless information of the source file (frames at the source rate).
 struct BackingTrackGapless {
     int64_t loopSamples = 0;
@@ -54,6 +61,7 @@ struct BackingTrackSource {
     std::string path;
     bool hasGapless = false;
     BackingTrackGapless gapless;
+    double sourceBpm = 0.0; // the file's own tempo; 0 = unknown (it then plays at its own speed)
 };
 
 // Result of a load (also what loadBackingTrack resolves with).
@@ -68,6 +76,7 @@ struct BackingTrackInfo {
     std::string formatName;      // reader used ("CoreAudio", "MP3 file", "WAV file", …)
     double playbackRate = 0.0;   // rate of the playable buffer
     int64_t playbackFrames = 0;  // its length
+    double sourceBpm = 0.0;      // the tempo taken from the source (0 = unknown)
 };
 
 // Playable buffer: stereo at the device rate.
@@ -80,6 +89,7 @@ struct BackingTrackBuffer {
     juce::AudioBuffer<float> audio;
     double sampleRate = 0.0;
     int length = 0;
+    double sourceBpm = 0.0; // set before publishing, then read-only (AuxProcessor follows it)
 
     static inline std::atomic<int> live{0}; // instances alive (tests check the deferred frees)
 };
@@ -152,11 +162,19 @@ public:
     // The buffer to play in this block (nullptr = none), marked in use: buffers published before
     // it are no longer referenced by the reader once this returns, except the one it used before
     // a change, which stays protected (replacing an earlier one) until releaseTail().
+    //
+    // The tail slot is set inside the re-validation loop, on whichever pass first moves off
+    // `previous` (a publish can land after the first read and only be seen by the re-check), and
+    // always before inUse leaves `previous`: collect() reads inUse, then inUseTail, so at every
+    // instant `previous` is in at least one of the slots it reads.
     BackingTrackBuffer* acquire() noexcept {
         BackingTrackBuffer* const previous = inUse.load(std::memory_order_relaxed); // written by the reader only
         BackingTrackBuffer* p = published.load(std::memory_order_seq_cst);
-        if (p != previous && previous != nullptr) inUseTail.store(previous, std::memory_order_seq_cst);
+#ifdef BACKING_TRACK_ACQUIRE_HOOK
+        BACKING_TRACK_ACQUIRE_HOOK();
+#endif
         for (;;) {
+            if (p != previous && previous != nullptr) inUseTail.store(previous, std::memory_order_seq_cst);
             inUse.store(p, std::memory_order_seq_cst);
             BackingTrackBuffer* again = published.load(std::memory_order_seq_cst);
             if (again == p) return p;

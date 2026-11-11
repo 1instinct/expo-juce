@@ -21,14 +21,20 @@ import {
   BackingTrackInfo,
   BackingTrackRegionRule,
   BackingTrackOptions,
+  BackingTrackLoadOptions,
   Analysis,
   ArpMode,
   ArpRate,
   ArpOptions,
   ArpAnalysis,
+  PadMode,
+  DrumVoiceParams,
+  DrumKitParams,
+  DrumState,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
 import { ARP_DEFAULTS, arpDefaults } from './arpDefaults';
+import { DRUM_KIT_DEFAULTS, DRUM_VOICE_COUNT, DRUM_VOICE_DEFAULTS, drumDefaults } from './drumDefaults';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
@@ -174,7 +180,11 @@ export function setMetronome(options: MetronomeOptions): boolean {
 // Decodes a local audio file (file:// URI or absolute path; WAV, AIFF, FLAC, MP3, plus CoreAudio
 // formats such as M4A on iOS) off the audio thread at the device rate and swaps it in (5 ms
 // crossfade). It plays while the transport plays; track sample 0 is beat 0, so starts, resumes
-// and setTransportPosition place it at beat x 60 / bpm, and a tempo change does not move it.
+// and setTransportPosition place it at beat x 60 / bpm. Without `options.sourceBpm` it plays at its
+// own speed (bpm is the transport's, and a tempo change does not move it). With the file's own
+// tempo (0.8.0-rc.3+) bpm is that tempo and the track follows the transport tempo at its own
+// pitch, each beat on the transport's beat; at exactly that tempo it is the file untouched. The
+// result's `sourceBpm` (absent on older binaries) says whether the binary does this.
 // `gapless` (MP3 LAME/Xing tag values) picks the exact loop region: decoded length ==
 // loopSamples -> [0, loopSamples) ('tag'); == 1152 + leading + loopSamples + trailing ->
 // [1152 + leading, +loopSamples) ('padded'); == leading + loopSamples + trailing ->
@@ -184,12 +194,19 @@ export function setMetronome(options: MetronomeOptions): boolean {
 // _FILE, _FORMAT, _TOO_LONG (over 6 min), _MEMORY (not enough memory available).
 export async function loadBackingTrack(
   uri: string,
-  gapless?: BackingTrackGapless
+  gapless?: BackingTrackGapless,
+  options?: BackingTrackLoadOptions
 ): Promise<BackingTrackInfo> {
   if (typeof ExpoJuceModule?.loadBackingTrack !== 'function') {
     const error = new Error('this binary has no backing-track support (expo-juce 0.6.0+)');
     (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';
     throw error;
+  }
+  // The tempo travels in the gapless dictionary, so the native signature is unchanged and older
+  // binaries simply ignore it.
+  const sourceBpm = options?.sourceBpm;
+  if (typeof sourceBpm === 'number' && Number.isFinite(sourceBpm) && sourceBpm > 0) {
+    return ExpoJuceModule.loadBackingTrack(uri, { ...(gapless ?? {}), sourceBpm });
   }
   return ExpoJuceModule.loadBackingTrack(uri, gapless ?? null);
 }
@@ -252,6 +269,62 @@ export function setArpeggiator(options: Partial<ArpOptions>): boolean {
 export function getArpeggiatorState(): ArpOptions {
   if (typeof ExpoJuceModule?.getArpeggiatorState !== 'function') return arpDefaults();
   return ExpoJuceModule.getArpeggiatorState();
+}
+
+// ── Drums (0.8.0+) ───────────────────────────────────────────────
+// Nine synthesized voices: 0 kick, 1 snare, 2 closed hat, 3 open hat (choked by the closed hat),
+// 4 clap, 5 low tom, 6 high tom, 7 rim, 8 mid tom (0.8.0-rc.2+; older binaries have 0-7 and ignore
+// 8: read getDrumState().voices.length). Each voice is monophonic: a hit restarts it.
+// The drum part is mixed with the synth before the effects chain; the arpeggiator never applies
+// to it. Parameters are synchronous and lock-free, remembered natively before setup() and across
+// engine rebuilds. Binaries older than 0.8.0: hasDrums() is false, drumHit is a no-op, the setters
+// return false and getDrumState returns the defaults.
+
+export { DRUM_VOICE_COUNT, DRUM_VOICE_DEFAULTS, DRUM_KIT_DEFAULTS };
+
+const DRUM_VOICE_KEYS = ['tune', 'decay', 'tone', 'level'] as const;
+
+const isDrumVoice = (voice: number): boolean =>
+  Number.isInteger(voice) && voice >= 0 && voice < DRUM_VOICE_COUNT;
+
+/** True when this binary has the drum part (0.8+). */
+export function hasDrums(): boolean {
+  return typeof ExpoJuceModule?.hasDrums === 'function' && ExpoJuceModule.hasDrums() === true;
+}
+
+/** Trigger voice 0..8 at velocity 1..127. Thread-safe, lock-free; same queue as noteOn. Out-of-range voice is ignored. */
+export function drumHit(voice: number, velocity: number): void {
+  if (typeof ExpoJuceModule?.drumHit !== 'function') return;
+  if (!isDrumVoice(voice) || !Number.isFinite(velocity)) return;
+  ExpoJuceModule.drumHit(voice, Math.min(127, Math.max(1, Math.round(velocity))));
+}
+
+/** Partial update of one voice; unknown keys ignored; values clamped. Returns false if unsupported. */
+export function setDrumVoice(voice: number, params: Partial<DrumVoiceParams>): boolean {
+  if (typeof ExpoJuceModule?.setDrumVoice !== 'function') return false;
+  if (!isDrumVoice(voice)) return false;
+  const clean: Partial<DrumVoiceParams> = {};
+  for (const key of DRUM_VOICE_KEYS) {
+    const value = params?.[key];
+    if (typeof value === 'number' && Number.isFinite(value)) clean[key] = value;
+  }
+  return ExpoJuceModule.setDrumVoice(voice, clean) === true;
+}
+
+/** Partial update of the kit (level 0–1, mute, drive 0–1); unknown keys ignored; values clamped. Returns false if unsupported. */
+export function setDrumKit(params: Partial<DrumKitParams>): boolean {
+  if (typeof ExpoJuceModule?.setDrumKit !== 'function') return false;
+  const clean: Partial<DrumKitParams> = {};
+  if (typeof params?.level === 'number' && Number.isFinite(params.level)) clean.level = params.level;
+  if (typeof params?.drive === 'number' && Number.isFinite(params.drive)) clean.drive = params.drive;
+  if (typeof params?.mute === 'boolean') clean.mute = params.mute;
+  return ExpoJuceModule.setDrumKit(clean) === true;
+}
+
+/** The kit and the 8 voices as stored natively (after clamping); the defaults on older binaries. */
+export function getDrumState(): { kit: DrumKitParams; voices: DrumVoiceParams[] } {
+  if (typeof ExpoJuceModule?.getDrumState !== 'function') return drumDefaults();
+  return ExpoJuceModule.getDrumState();
 }
 
 // ── Transport ────────────────────────────────────────────────────
@@ -320,9 +393,14 @@ export {
   BackingTrackInfo,
   BackingTrackRegionRule,
   BackingTrackOptions,
+  BackingTrackLoadOptions,
   Analysis,
   ArpMode,
   ArpRate,
   ArpOptions,
   ArpAnalysis,
+  PadMode,
+  DrumVoiceParams,
+  DrumKitParams,
+  DrumState,
 };

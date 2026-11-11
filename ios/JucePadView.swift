@@ -5,12 +5,24 @@ import UIKit
 // (no JS round trip). Multi-touch safe: the note starts with the first touch on the view and
 // stops when the last touch on it lifts or is cancelled. onNoteOn / onNoteOff are for visuals
 // and haptics only; the sound has already been triggered when they fire.
+//
+// Drums mode (mode "drums"): `note` is a drum voice (0–8) and every touch-down hits it (one-shot,
+// with the same velocity as a note; a second finger retriggers). onNoteOn fires per hit and
+// onNoteOff when the last touch lifts; no note-off is sent to the engine.
 class JucePadView: ExpoView {
   let onNoteOn = EventDispatcher()
   let onNoteOff = EventDispatcher()
 
   var note: Int = 60
   var velocity: Int = 100
+  // Drums mode. Changing the mode releases whatever this pad is sounding.
+  var drumMode: Bool = false {
+    didSet {
+      if drumMode != oldValue {
+        releaseAllTouches()
+      }
+    }
+  }
   // Disabled pads leave hit-testing entirely, so touches reach the views underneath (forwarding
   // to super would only walk the responder chain, which does not include siblings).
   var enabled: Bool = true {
@@ -36,6 +48,8 @@ class JucePadView: ExpoView {
 
   private var activeTouches = Set<UITouch>()
   private var soundingNote: Int?
+  // The sounding note is a drum hit (nothing to release in the engine).
+  private var soundingIsDrum = false
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -98,7 +112,7 @@ class JucePadView: ExpoView {
     }
     let wasIdle = activeTouches.isEmpty
     activeTouches.formUnion(touches)
-    if wasIdle && !activeTouches.isEmpty {
+    if (wasIdle || drumMode) && !activeTouches.isEmpty {
       var timestamp: TimeInterval = 0
       for touch in touches {
         if timestamp == 0 || touch.timestamp < timestamp {
@@ -154,13 +168,24 @@ class JucePadView: ExpoView {
   }
 
   private func startNote(touchTimestamp: TimeInterval) {
-    stopNote()
+    // A drums-mode retrigger (another finger while a hit is held) is just another hit: no
+    // onNoteOff in between, that fires only when the last touch lifts.
+    if !(drumMode && soundingIsDrum) {
+      stopNote()
+    }
     let noteNumber = note
     let noteVelocity = velocity
     soundingNote = noteNumber
-    ExpoJuceBridge.padNoteOn(Int32(clamping: noteNumber),
-                             velocity: Int32(clamping: noteVelocity),
-                             touchTimestamp: touchTimestamp)
+    soundingIsDrum = drumMode
+    if drumMode {
+      ExpoJuceBridge.padDrumHit(Int32(clamping: noteNumber),
+                                velocity: Int32(clamping: noteVelocity),
+                                touchTimestamp: touchTimestamp)
+    } else {
+      ExpoJuceBridge.padNoteOn(Int32(clamping: noteNumber),
+                               velocity: Int32(clamping: noteVelocity),
+                               touchTimestamp: touchTimestamp)
+    }
     let payload: [String: Any] = [
       "note": noteNumber,
       "velocity": noteVelocity,
@@ -173,7 +198,10 @@ class JucePadView: ExpoView {
       return
     }
     soundingNote = nil
-    ExpoJuceBridge.noteOff(Int32(clamping: noteNumber))
+    if !soundingIsDrum {
+      ExpoJuceBridge.noteOff(Int32(clamping: noteNumber))
+    }
+    soundingIsDrum = false
     let payload: [String: Any] = [
       "note": noteNumber,
     ]

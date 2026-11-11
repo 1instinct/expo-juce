@@ -72,6 +72,7 @@ struct AuxDiagnostics {
     std::atomic<uint64_t> processCount{0};
     std::atomic<uint64_t> clicks{0};          // metronome clicks started
     std::atomic<double> trackPositionSec{-1.0}; // backing-track read position (-1 = not playing)
+    std::atomic<double> trackTempoRatio{1.0};   // transport tempo / track tempo; 1 = the file untouched
 };
 
 // Metronome: clicks start on the first sample whose transport beat position is >= each integer
@@ -83,12 +84,23 @@ struct AuxDiagnostics {
 // samples rendered, so a tempo change does not move it. When the transport starts or is moved
 // (setTransportPosition, detected from the transport's seek flag or a block-start beat that is
 // not where the previous block ended) the position is set from the beat: track sample 0 is beat
-// 0, position = beat × 60 / bpm × rate (modulo the length when looping). Pausing and resuming
+// 0, position = beat × 60 / bpm × rate (modulo the length when looping), where bpm is the track's
+// own tempo if it has one and the transport's otherwise. Pausing and resuming
 // therefore continues where it stopped, and seeks land on the beat grid. Loops if `loop`, else
 // silent past its end. A start away from sample 0, a seek, a stop, and a swap to another buffer
 // (load, unload, resample) are declicked with a 5 ms fade (the old buffer fades out while the
 // new one fades in; the holder keeps the old one alive for that). A published buffer whose rate
 // is not this node's rate is not played (it is being reloaded).
+//
+// Following the tempo: a buffer with a sourceBpm keeps its beats on the transport's at any tempo,
+// at its own pitch (WSOLA over the resident buffer, nothing is buffered or allocated). Two read
+// heads, each at normal speed, crossfade every kGrainHopSeconds: the outgoing head is the previous
+// grain, the incoming one starts where the beat says the track should be by the middle of its
+// grain, moved up to kGrainSearchSeconds to the place that best continues what the outgoing head is
+// playing. The target comes from the transport's beat each time, so errors never add up and a tempo
+// change or a seek holds from the next grain. A click sits at most the search distance plus
+// |ratio - 1| × hop from its beat. At the track's own tempo there are no grains: after one last
+// crossfade onto the exact grid position it is the plain path above, the file sample for sample.
 //
 // Prepare: JUCE never runs prepareToPlay concurrently with processBlock (the graph renders
 // nothing while its nodes are prepared, see AudioProcessorGraph NodeStates::applySettings; the
@@ -101,6 +113,9 @@ public:
     static constexpr double kFadeSeconds = 0.005;
     static constexpr double kLevelRampSeconds = 0.030;
     static constexpr int kMaxClickSamples = (int)(kMaxClickSeconds * 192000.0) + 1;
+    static constexpr double kGrainHopSeconds = 0.020;
+    static constexpr double kGrainSearchSeconds = 0.010;
+    static constexpr double kGrainCompareSeconds = 0.010;
 
     AuxProcessor();
     ~AuxProcessor() override;
@@ -144,6 +159,7 @@ private:
     void renderMetronome(float* left, float* right, int n, double beatStart, double beatsPerSample, bool playing);
     void renderTrack(float* left, float* right, int n, double beatStart, double bpm, bool playing, bool seeked);
     void startTail(BackingTrackBuffer* buffer, int64_t position);
+    void startGrain(const BackingTrackBuffer& buffer, double sourcePosition, bool search, bool loop, bool fromTop);
 
     AuxSettingsStore ownSettings;
     AuxSettingsStore* settings = &ownSettings;
@@ -169,12 +185,20 @@ private:
     bool havePrevBlock = false;       // prevBeatStart / prevBeatsAdvanced valid
     double prevBeatStart = 0.0, prevBeatsAdvanced = 0.0;
     bool trackActive = false;         // main voice playing
-    int64_t trackPos = 0;             // main voice position (samples at sr, not wrapped)
+    int64_t trackPos = 0;             // main voice position (samples at sr, not wrapped); with grains, the incoming head
+    bool grainsActive = false;        // following a tempo that is not the track's
+    bool grainsOnGrid = false;        // back at the track's tempo: the incoming head is the exact position
+    int64_t grainOutPos = 0;          // the outgoing head
+    int grainHop = 960, grainPhase = 0; // samples per crossfade, samples into this one
+    int grainSearch = 480, grainCompare = 480, grainStride = 4;
     int mainFadeLeft = 0;             // fade-in samples left
     bool tailActive = false;          // a voice fading out (seek / stop / swap)
     BackingTrackBuffer* tailBuffer = nullptr;
     int64_t tailPos = 0;
     int tailLeft = 0;
+    bool tailGrains = false;          // the tail was mid-crossfade: it finishes that one while it fades
+    int64_t tailOutPos = 0;
+    int tailPhase = 0;
     bool tailProtected = false;       // the holder keeps a previous buffer for us
     Smoothed trackGain;
     BackingTrackBuffer* lastTrack = nullptr;

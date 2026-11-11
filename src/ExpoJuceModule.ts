@@ -7,11 +7,14 @@ import type {
   BackingTrackGapless,
   BackingTrackInfo,
   BackingTrackOptions,
+  DrumKitParams,
+  DrumState,
+  DrumVoiceParams,
   EffectsState,
   MetronomeOptions,
 } from './ExpoJuce.types';
 
-// The native module (ios/ExpoJuceModule.swift). Functions added after 0.5.0 are optional,
+// The native module (ios/ExpoJuceModule.swift; android/src/main/java/expo/modules/juce/ExpoJuceModule.kt). Functions added after 0.5.0 are optional,
 // because an older binary does not export them: callers check `typeof fn === 'function'`.
 export type ExpoJuceNativeModule = {
   PI: number;
@@ -48,13 +51,21 @@ export type ExpoJuceNativeModule = {
   // Metronome, backing track, analysis (0.6.0+)
   setMetronome?(options: MetronomeOptions): boolean;
   setBackingTrackOptions?(options: BackingTrackOptions): void;
-  loadBackingTrack?(uri: string, gapless: BackingTrackGapless | null): Promise<BackingTrackInfo>;
+  // `gapless` may also carry `sourceBpm` (0.8.0-rc.3+; see loadBackingTrack in index.ts).
+  loadBackingTrack?(uri: string, gapless: (Partial<BackingTrackGapless> & { sourceBpm?: number }) | null): Promise<BackingTrackInfo>;
   unloadBackingTrack?(): void;
   getAnalysis?(): Analysis;
 
   // Arpeggiator (0.7.0+)
   setArpeggiator?(options: Partial<ArpOptions>): boolean;
   getArpeggiatorState?(): ArpOptions;
+
+  // Drums (0.8.0+)
+  hasDrums?(): boolean;
+  drumHit?(voice: number, velocity: number): void;
+  setDrumVoice?(voice: number, params: Partial<DrumVoiceParams>): boolean;
+  setDrumKit?(params: Partial<DrumKitParams>): boolean;
+  getDrumState?(): DrumState;
 
   // Transport
   startTransport(): void;

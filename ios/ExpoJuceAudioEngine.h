@@ -2,7 +2,9 @@
 
 #import <Foundation/Foundation.h>
 
-typedef void(^BeatCallback)(double beat, double bpm);
+// beat: transport position (beats, fractional) at the end of the block that crossed a beat;
+// position: transport position (beats, fractional) when the event is delivered.
+typedef void(^BeatCallback)(double beat, double bpm, double position);
 
 @interface ExpoJuceAudioEngine : NSObject
 
@@ -64,6 +66,8 @@ typedef void(^BeatCallback)(double beat, double bpm);
 // (gapless: loopSamples / leadingSamples / trailingSamples, optional), resamples to the device
 // rate and swaps it in. A later load / unload supersedes it (ERR_BACKING_TRACK_SUPERSEDED).
 // `completion` runs on that background queue: result on success, else errorCode + message.
+// `gapless` may also carry `sourceBpm`, the file's own tempo (0.8.0-rc.3+): the track then follows
+// the transport tempo (see AuxProcessor.h).
 - (void)loadBackingTrack:(NSString *)uri
                  gapless:(NSDictionary<NSString *, id> *)gapless
               completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode,
@@ -78,6 +82,21 @@ typedef void(^BeatCallback)(double beat, double bpm);
 - (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options; // NO (nothing applied): unknown mode / rate, pattern not 1–16 booleans
 // Every option as stored (pattern as an array of `length` booleans).
 - (NSDictionary<NSString *, id> *)arpeggiatorState;
+
+// Drums (0.8.0+): nine synthesized voices (eight before 0.8.0-rc.2) mixed before the effects (see DrumMachine.h).
+// drumHit: voice 0–8, velocity clamped to 1–127; any thread, lock-free, through the note queue
+// (out-of-range voice ignored; dropped while the engine is not ready, like noteOn).
+- (void)drumHit:(int)voice velocity:(int)velocity;
+// drumHit from a native touch (JucePadView in drums mode); touchTimestamp as for noteOn.
+- (void)drumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp;
+// Parameters: lock-free, any thread, remembered before setup and across rebuilds; absent / unknown
+// keys and non-finite values unchanged, numbers clamped. Voice keys: tune (semitones −24..24),
+// decay, tone, level (0–1). NO for a voice outside 0–8 (nothing applied).
+- (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params;
+// Kit keys: level (0–1), mute (bool), drive (0–1). Always YES.
+- (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params;
+// { kit: { level, mute, drive }, voices: [9 × { tune, decay, tone, level }] } as stored.
+- (NSDictionary<NSString *, id> *)drumState;
 
 // Output analysis for HUDs: { peak, rms, scope: [128 numbers], bands: [24 numbers], sampleRate,
 // lastNote, bpm, beat, playing, arp: { active, step, steps, note } }. Any thread; one 2048-point
@@ -96,6 +115,8 @@ typedef void(^BeatCallback)(double beat, double bpm);
 // Beat events
 - (void)setBeatCallback:(BeatCallback)callback;
 // The beat timer lives on the main queue; called off the main thread these re-dispatch to main.
+// startBeatTimer works before setup (the timer idles until the engine exists); stopBeatTimer keeps
+// the callback.
 - (void)startBeatTimer;
 - (void)stopBeatTimer;
 
