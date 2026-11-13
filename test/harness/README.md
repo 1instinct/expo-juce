@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, bsel, broute)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, bsel, broute, mip, mim, mih, mic)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -145,6 +145,17 @@ Exit code non-zero on any failure.
   running setup and nothing is reopened; a stale stored setup, which opens a new device; back to the
   speaker, which the old "granted > last granted" check missed (1025 > 1025) and which now comes
   back to 131; a second speaker route change that asks nothing; xruns carried once per device).
+- MIDI byte input (0.9.0-rc.2): `mip` (`ios/MidiInput.h` parsers against the vectors of a JS
+  parser with the same rules: BLE-MIDI headers, timestamps, running status across packets, SysEx
+  skipped, a note-on with velocity 0 as a note-off, truncated and headerless packets; a raw stream
+  with running status; raw packets that are not complete MIDI ignored whole), `mim` (map sanitising, and 20000
+  swaps against 3 reader threads that must only ever see a whole map), `mih` (holds: a note-off
+  releases what its note-on played across map changes; shared synth notes counted; a note another
+  source holds left to it; a retrigger's synthetic note-off; `releaseAll` and the engine's
+  `allNotesOff` bump the epoch; a full event ring; the real synth sounds and the
+  `midiInputToRenderMs` leg records from the arrival stamp; no allocation on input or in the
+  render), `mic` (the exported C entry point from 4 threads with map swaps, enable flips and a
+  draining thread: every note-on counted once, no synth note left on).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

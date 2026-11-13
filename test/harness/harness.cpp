@@ -4005,8 +4005,7 @@ static bool runDeviceRoutes() {
 // MIDI byte input (ios/MidiInput.h, ios/ExpoJuceMidiInput.mm).
 
 // A message as a compact string ("on c0 60 100", "off c1 64 0", "pp c0 60 33", "cc c3 74 12",
-// "pb c0 8192") so vectors read like the app's TypeScript tests (src/services/device/bleMidi.test.ts
-// in the app that drove this; the vectors are the same).
+// "pb c0 8192"), so the vectors read like (and match) the tests of a JS parser with the same rules.
 static std::string midiStr(const midiin::Message& m) {
     const std::string ch = " c" + std::to_string(m.channel) + " ";
     switch (m.type) {
@@ -4084,7 +4083,7 @@ static bool runMidiParsers() {
     { midiin::ParserState s;
       expect(raw(s, {0x90, 60, 100, 60, 0}), V{"on c0 60 100", "off c0 60 0"}, "raw with running status");
       midiin::ParserState t;
-      const std::string text = "hello beeper\r\n";
+      const std::string text = "hello device\r\n";
       expect(raw(t, Bytes(text.begin(), text.end())), V{}, "raw text yields nothing");
       midiin::ParserState u;
       expect(raw(u, {0xC0, 5, 0xF2, 1, 2, 0x80, 60, 64}), V{"off c0 60 64"}, "program change and system common skipped"); }
@@ -4120,7 +4119,7 @@ static bool runMidiParsers() {
         check(gRenderAllocs.load() + gRenderFrees.load() == 0 && n == 4000, "parsers allocate / count " + std::to_string(n));
     }
     const bool pass = failed == 0;
-    std::printf("mip   MIDI input parsers: BLE-MIDI, raw stream, raw packets (vectors of the app's TS tests)  %-4s %d failed checks%s\n",
+    std::printf("mip   MIDI input parsers: BLE-MIDI, raw stream, raw packets (JS parser vectors)  %-4s %d failed checks%s\n",
                 pass ? "PASS" : "FAIL", failed, detail.c_str());
     std::fflush(stdout);
     return pass;

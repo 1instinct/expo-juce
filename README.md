@@ -419,6 +419,64 @@ other's touches. Empty, odd-length or fewer than 3 points: the whole view.
 <JucePadView note={62} hitPolygon={[0.5, 0, 1, 0.5, 0.5, 1, 0, 0.5]} style={{ width: 96, height: 96 }} />
 ```
 
+### MIDI byte input (0.9.0-rc.2+, iOS)
+
+For MIDI that arrives in the app's own native code, such as a Bluetooth LE notification callback
+or a serial port. That code passes the raw bytes to the engine on its own thread, the engine
+plays mapped notes straight from its note queue (no JavaScript on the way), and JS gets every
+parsed message afterwards for logging, learning and recording.
+
+```objc
+#include <dlfcn.h>
+typedef int (*MidiInputFn)(const uint8_t *, size_t, int, double);
+static MidiInputFn fn;  // dlsym(RTLD_DEFAULT, "expojuce_midi_input_bytes"), once
+// In the notification callback, first thing:
+double arrival = CACurrentMediaTime();
+if (fn) fn(bytes, length, 0 /* EXPOJUCE_MIDI_FORMAT_BLE_MIDI */, arrival);
+```
+
+Formats: `0` one BLE-MIDI packet per call (header and timestamp bytes, running status, SysEx
+skipped), `1` a raw MIDI stream (any split across calls), `2` raw packets that must each be
+complete MIDI (anything else, such as a text log a serial bridge interleaves, is ignored whole).
+`ios/ExpoJuceMidiInput.h` documents the function; code that must run without this library looks
+it up with `dlsym`, or `+[ExpoJuceBridge midiInputBytesFunction]` when the executable's global
+symbols are stripped.
+
+```ts
+import {
+  hasMidiInput, setMidiInputMap, setMidiInputEnabled, addMidiInputListener,
+  releaseMidiInputHolds,
+} from 'expo-juce';
+
+if (hasMidiInput()) {
+  // Input note → what it plays: a synth note, a drum voice, or null (passed to JS).
+  setMidiInputMap({
+    actions: Array.from({ length: 128 }, (_, n) => (n === 36 ? { drum: 0 } : { note: n })),
+    velocity: Array.from({ length: 128 }, (_, v) => Math.max(1, v)), // optional curve
+  });
+  setMidiInputEnabled(true);
+  const sub = addMidiInputListener(({ events }) => {
+    for (const e of events) {
+      if (!e.played && e.type === 'noteOn') { /* not mapped (or map off): play it from JS */ }
+      // e.arrival: seconds on getMidiInputClock()'s clock (CACurrentMediaTime)
+    }
+  });
+  // The device went away: end the notes it holds.
+  releaseMidiInputHolds();
+}
+```
+
+- The map is swapped atomically (readers see the old map or the new one) and stays off until
+  `setMidiInputEnabled(true)`; while off, every note-on passes to JS.
+- A note-off releases what its note-on played, whatever the map says by then. Two inputs holding
+  the same synth note are counted; a note held by another source (`noteOn` from JS, a
+  `JucePadView`) is left to that source's release. A second note-on of a held input note
+  releases the first (an event with `synthetic: true`).
+- Events carry the release epoch: `releaseMidiInputHolds()` and `allNotesOff()` bump it, so
+  events from before a release can be told apart.
+- `midiInputBytes(bytes, format, arrival?)` feeds the same path from JS (tests, a JS transport).
+- Android and older binaries: `hasMidiInput()` is false, the setters return false.
+
 ### Diagnostics
 
 `getDiagnostics()` returns setup state (`isReady`, `setupStep`, `lastError`), device
@@ -445,6 +503,11 @@ was delivered to, and `mainThreadMaxGapMs` / `mainThreadStalls50` come from a di
 probe. `requestedSampleRate` / `grantedSampleRate`, `requestedBufferSize` / `grantedBufferSize`,
 `hardwareSampleRate`, `availableBufferSizes`, `deviceOpens` (the last 8 opens) and `xrunCount`
 show the device format. See [docs/latency.md](docs/latency.md#touch-latency-legs-and-device-format-090-rc1).
+
+0.9.0-rc.2+ (iOS) adds `midiInput` (MIDI byte input counters: `packets`, `messages`, `played`,
+`passed`, `dropped`, `rejectedPackets`, `eventsDropped`, `held`, `epoch`, `mapVersion`,
+`enabled`) and the `midiInputToRenderMs` leg (bytes' arrival → render block), also in
+`touchLatency`.
 
 ### Beat events
 
