@@ -11,6 +11,7 @@ import {
   TouchLatencyDiagnostics,
   TouchPathEntry,
   LastTouchReport,
+  StallLogEntry,
   EngineState,
   SetupOptions,
   JucePadViewProps,
@@ -87,6 +88,26 @@ export function getDiagnostics(): AudioDiagnostics {
 // audio device is not running (nothing is played in that case).
 export function playTestTone(durationMs: number): boolean {
   return ExpoJuceModule.playTestTone(durationMs);
+}
+
+// ── Display rate (0.9.0-rc.4+, iOS) ──────────────────────────────
+// UIKit delivers touches on display frames, so a ProMotion screen held at 60 Hz can deliver a touch
+// up to a 60 Hz frame late. A hint above 60 makes a main-thread CADisplayLink ask for (80, hz, hz)
+// clamped to the screen's maximum, which keeps the display at that rate; 0 or 60 removes it. On
+// iPhone the app must also set CADisableMinimumFrameDurationOnPhone in its Info.plist, or the
+// display stays at 60. The hint does not need setup() and survives engine rebuilds; the link
+// pauses while the app is inactive. Other display links and animations in the app may then run
+// faster too: cap the ones that should not. getDiagnostics() reports displayHz (the link's
+// measured rate), maxFramesPerSecond and displayRateHint.
+
+/**
+ * Asks for a display refresh rate in Hz (0 = no hint). Returns true when the binary took it (iOS,
+ * applied on the main thread); false on Android, on web, on binaries older than 0.9.0-rc.4 and for
+ * a non-finite value.
+ */
+export function setDisplayRateHint(hz: number): boolean {
+  if (typeof ExpoJuceModule?.setDisplayRateHint !== 'function' || !Number.isFinite(hz)) return false;
+  return ExpoJuceModule.setDisplayRateHint(hz) === true;
 }
 
 // ── Polyphonic Synth (MIDI-style) ────────────────────────────────
@@ -485,6 +506,7 @@ export {
   TouchLatencyDiagnostics,
   TouchPathEntry,
   LastTouchReport,
+  StallLogEntry,
   EngineState,
   EffectId,
   EffectParams,

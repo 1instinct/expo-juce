@@ -508,10 +508,35 @@ probe. `requestedSampleRate` / `grantedSampleRate`, `requestedBufferSize` / `gra
 `hardwareSampleRate`, `availableBufferSizes`, `deviceOpens` (the last 8 opens) and `xrunCount`
 show the device format. See [docs/latency.md](docs/latency.md#touch-latency-legs-and-device-format-090-rc1).
 
+0.9.0-rc.4+ (iOS) adds `mainThreadStallLog` (the last 32 main-thread gaps over 50 ms with their
+start on the `clockSec` clock), `mainThreadStallIntervalP50Ms` (their median spacing),
+`clockSec`, and the display rate: `displayHz` (the main display link's measured rate),
+`maxFramesPerSecond` and `displayRateHint` (see "Display-rate hint" below).
+
 0.9.0-rc.2+ (iOS) adds `midiInput` (MIDI byte input counters: `packets`, `messages`, `played`,
 `passed`, `dropped`, `rejectedPackets`, `eventsDropped`, `held`, `epoch`, `mapVersion`,
 `enabled`) and the `midiInputToRenderMs` leg (bytes' arrival → render block), also in
 `touchLatency`.
+
+### Display-rate hint
+
+`setDisplayRateHint(hz)` (0.9.0-rc.4+, iOS) keeps a ProMotion display at `hz` (above 60, up to
+the screen's `maximumFramesPerSecond`) with a main-thread `CADisplayLink` whose
+`preferredFrameRateRange` is (80, hz, hz); 0 or 60 removes it. UIKit delivers touches on display
+frames, so at 120 Hz a touch can reach the app up to about 8 ms sooner than at 60 Hz; compare
+`touchLatency.touchDeliveryMs` with the hint on and off. On iPhone the app also needs
+`CADisableMinimumFrameDurationOnPhone: true` in its Info.plist, or the display stays at 60.
+
+- Any thread; applied on the main thread. Does not need `setup()`, survives engine rebuilds,
+  pauses while the app is inactive, and is cleared when a module is created and when the module
+  that set it goes away (after a reload, JS sets it again).
+- With the Info.plist key, every display link in the app (`requestAnimationFrame`, animation
+  libraries, GL render loops) may run at the higher rate while the display does. Cap the ones that
+  should not (a render loop can draw every other frame).
+- `getDiagnostics()`: `displayHz` (the link's measured rate), `maxFramesPerSecond`,
+  `displayRateHint`. Without a hint above 60 the link is held to 60, so `displayHz` 60 then
+  says nothing about other links that may run the display faster.
+- Android, web and older binaries: `setDisplayRateHint` returns false and does nothing.
 
 ### Beat events
 

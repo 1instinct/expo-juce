@@ -17,6 +17,7 @@
 // ── Diagnostics ──
 + (NSDictionary<NSString *, id> *)getDiagnostics { return [[ExpoJuceAudioEngine sharedInstance] diagnostics]; }
 + (BOOL)playTestTone:(double)durationMs { return [[ExpoJuceAudioEngine sharedInstance] playTestTone:durationMs]; }
++ (BOOL)setDisplayRateHint:(double)hz { return [[ExpoJuceAudioEngine sharedInstance] setDisplayRateHint:hz]; }
 + (void)startBeatTimer { [[ExpoJuceAudioEngine sharedInstance] startBeatTimer]; }
 + (void)stopBeatTimer { [[ExpoJuceAudioEngine sharedInstance] stopBeatTimer]; }
 + (void)reportTouchPath:(NSArray<NSDictionary<NSString *, id> *> *)entries {

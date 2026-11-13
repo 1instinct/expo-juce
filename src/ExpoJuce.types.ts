@@ -424,6 +424,29 @@ export type AudioDiagnostics = {
   mainThreadMaxGapMs?: number;
   /** Main-thread gaps longer than 50 ms since launch. */
   mainThreadStalls50?: number;
+  // ── iOS, 0.9.0-rc.4+ ──
+  /**
+   * The last 32 main-thread gaps longer than 50 ms, oldest first: when each began (`atSec`, on the
+   * `clockSec` clock) and how long it was.
+   */
+  mainThreadStallLog?: StallLogEntry[];
+  /** Median time between the starts of consecutive stalls in `mainThreadStallLog` (ms); 0 with fewer than two. */
+  mainThreadStallIntervalP50Ms?: number;
+  /**
+   * `CACurrentMediaTime()` when this snapshot was taken: seconds since boot, the clock of the stall
+   * log's `atSec` (and of `UITouch.timestamp`).
+   */
+  clockSec?: number;
+  /**
+   * The main display link's measured rate (Hz): the median of its frame duration over its last 32
+   * ticks; 0 while it does not run (no setup and no hint above 60, or the app inactive). Without a
+   * hint above 60 the link is held to 60, so 60 here does not prove the display itself ran at 60.
+   */
+  displayHz?: number;
+  /** The screen's `maximumFramesPerSecond` (120 on ProMotion); 0 until the link first ran. */
+  maxFramesPerSecond?: number;
+  /** The last `setDisplayRateHint` value (rounded, at most 240; 0 = none). */
+  displayRateHint?: number;
   /** MIDI byte input (0.9.0-rc.2+, iOS): counters since launch and the arrival → render leg. */
   midiInput?: MidiInputDiagnostics;
 };
@@ -582,6 +605,14 @@ export type TouchPathEntry =
       delaysContentTouches: boolean;
       canCancelContentTouches: boolean;
     };
+
+/** One entry of `AudioDiagnostics.mainThreadStallLog`. */
+export type StallLogEntry = {
+  /** When the gap began (the display-link tick before it), `CACurrentMediaTime()` seconds. */
+  atSec: number;
+  /** Its length (ms), over 50. */
+  ms: number;
+};
 
 /** `AudioDiagnostics.lastTouch`. Recognizers are the ones the touch was delivered to (`UITouch.gestureRecognizers`). */
 export type LastTouchReport = {

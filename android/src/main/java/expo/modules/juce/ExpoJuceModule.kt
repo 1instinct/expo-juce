@@ -187,6 +187,9 @@ class ExpoJuceModule : Module() {
     // No native pad view on Android yet: the JS wrapper's isJucePadViewAvailable() is false.
     // The function must exist, because the wrapper passes setup options only when it does.
     Function("hasJucePadView") { false }
+
+    // No display-rate hint on Android: setDisplayRateHint does nothing and returns false.
+    Function("setDisplayRateHint") { _: Double -> false }
   }
 
   // Runs block on the main thread: now if this is it, else posted.

@@ -33,6 +33,10 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 - (NSDictionary<NSString *, id> *)diagnostics;
 // Returns NO if the engine is not ready or the device is not playing.
 - (BOOL)playTestTone:(double)durationMs;
+// Display-rate hint (DisplayRate.h), any thread, independent of setup: above 60 on a screen that
+// goes faster, a main-thread display link keeps the display at min(hz, the screen maximum); 0 or 60
+// removes that. Applied on the main thread. NO for a non-finite hz (nothing changes).
+- (BOOL)setDisplayRateHint:(double)hz;
 
 // Synth — MIDI-style
 - (void)noteOn:(int)note velocity:(int)velocity;

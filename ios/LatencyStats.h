@@ -1,7 +1,7 @@
 #pragma once
 
 // Pure C++ (no Objective-C, no JUCE): rolling latency statistics for the touch → sound legs and
-// the main-thread stall probe. Used by PolySynthProcessor (audio thread), ExpoJuceAudioEngine.mm
+// the main-thread stall probe (its gap window and its log of the last stalls). Used by PolySynthProcessor (audio thread), ExpoJuceAudioEngine.mm
 // (main thread, diagnostics) and the offline harness (test/harness, case "lat").
 //
 // Every window has exactly one writer thread and any number of readers. Writers only store
@@ -139,4 +139,63 @@ private:
     std::atomic<double> slotMax[kSeconds] = {};
     std::atomic<uint64_t> stalls{0};
     std::atomic<uint64_t> ticks{0};
+};
+
+// The last kSize main-thread stalls (gaps over StallWindow::kStallMs), each with its start time, so
+// their cadence can be read: a stall every second points at a periodic main-thread job. The writer
+// is the stall probe's display-link callback (main thread): a fixed ring of atomics, no lock, no
+// allocation. A reader racing the writer can pair one slot's start with a newer duration; for
+// diagnostics that is fine.
+struct StallRecord {
+    double atSec = 0.0; // start of the gap (the tick before it), monotonic seconds
+    double ms = 0.0;    // its length
+};
+
+class StallLog {
+public:
+    static constexpr int kSize = 32;
+
+    // Writer (main thread). Records the gap ending at endSec if it is longer than kStallMs.
+    void addGap(double endSec, double gapMs) noexcept {
+        if (!std::isfinite(endSec) || !std::isfinite(gapMs) || !(gapMs > StallWindow::kStallMs)) return;
+        const uint64_t n = written.load(std::memory_order_relaxed);
+        const size_t slot = (size_t)(n % kSize);
+        startSec[slot].store(endSec - gapMs / 1000.0, std::memory_order_relaxed);
+        lengthMs[slot].store(gapMs, std::memory_order_relaxed);
+        written.store(n + 1, std::memory_order_release);
+    }
+
+    // Any thread: copies up to kSize records into `out`, oldest first; returns how many.
+    int copy(StallRecord* out) const noexcept {
+        const uint64_t n = written.load(std::memory_order_acquire);
+        const int m = (int)std::min<uint64_t>(n, (uint64_t)kSize);
+        for (int k = 0; k < m; ++k) {
+            const size_t slot = (size_t)((n - (uint64_t)m + (uint64_t)k) % kSize);
+            out[k].atSec = startSec[slot].load(std::memory_order_relaxed);
+            out[k].ms = lengthMs[slot].load(std::memory_order_relaxed);
+        }
+        return m;
+    }
+
+    // Median (nearest rank) of the gaps between consecutive stall starts in `records` (n of them,
+    // oldest first), in ms; 0 with fewer than two records. Intervals that are not positive (a
+    // reader that raced the writer) are skipped.
+    static double intervalP50Ms(const StallRecord* records, int n) noexcept {
+        std::array<double, kSize> intervals{};
+        int m = 0;
+        for (int k = 1; k < n && m < kSize; ++k) {
+            const double d = (records[k].atSec - records[k - 1].atSec) * 1000.0;
+            if (std::isfinite(d) && d > 0.0) intervals[(size_t)m++] = d;
+        }
+        if (m == 0) return 0.0;
+        std::sort(intervals.begin(), intervals.begin() + m);
+        return latencyPercentile(intervals.data(), m, 0.50);
+    }
+
+    uint64_t count() const noexcept { return written.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<double> startSec[kSize] = {};
+    std::atomic<double> lengthMs[kSize] = {};
+    std::atomic<uint64_t> written{0};
 };

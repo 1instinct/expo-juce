@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.0-rc.4
+
+### Added (iOS)
+
+- **Display-rate hint.** `setDisplayRateHint(hz)`: above 60, on a screen that goes faster
+  (`maximumFramesPerSecond`), a main-thread `CADisplayLink` asks for
+  `preferredFrameRateRange` (80, hz, hz) clamped to the screen's maximum, which keeps a ProMotion
+  display at that rate. UIKit delivers touches on display frames, so this is for testing whether
+  touch delivery gets shorter at 120 Hz. 0 or 60 removes it. The hint does not need `setup()`,
+  survives engine rebuilds and is cleared when a module is created (launch, reload) and when the
+  module that set it goes away. On iPhone the app
+  must also set `CADisableMinimumFrameDurationOnPhone` in its Info.plist. Returns true when taken;
+  false for a non-finite value, on Android (a no-op) and on web.
+- The hint shares the stall probe's display link. That link now runs while the engine is set up
+  or a hint above 60 is set, pauses while the app is inactive (and starts paused when the app is
+  not active), and without a hint above 60 is held to 60 on screens that go faster, so the probe
+  alone never raises the display rate.
+- Diagnostics: `displayHz` (the link's measured rate: median of `targetTimestamp - timestamp`
+  over its last 32 ticks, 0 while it is not running), `maxFramesPerSecond`, `displayRateHint`.
+- **Stall cadence.** The stall probe keeps a fixed ring of the last 32 main-thread gaps over
+  50 ms: `mainThreadStallLog` (`[{ atSec, ms }]`, the start of each gap on the
+  `CACurrentMediaTime()` clock and its length) and `mainThreadStallIntervalP50Ms` (median time
+  between consecutive stall starts), so a periodic main-thread job shows as a steady interval.
+  `clockSec` is `CACurrentMediaTime()` at the snapshot, to place the log in time. Preallocated,
+  no allocation or lock in the display-link callback.
+- Harness cases `rate` (hint range, measured rate) and `stlog` (stall log, median interval).
+
+### Compatibility
+
+- New entry point and optional diagnostics keys only. Apps that never call `setDisplayRateHint`
+  keep the stall probe at 60 Hz, as before.
+
 ## 0.9.0-rc.3
 
 ### Fixed (iOS)
