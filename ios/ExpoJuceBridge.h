@@ -45,8 +45,15 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (int)releaseMidiInputHolds NS_SWIFT_NAME(releaseMidiInputHolds());
 + (double)midiInputClock NS_SWIFT_NAME(midiInputClock());
 + (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds NS_SWIFT_NAME(midiInputBytes(_:format:arrival:));
-// `handler` runs on a background serial queue with { events, now, epoch }; nil removes it.
-+ (void)setMidiInputHandler:(nullable void (^)(NSDictionary<NSString *, id> *batch))handler NS_SWIFT_NAME(setMidiInputHandler(_:));
+// `handler` runs on a background serial queue with { events, now, epoch } while listening is on.
+// Returns a token; clearMidiInputHandler / setMidiInputListening act only for the latest token.
++ (uint64_t)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *batch))handler NS_SWIFT_NAME(setMidiInputHandler(_:));
++ (void)clearMidiInputHandler:(uint64_t)token NS_SWIFT_NAME(clearMidiInputHandler(_:));
++ (void)setMidiInputListening:(BOOL)listening token:(uint64_t)token NS_SWIFT_NAME(setMidiInputListening(_:token:));
+// Engine ownership across module instances (a reload may create the new module before the old
+// one is destroyed). releaseModule stops the beat timer and shuts down only for the latest claim.
++ (uint64_t)claimModule NS_SWIFT_NAME(claimModule());
++ (void)releaseModule:(uint64_t)token NS_SWIFT_NAME(releaseModule(_:));
 // The address of expojuce_midi_input_bytes (ExpoJuceMidiInput.h), for native code that finds it
 // through the Objective-C runtime (NSClassFromString(@"ExpoJuceBridge")) when dlsym cannot, e.g.
 // in an executable whose global symbols were stripped.

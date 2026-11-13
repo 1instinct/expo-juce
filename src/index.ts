@@ -410,8 +410,8 @@ export function getMidiInputClock(): number {
 }
 
 /**
- * Bytes from JS through the same path (at most 512 per call). Returns the messages parsed, or -1
- * (unknown format, unsupported binary).
+ * Bytes from JS through the same path: one call is one packet, at most 512 bytes. Returns the
+ * messages parsed, or -1 (unknown format, more than 512 bytes, unsupported binary).
  */
 export function midiInputBytes(bytes: ArrayLike<number>, format: MidiInputFormat, arrivalSeconds?: number): number {
   if (typeof ExpoJuceModule?.midiInputBytes !== 'function') return -1;

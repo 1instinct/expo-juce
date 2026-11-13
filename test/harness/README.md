@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, bsel, broute, mip, mim, mih, mic)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, bsel, broute, mip, mim, mih, mic, own)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -155,7 +155,11 @@ Exit code non-zero on any failure.
   `allNotesOff` bump the epoch; a full event ring; the real synth sounds and the
   `midiInputToRenderMs` leg records from the arrival stamp; no allocation on input or in the
   render), `mic` (the exported C entry point from 4 threads with map swaps, enable flips and a
-  draining thread: every note-on counted once, no synth note left on).
+  draining thread: every note-on counted once, no synth note left on). `mih` also covers a
+  rejected raw packet's note-offs (`8n`, `9n` velocity 0) releasing the input's holds while its
+  note-ons never play, and the engine's own note-on marking before its push and restoring the mark
+  when the push failed. `own` (`ios/OwnerToken.h`: a module destroyed after its replacement was
+  created releases nothing of the new one's; racing claims stay consistent).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

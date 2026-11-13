@@ -59,10 +59,21 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 - (int)releaseMidiInputHolds;
 // Now, in seconds on the input's arrival clock (CACurrentMediaTime()).
 - (double)midiInputClock;
-// The C entry point with bytes from JS (at most 512). arrival <= 0 = now. Messages parsed, -1 = bad format.
+// The C entry point with bytes from JS (one call = one packet, at most 512 bytes). arrival <= 0 =
+// now. Messages parsed; -1 = bad format or more than 512 bytes (never truncated).
 - (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds;
-// Receives { events, now, epoch } batches on a background queue (nil = none).
-- (void)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *batch))handler;
+// Receives { events, now, epoch } batches on a background queue while the caller's JS listens
+// (setMidiInputListening). Returns the caller's token: only that token clears it, so a module
+// destroyed after its replacement was created leaves the new handler alone.
+- (uint64_t)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *batch))handler;
+- (void)clearMidiInputHandler:(uint64_t)token;
+// Events are dropped (not built) while nobody listens. Ignored unless `token` set the handler.
+- (void)setMidiInputListening:(BOOL)listening token:(uint64_t)token;
+// The engine's owner across module instances: OnCreate claims; OnDestroy releases, which stops the
+// beat timer and shuts the engine down only if no newer module claimed it meanwhile (otherwise it
+// only releases held notes).
+- (uint64_t)claimModule;
+- (void)releaseModule:(uint64_t)token;
 // &expojuce_midi_input_bytes, for native callers that look it up through the Objective-C runtime.
 + (void *)midiInputBytesFunction;
 

@@ -42,6 +42,7 @@ Pod::Spec.new do |s|
     "JuceConfig.h",
     "Voice.h",
     "VoiceAllocator.h",
+    "OwnerToken.h",
     "PolySynthProcessor.h",
     "FxChainProcessor.h",
     "AuxProcessor.h",
