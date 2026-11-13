@@ -59,15 +59,20 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 // Options of the last setup call (reused by media-services-reset recovery).
 @property (nonatomic, assign) int requestedBufferSize;
 @property (nonatomic, assign) double requestedSampleRate;
-// The rate the engine asks the device for: the route's hardware rate when the session reports one
+// The rate the engine asks the device for: the session's current rate when it is a music rate
 // (devicefmt::chooseDeviceSampleRate), read at setup and again after a route change or an
 // interruption. Atomic: diagnostics read it off the main thread.
 @property (atomic, assign) double targetSampleRate;
-// The session's rate read at setup before the device was created (the route's own rate). Atomic.
+// The session's rate read at setup before the device was created. Atomic.
 @property (atomic, assign) double hardwareSampleRate;
-// The listed buffer size the engine last asked the device for, and what it was granted. Atomic.
+// The listed buffer size the engine last asked the device for. Atomic.
 @property (atomic, assign) int chosenBufferSize;
-@property (atomic, assign) int lastGrantedBufferSize;
+// The size the device was last opened with (devicefmt::OpenResult::targetBufferSize; 0: unknown),
+// which JUCE's iOS device keeps asking for when it restarts itself on a route change. Main thread.
+@property (nonatomic, assign) int deviceTargetBufferSize;
+// The device's listed buffer sizes, copied on the main thread after each open and route check
+// (JUCE rebuilds its list on the main thread without the engine lock). Atomic copy.
+@property (atomic, copy) NSArray<NSNumber *> *listedBufferSizes;
 // Diagnostics: the last kMaxDeviceOpenLog device opens (main thread writes a new array; atomic copy).
 @property (atomic, copy) NSArray<NSDictionary<NSString *, id> *> *deviceOpenLog;
 // Diagnostics from the most recently attached / touched JucePadView (main thread writes;
@@ -198,12 +203,13 @@ static TouchLatencyStats sTouchLatency;
 static StallWindow sStalls;
 static std::atomic<bool> sStallProbeRunning{false}; // diagnostics read it off the main thread
 
-// Xruns of devices the engine has closed or reopened since launch (AudioDeviceManager's count
-// restarts with every open). Main thread only, under the lifecycle lock.
+// Xruns of devices the engine has closed or reopened since the app's last setup (rebuilds keep
+// counting; AudioDeviceManager's count restarts with every open). Written on the main thread
+// under the lifecycle lock (and reset by setup); read by diagnostics.
 static std::atomic<uint64_t> sXrunsCarried{0};
 
-// Main thread, under the lifecycle lock: keep the current device's xruns before closing or
-// reopening it.
+// Main thread, under the lifecycle lock: keep the current device's xruns before closing it.
+// (Reopens through DeviceFormat.h report the xruns they dropped in OpenResult::xrunsBeforeOpen.)
 static void carryXrunsLocked() {
     if (sDeviceManager == nullptr || sDeviceManager->getCurrentAudioDevice() == nullptr) return;
     const int count = sDeviceManager->getXRunCount();
@@ -395,6 +401,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 
     self.requestedBufferSize = (bufferSize > 0) ? std::min(bufferSize, 4096) : kDefaultBufferSize;
     self.requestedSampleRate = (sampleRate > 0.0) ? sampleRate : kDefaultSampleRate;
+    sXrunsCarried.store(0, std::memory_order_relaxed); // xrunCount counts from this setup
 
     BOOL ok = NO;
     {
@@ -495,9 +502,10 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                             activationError.localizedDescription]];
     }
 
-    // Preferred hardware format. The rate is the route's own (read now, after activation and
-    // before JUCE creates its device, whose constructor leaves a 44.1 kHz preference behind); the
-    // app's rate is only a hint for when the session reports none. The IO buffer duration is
+    // Preferred hardware format. The rate is the session's current one, read now, after activation
+    // and before JUCE creates its device (whose constructor leaves a 44.1 kHz preference behind):
+    // the route's own rate on a fresh session, else the rate last preferred in this process. The
+    // app's rate is only a hint for when the session reports no music rate. The IO buffer duration is
     // computed at that rate. JUCE's iOS device re-requests the buffer duration itself when it
     // opens (see applyPreferredDeviceSetup below); these preferences cover the first open.
     const int preferredBuffer = self.requestedBufferSize;
@@ -651,8 +659,23 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     return problems.count > 0 ? [problems componentsJoinedByString:@"; "] : nil;
 }
 
-// Main thread, under the lifecycle lock (or during doSetup). Appends one entry to deviceOpenLog.
+// Main thread, under the lifecycle lock. Copies the device's listed buffer sizes for diagnostics.
+- (void)refreshListedBufferSizesLocked {
+    NSMutableArray<NSNumber *> *sizes = [NSMutableArray array];
+    if (sDeviceManager != nullptr) {
+        if (juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice()) {
+            for (int size : device->getAvailableBufferSizes()) [sizes addObject:@(size)];
+        }
+    }
+    self.listedBufferSizes = sizes;
+}
+
+// Main thread, under the lifecycle lock (or during doSetup). Records the outcome of an
+// applyPreferredSetup / reopenWithPreferredSetup call: carries the xruns of the device it
+// reopened, remembers the size the device was opened with, and appends one entry to deviceOpenLog.
 - (void)logDeviceOpen:(NSString *)context result:(const devicefmt::OpenResult &)result sampleRate:(double)sampleRate {
+    if (result.xrunsBeforeOpen > 0) sXrunsCarried.fetch_add((uint64_t)result.xrunsBeforeOpen, std::memory_order_relaxed);
+    if (result.opened) self.deviceTargetBufferSize = result.targetBufferSize;
     double grantedRate = 0.0;
     int granted = 0;
     if (sDeviceManager != nullptr) {
@@ -661,8 +684,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
             granted = device->getCurrentBufferSizeSamples();
         }
     }
+    [self refreshListedBufferSizesLocked];
     self.chosenBufferSize = result.chosenBufferSize;
-    self.lastGrantedBufferSize = granted;
     NSString *error = result.error.isEmpty() ? @"" : ([NSString stringWithUTF8String:result.error.toRawUTF8()] ?: @"(unprintable error)");
     NSDictionary<NSString *, id> *entry = @{
         @"context": context ?: @"",
@@ -672,6 +695,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
         @"grantedBufferSize": @(granted),
         @"requestedSampleRate": @(sampleRate),
         @"grantedSampleRate": @(grantedRate),
+        @"opened": @(result.opened ? YES : NO),
         @"newDevice": @(result.reopened ? YES : NO),
         @"error": error,
     };
@@ -686,10 +710,11 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 // Main thread, caller holds sEngineLock (or is doSetup). Asks the open device for the preferred
 // sample rate / buffer size through JUCE, so JUCE's own device restarts (route changes) keep it:
 // the nearest size in the device's own list (devicefmt::applyPreferredSetup; any other size
-// would silently become JUCE's default, 256 on iOS). Non-fatal: on error the device is restored.
+// would silently become JUCE's default, 256 on iOS). A request equal to the device's current
+// setup reopens nothing (or a new device if that setup is stale). Non-fatal: on error the device
+// is restored.
 - (void)applyPreferredDeviceSetupLocked:(NSString *)context bufferSize:(int)bufferSize sampleRate:(double)sampleRate {
     if (sDeviceManager == nullptr || sDeviceManager->getCurrentAudioDevice() == nullptr) return;
-    carryXrunsLocked();
     const devicefmt::OpenResult result = devicefmt::applyPreferredSetup(*sDeviceManager, bufferSize, sampleRate);
     [self logDeviceOpen:context result:result sampleRate:sampleRate];
     if (result.error.isEmpty()) return;
@@ -712,7 +737,6 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (sDeviceManager == nullptr) return;
     NSString *preferenceError = [self applySessionPreferences];
     if (preferenceError) [self noteRecoveryError:[NSString stringWithFormat:@"%@: %@", context, preferenceError]];
-    carryXrunsLocked();
     const devicefmt::OpenResult result =
         devicefmt::reopenWithPreferredSetup(*sDeviceManager, self.requestedBufferSize, self.targetSampleRate);
     [self logDeviceOpen:context result:result sampleRate:self.targetSampleRate];
@@ -723,10 +747,17 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     }
 }
 
-// Main thread. After a route change or an interruption: re-read the route's rate, reapply the
-// session preferences, and if the running device has drifted from them (another rate, or a larger
-// buffer than it was last granted) ask it again. A device that is not running is left to
-// restartDeviceIfStopped / the dead-device check.
+// Main thread. After a route change or an interruption: re-read the session's rate, reapply the
+// session preferences, and if the running device has drifted from them ask it again. A device
+// that is not running is left to restartDeviceIfStopped / the dead-device check.
+//
+// What the rate check can see: by the time it runs, JUCE's iOS device has restarted itself and
+// asked the session for the rate it was opened with, so session.sampleRate is that rate whenever
+// the new route can run it. The engine therefore moves to another rate only when the new route
+// cannot run the current one (e.g. a 96 kHz-only interface); it does not discover that a route
+// would prefer another rate it can also run. Voice rates (e.g. right after a call) are ignored.
+// The buffer check: the nearest listed size on the (possibly new) route is not the size the device
+// was opened with, which JUCE's restart keeps asking for (devicefmt::bufferChoiceDrifted).
 - (void)ensurePreferredFormat:(NSString *)context {
     if (!self.isReady || self.isRecovering || sDeviceManager == nullptr) return;
     AVAudioSession *session = [AVAudioSession sharedInstance];
@@ -736,11 +767,12 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (preferenceError) [self noteRecoveryError:[NSString stringWithFormat:@"%@: %@", context, preferenceError]];
 
     LifecycleLock lifecycle;
+    [self refreshListedBufferSizesLocked];
     juce::AudioIODevice* device = sDeviceManager->getCurrentAudioDevice();
     if (device == nullptr || !device->isPlaying()) return;
     const bool rateDrifted = std::abs(device->getCurrentSampleRate() - self.targetSampleRate) > 0.5;
-    const bool bufferDrifted = self.lastGrantedBufferSize > 0
-        && device->getCurrentBufferSizeSamples() > self.lastGrantedBufferSize;
+    const bool bufferDrifted = devicefmt::bufferChoiceDrifted(device->getAvailableBufferSizes(), self.requestedBufferSize,
+                                                              self.deviceTargetBufferSize);
     if (!rateDrifted && !bufferDrifted) return;
     NSLog(@"[ExpoJuceAudioEngine] %@: device at %.0f Hz / %d, want %.0f Hz / %d; asking again", context,
           device->getCurrentSampleRate(), device->getCurrentBufferSizeSamples(), self.targetSampleRate,
@@ -762,6 +794,8 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     delete sGraph; sGraph = nullptr; // ~AuxProcessor releases its backing-track reader slot
     [self scheduleBackingTrackCollect];
     carryXrunsLocked();
+    self.deviceTargetBufferSize = 0;
+    self.listedBufferSizes = @[];
     if (sDeviceManager) { sDeviceManager->closeAudioDevice(); delete sDeviceManager; sDeviceManager = nullptr; }
     delete sTransport; sTransport = nullptr;
 }
@@ -872,7 +906,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
             });
             return;
         // The reasons JUCE's iOS device restarts itself for (asynchronously, keeping the size and
-        // rate it was opened with). Afterwards, re-read the new route's rate and ask again.
+        // rate it was opened with). Afterwards, check the format again (ensurePreferredFormat).
         case AVAudioSessionRouteChangeReasonNewDeviceAvailable:
         case AVAudioSessionRouteChangeReasonOldDeviceUnavailable:
         case AVAudioSessionRouteChangeReasonOverride:
@@ -1170,7 +1204,6 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     double metronomeClicks = 0.0, backingTrackPositionSec = -1.0, backingTrackTempoRatio = 1.0;
     double drumPeak = 0.0;
     double xrunCount = (double)sXrunsCarried.load(std::memory_order_relaxed);
-    NSMutableArray<NSNumber *> *availableBufferSizes = [NSMutableArray array];
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
         if (acquireUserLock(lock)) {
@@ -1182,7 +1215,6 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
                     sampleRate = device->getCurrentSampleRate();
                     bufferSize = device->getCurrentBufferSizeSamples();
                     outputLatencySamples = device->getOutputLatencyInSamples();
-                    for (int size : device->getAvailableBufferSizes()) [availableBufferSizes addObject:@(size)];
                     xrunCount += (double)std::max(0, sDeviceManager->getXRunCount());
                 }
             }
@@ -1296,7 +1328,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     d[@"grantedSampleRate"] = @(sampleRate);
     d[@"requestedBufferSize"] = @(self.chosenBufferSize);
     d[@"grantedBufferSize"] = @(bufferSize);
-    d[@"availableBufferSizes"] = availableBufferSizes;
+    d[@"availableBufferSizes"] = self.listedBufferSizes ?: @[];
     d[@"deviceOpens"] = self.deviceOpenLog ?: @[];
     d[@"xrunCount"] = @(xrunCount);
 

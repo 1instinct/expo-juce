@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, bsel)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, bsel, broute)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -135,11 +135,16 @@ Exit code non-zero on any failure.
   thread racing a reader, no allocation; `PolySynthProcessor` records the handler, queue → render
   and touch → render legs from the event's stamps for touch-stamped notes and hits only, with no
   allocation in the render), `stall` (the main-thread gap window: longest gap over 10 s, slot reuse,
-  the > 50 ms count), `bsel` (`ios/DeviceFormat.h`: nearest listed buffer size, the route's rate
+  the > 50 ms count), `bsel` (`ios/DeviceFormat.h`: nearest listed buffer size, the session's rate
   over the hint and never a voice rate, the IO duration; then JUCE's real `AudioDeviceManager` with
   an iOS-like fake device on three routes, preferred 128: first open, the old
   `restartLastAudioDevice` recovery, which lands on JUCE's default 256 + 1, e.g. 288 at 44.1 kHz in
-  32-frame steps, and the new reopen, which comes back to the first open's size).
+  32-frame steps, and the new reopen, which comes back to the first open's size), `broute` (route
+  changes the way `ensurePreferredFormat` handles them, with the fake device restarting itself in
+  place like JUCE's: speaker → Bluetooth with a 1024-frame floor, where the request equals the
+  running setup and nothing is reopened; a stale stored setup, which opens a new device; back to the
+  speaker, which the old "granted > last granted" check missed (1025 > 1025) and which now comes
+  back to 131; a second speaker route change that asks nothing; xruns carried once per device).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

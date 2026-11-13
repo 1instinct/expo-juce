@@ -183,9 +183,13 @@ scroll view delayed it, or the main thread was busy.
 - `mainThreadMaxGapMs` (longest gap between display-link ticks in the last 10 s) and
   `mainThreadStalls50` (gaps over 50 ms since launch).
 
-**Device format.** The engine now runs at the route's own rate (`hardwareSampleRate`, read at
-setup before JUCE's device exists) instead of forcing 48 kHz; `preferredSampleRate` is a hint for
-when the session reports none. The IO buffer duration is computed at that rate. JUCE only
+**Device format.** The engine now runs at the session's current rate (`hardwareSampleRate`, read
+at setup before JUCE's device exists: the route's own rate on a fresh session, else the rate last
+preferred in the process) instead of forcing 48 kHz; `preferredSampleRate` is a hint for when the
+session reports no music rate. The IO buffer duration is computed at that rate. After a route
+change the rate check runs once JUCE's device has restarted itself and asked for its old rate
+again, so it only sees a new rate when the new route cannot run the old one (a voice rate is
+ignored); it does not find a rate the route would merely prefer. JUCE only
 accepts a buffer size from the device's list (`availableBufferSizes`: the sizes granted for 64,
 128, … frames), so the engine asks for the nearest listed size (`requestedBufferSize`) and reports
 what it got (`grantedBufferSize`). Recovery used JUCE's `restartLastAudioDevice`, which reopens a
@@ -194,8 +198,12 @@ to its default 256 (+1 frame, rounded up by the route: 288 at 44.1 kHz on 32-fra
 dead-device restart, the stopped-device restart, the interruption recovery and route changes now
 reapply the session preferences and reopen with the nearest listed size (`ios/DeviceFormat.h`,
 harness case `bsel`, which runs JUCE's real `AudioDeviceManager` against an iOS-like fake device).
-`deviceOpens` keeps the last 8 opens (context, requested and granted size and rate) and
-`xrunCount` the underruns since setup.
+On a route change JUCE's device restarts itself with the size it was opened with; the engine asks
+again only when the nearest listed size on the new route is a different one (e.g. back on the
+speaker after a Bluetooth route opened at 1024), and a request equal to the running setup reopens
+nothing (harness case `broute`). `deviceOpens` keeps the last 8 opens (context, requested and
+granted size and rate, `opened`: whether the device was actually reopened) and `xrunCount` the
+underruns since the last `setup()`, each device's counted once.
 
 ## 6. Slow-motion measurement procedure
 

@@ -13,13 +13,16 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // Lifecycle
 // Returns YES on success (or if already initialized). On failure, setupStep
 // holds the step that failed and lastError a description.
-// -setup uses the defaults: a 128-sample buffer, at the route's own sample rate (48000 Hz if the
-// session reports none).
+// -setup uses the defaults: a 128-sample buffer, at the session's current sample rate (48000 Hz if
+// the session reports no music rate).
 - (BOOL)setup;
 // Preferred I/O buffer size (samples) and sample rate; the device grants the nearest it
 // supports (see diagnostics: requested* / granted* vs preferredBufferSize / preferredSampleRate).
-// The sample rate is a hint: the engine runs at the route's current hardware rate whenever the
-// session reports one (no resampling), and uses this value only when it does not.
+// The sample rate is a hint: the engine runs at the session's current rate whenever that is a
+// music rate (no resampling), and uses this value only when it is not. On a fresh session that
+// is the route's own rate; after an earlier setup in the same process it is usually the rate that
+// setup ran at. After a route change the engine changes rate only when the new route cannot run
+// the current one.
 // Values <= 0 fall back to the defaults.
 - (BOOL)setupWithBufferSize:(int)bufferSize sampleRate:(double)sampleRate;
 - (void)shutdown;

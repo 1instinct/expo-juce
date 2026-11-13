@@ -381,8 +381,9 @@ export type AudioDiagnostics = {
   nativeSampleRate?: number;
   /**
    * Output underruns. Android (0.9.0+): reported by the audio stream since it opened; -1 = unknown.
-   * iOS (0.9.0-rc.1+): since setup, summed over every device the engine opened (JUCE's count: gaps
-   * in the device's sample time plus callbacks that overran their time budget).
+   * iOS (0.9.0-rc.1+): since the last `setup()` (engine rebuilds keep counting), summed over every
+   * device the engine opened (JUCE's count: gaps in the device's sample time plus callbacks that
+   * overran their time budget).
    */
   xrunCount?: number;
   /** Android: the app is in the background and the audio device is closed (0.9.0+). */
@@ -393,9 +394,15 @@ export type AudioDiagnostics = {
   foregroundRestarts?: number;
 
   // ── iOS, 0.9.0-rc.1+ (absent on older binaries and on Android) ──
-  /** The session's sample rate at setup, before the device was created: the route's own rate (Hz). */
+  /**
+   * The session's sample rate at setup, before the device was created (Hz): the route's own rate on
+   * a fresh session, else the rate last preferred in this process.
+   */
   hardwareSampleRate?: number;
-  /** The sample rate the engine asked the device for: the route's rate (`preferredSampleRate` is only a hint). */
+  /**
+   * The sample rate the engine asked the device for: the session's rate (`preferredSampleRate` is
+   * only a hint). After a route change it changes only when the new route cannot run the old rate.
+   */
   requestedSampleRate?: number;
   /** The sample rate the device runs at (same as `sampleRate`). */
   grantedSampleRate?: number;
@@ -430,6 +437,11 @@ export type DeviceOpenRecord = {
   grantedBufferSize: number;
   requestedSampleRate: number;
   grantedSampleRate: number;
+  /**
+   * The device was stopped and opened again. False when it already ran with the requested setup
+   * (nothing was touched).
+   */
+  opened: boolean;
   /** A new device object was created (a reopen) rather than the open one reconfigured. */
   newDevice: boolean;
   /** Empty when the open succeeded. */
