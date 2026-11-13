@@ -20,6 +20,8 @@
 //    a status byte and holds nothing but whole channel voice messages (running status and
 //    real-time bytes allowed). Anything else (text a serial bridge interleaves, a truncated
 //    message, SysEx) is rejected whole and clears running status, so text can never play a note.
+//    The complete note-offs in a rejected packet (8n kk vv, 9n kk 00) still release the input's
+//    holds (salvageNoteOffs), so a note-off that shared a packet with text never leaves a note on.
 // All three: real-time bytes (F8–FF) are ignored anywhere and keep running status; SysEx is
 // skipped until F7 or any other status; system common clears running status and its data bytes
 // are skipped; a note-on with velocity 0 is a note-off; program change and channel pressure are
@@ -40,8 +42,8 @@
 // releases the first (an Event with kSynthetic). releaseAll() ends every input hold (disconnect);
 // the engine's allNotesOff forgets them under the same lock as its queue release.
 //
-// Threads: input(), releaseAll(), allNotesOff() and the hold bookkeeping run under one spinlock
-// among producers (a few hundred stores at most per call; never taken by the audio thread). The
+// Threads: input(), releaseAll(), allNotesOff() and the hold bookkeeping run under one lock
+// among producers (InputLock: os_unfair_lock on Apple) (a few hundred stores at most per call; never taken by the audio thread). The
 // map and the counters are atomics. Events go into a fixed ring (producers under the lock, one
 // consumer: drainEvents). No allocation anywhere after construction.
 
@@ -50,6 +52,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <thread>
+#if defined(__APPLE__)
+#include <os/lock.h>
+#endif
 
 namespace midiin {
 
@@ -192,6 +197,29 @@ inline bool parseRawPacket(const uint8_t* bytes, size_t length, ParserState& s, 
     return true;
 }
 
+// A rejected raw packet's complete note-offs: a status 8n, or 9n with velocity 0, followed by two
+// data bytes. Nothing else (a note-on can never come from a packet that is not complete MIDI). Text
+// is 7-bit, so it never holds a status byte; a stray UTF-8 continuation byte can read as a note-off,
+// which at worst releases a note the input holds.
+template <typename Out>
+inline void salvageNoteOffs(const uint8_t* bytes, size_t length, Out&& out) {
+    for (size_t i = 0; i + 2 < length; ++i) {
+        const uint8_t st = bytes[i];
+        const uint8_t hi = st & 0xF0;
+        if (hi != 0x80 && hi != 0x90) continue;
+        const uint8_t note = bytes[i + 1], velocity = bytes[i + 2];
+        if (note >= 0x80 || velocity >= 0x80) continue;
+        if (hi == 0x90 && velocity != 0) continue;
+        Message m;
+        m.type = kNoteOff;
+        m.channel = (uint8_t)(st & 0x0F);
+        m.data1 = note;
+        m.data2 = hi == 0x80 ? velocity : 0;
+        out(m);
+        i += 2;
+    }
+}
+
 // kFormatBleMidi: one BLE-MIDI packet.
 template <typename Out>
 inline void parseBleMidiPacket(const uint8_t* bytes, size_t length, ParserState& s, Out&& out) {
@@ -215,22 +243,34 @@ inline void parseBleMidiPacket(const uint8_t* bytes, size_t length, ParserState&
     }
 }
 
-// Producer-side spinlock (test_and_set acquire / clear release); yields in case the holder was
-// preempted. Never taken on the audio thread.
-class SpinLock {
+// The producers' lock. Never taken on the audio thread. On Apple platforms an os_unfair_lock:
+// it donates the waiter's priority to the holder (a Bluetooth queue holding it while a
+// user-interactive thread waits), where a spinlock would spin against a preempted holder. The
+// spinlock (test_and_set acquire / clear release, yielding) is for other hosts (the harness).
+#if defined(__APPLE__)
+class InputLock {
+public:
+    void lock() noexcept { os_unfair_lock_lock(&l); }
+    void unlock() noexcept { os_unfair_lock_unlock(&l); }
+private:
+    os_unfair_lock l = OS_UNFAIR_LOCK_INIT;
+};
+#else
+class InputLock {
 public:
     void lock() noexcept { while (flag.test_and_set(std::memory_order_acquire)) std::this_thread::yield(); }
     void unlock() noexcept { flag.clear(std::memory_order_release); }
 private:
     std::atomic_flag flag = ATOMIC_FLAG_INIT;
 };
+#endif
 
-struct SpinScope {
-    explicit SpinScope(SpinLock& l) : lock(l) { lock.lock(); }
-    ~SpinScope() { lock.unlock(); }
-    SpinScope(const SpinScope&) = delete;
-    SpinScope& operator=(const SpinScope&) = delete;
-    SpinLock& lock;
+struct LockScope {
+    explicit LockScope(InputLock& l) : lock(l) { lock.lock(); }
+    ~LockScope() { lock.unlock(); }
+    LockScope(const LockScope&) = delete;
+    LockScope& operator=(const LockScope&) = delete;
+    InputLock& lock;
 };
 
 // ── Input map ────────────────────────────────────────────────────
@@ -267,7 +307,7 @@ public:
     // input velocity → played velocity, clamped to 1–127 (nullptr = identity). Readers see either
     // the old map or the new one, never a mix.
     void set(const int* actions, const int* velocity) {
-        SpinScope guard(writerLock);
+        LockScope guard(writerLock);
         const int next = 1 - current.load(std::memory_order_relaxed);
         Slot& slot = slots[next];
         const uint32_t g = slot.gen.load(std::memory_order_relaxed);
@@ -312,7 +352,7 @@ private:
     Slot slots[2];
     std::atomic<int> current{0};
     std::atomic<uint32_t> versionCount{0};
-    SpinLock writerLock;
+    InputLock writerLock;
 };
 
 // ── Where mapped messages go ─────────────────────────────────────
@@ -419,7 +459,7 @@ public:
         int parsed = 0;
         bool recorded = false;
         {
-            SpinScope guard(lock);
+            LockScope guard(lock);
             packets.fetch_add(1, std::memory_order_relaxed);
             auto handle = [&](const Message& m) {
                 ++parsed;
@@ -431,8 +471,11 @@ public:
                 case kFormatBleMidi: parseBleMidiPacket(bytes, length, state, handle); break;
                 case kFormatRawStream: parseRawStream(bytes, length, state, handle); break;
                 default:
-                    if (!parseRawPacket(bytes, length, state, handle))
+                    if (!parseRawPacket(bytes, length, state, handle)) {
                         rejectedPackets.fetch_add(1, std::memory_order_relaxed);
+                        // Never a note-on from it; its note-offs still end what they held.
+                        salvageNoteOffs(bytes, length, handle);
+                    }
                     break;
             }
         }
@@ -445,8 +488,15 @@ public:
 
     // Any thread: another source of the engine started / released `note` (the engine's own
     // noteOn / noteOff). An input release of a note another source holds is left to that source.
-    void externalNoteOn(int note) {
-        if (note >= 0 && note <= 127) external[note].store(true, std::memory_order_release);
+    // Mark before the note-on is queued (so an input note-off racing it never releases it) and
+    // undo the mark if the push failed: externalNoteOn returns the previous mark for
+    // restoreExternal.
+    bool externalNoteOn(int note) {
+        if (note < 0 || note > 127) return false;
+        return external[note].exchange(true, std::memory_order_acq_rel);
+    }
+    void restoreExternal(int note, bool previous) {
+        if (note >= 0 && note <= 127) external[note].store(previous, std::memory_order_release);
     }
     void externalNoteOff(int note) {
         if (note >= 0 && note <= 127) external[note].store(false, std::memory_order_release);
@@ -456,7 +506,7 @@ public:
     // forgets the input holds and the external marks, under the input lock, so an input note-on
     // is either released by it or held after it. Bumps the epoch.
     void allNotesOff() {
-        SpinScope guard(lock);
+        LockScope guard(lock);
         sink.allNotesOff();
         for (int i = 0; i < 128; ++i) {
             heldBy[i] = -1;
@@ -471,7 +521,7 @@ public:
     // note the input holds, unless another source holds it; resets the parsers. Returns the new
     // epoch (events recorded before it carry a lower one).
     uint32_t releaseAll() {
-        SpinScope guard(lock);
+        LockScope guard(lock);
         for (int s = 0; s < 128; ++s) {
             if (holdCount[s] == 0) continue;
             holdCount[s] = 0;
@@ -520,8 +570,8 @@ public:
     }
 
     // Tests: the synth note input note n holds (-1 none) and the input holds of synth note s.
-    int heldNoteForTests(int n) { SpinScope guard(lock); return heldBy[n & 127]; }
-    int holdCountForTests(int s) { SpinScope guard(lock); return holdCount[s & 127]; }
+    int heldNoteForTests(int n) { LockScope guard(lock); return heldBy[n & 127]; }
+    int holdCountForTests(int s) { LockScope guard(lock); return holdCount[s & 127]; }
 
 private:
     // Caller holds `lock`.
@@ -610,7 +660,7 @@ private:
     MidiInputSink& sink;
     InputMap inputMap;
     std::atomic<bool> enabledFlag{false};
-    SpinLock lock;
+    InputLock lock;
 
     // Guarded by `lock`.
     ParserState parsers[kFormatCount];

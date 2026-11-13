@@ -23,6 +23,7 @@
 #include "DeviceFormat.h"
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
+#include "OwnerToken.h"
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -154,7 +155,9 @@ static std::atomic<uint64_t> sDeadDeviceRestarts{0};
 // a device reopen (the synth applies it on the first block after the device restarts).
 // Note-ons are accepted only while the engine is ready (sAcceptingNotes); setup discards
 // note-ons left in the ring before the new synth is attached, so nothing stale plays.
-static NoteEventQueue sNoteQueue;
+// Heap-allocated and never freed: a producer on another thread during process exit never finds
+// it destroyed.
+static NoteEventQueue& sNoteQueue = *new NoteEventQueue;
 static std::atomic<bool> sAcceptingNotes{false};
 
 // ── Effect settings ──
@@ -224,10 +227,16 @@ static void carryXrunsLocked() {
 // sAcceptingNotes). Heap-allocated and never freed, so a call during process exit never finds it
 // destroyed. Events for JS are drained on sMidiInputQueue (serial), at most ~4 ms after the first
 // one of a burst, into one onMidiInput batch; the handler is only touched on that queue.
-static midiin::NoteQueueSink sMidiInputSink(sNoteQueue, &sAcceptingNotes);
+static midiin::NoteQueueSink& sMidiInputSink = *new midiin::NoteQueueSink(sNoteQueue, &sAcceptingNotes);
 static midiin::MidiInput& sMidiInput = *new midiin::MidiInput(sMidiInputSink);
 static LatencyWindow sMidiInputLatency; // arrival -> render, written by the audio thread
-static void (^sMidiInputHandler)(NSDictionary<NSString *, id> *) = nil;
+static void (^sMidiInputHandler)(NSDictionary<NSString *, id> *) = nil; // midiInputQueue only
+// The module that set the handler (a reload can create the new module before the old one is
+// destroyed: the old one's clear must not remove the new handler) and whether its JS listens.
+static OwnerToken sMidiInputHandlerOwner;
+static std::atomic<bool> sMidiInputListening{false};
+// The module instance that owns the engine's lifetime (see -claimModule / -releaseModule:).
+static OwnerToken sModuleOwner;
 static const int64_t kMidiInputFlushNs = 4 * (int64_t)NSEC_PER_MSEC;
 
 static dispatch_queue_t midiInputQueue() {
@@ -284,10 +293,14 @@ static NSDictionary<NSString *, id> *midiInputEventDictionary(const midiin::Even
 static void flushMidiInputEvents(void *) {
     @autoreleasepool {
         sMidiInput.beginDrain();
+        void (^handler)(NSDictionary<NSString *, id> *) = sMidiInputHandler;
+        if (handler == nil || !sMidiInputListening.load(std::memory_order_acquire)) {
+            sMidiInput.drainEvents([](const midiin::Event&) {}); // nobody listens: drop them
+            return;
+        }
         NSMutableArray<NSDictionary<NSString *, id> *> *events = [NSMutableArray array];
         sMidiInput.drainEvents([&](const midiin::Event& e) { [events addObject:midiInputEventDictionary(e)]; });
-        void (^handler)(NSDictionary<NSString *, id> *) = sMidiInputHandler;
-        if (events.count == 0 || handler == nil) return;
+        if (events.count == 0) return;
         handler(@{
             @"events": events,
             @"now": @(midiin::NoteQueueSink::nowSeconds()),
@@ -1476,9 +1489,13 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 // sEngineLock (acquireUserLock) while it dereferences sSynth / sTransport; if the lifecycle
 // holds it, the call is dropped and the safe default returned.
 
+// The MIDI input's mark that another source holds the note goes on before the note is queued, so
+// an input note-off racing this call never releases it; a note-on that was not queued undoes it.
 - (void)noteOn:(int)note velocity:(int)velocity {
     if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
-    if (sNoteQueue.pushNoteOn(note, velocity)) sMidiInput.externalNoteOn(std::clamp(note, 0, 127));
+    const int marked = std::clamp(note, 0, 127);
+    const bool previous = sMidiInput.externalNoteOn(marked);
+    if (!sNoteQueue.pushNoteOn(note, velocity)) sMidiInput.restoreExternal(marked, previous);
 }
 
 // UITouch.timestamp and CACurrentMediaTime() are both seconds on the mach_absolute_time clock
@@ -1503,9 +1520,10 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
     entryTimestamp:(double)entryTimestamp {
     const juce::int64 touchTicks = touchTicksFor(touchTimestamp);
     const juce::int64 entryTicks = touchTicksFor(entryTimestamp);
-    if (sAcceptingNotes.load(std::memory_order_acquire)
-        && sNoteQueue.pushNoteOn(note, velocity, touchTicks, entryTicks)) {
-        sMidiInput.externalNoteOn(std::clamp(note, 0, 127));
+    if (sAcceptingNotes.load(std::memory_order_acquire)) {
+        const int marked = std::clamp(note, 0, 127);
+        const bool previous = sMidiInput.externalNoteOn(marked); // before the push (see noteOn)
+        if (!sNoteQueue.pushNoteOn(note, velocity, touchTicks, entryTicks)) sMidiInput.restoreExternal(marked, previous);
     }
     // After the push, so the handler leg (entry -> push stamp) does not include it.
     recordTouchDelivery(touchTimestamp, entryTimestamp);
@@ -1554,15 +1572,47 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
 
 - (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds {
     uint8_t buffer[512];
-    const NSUInteger count = MIN(bytes.count, (NSUInteger)sizeof(buffer));
+    // Never truncated: a cut packet would parse as something else (one call is one packet).
+    if (bytes.count > (NSUInteger)sizeof(buffer)) return -1;
+    const NSUInteger count = bytes.count;
     for (NSUInteger i = 0; i < count; ++i)
         buffer[i] = [bytes[i] isKindOfClass:[NSNumber class]] ? (uint8_t)(bytes[i].intValue & 0xFF) : 0;
     return expojuce_midi_input_bytes(buffer, (size_t)count, format, arrivalSeconds);
 }
 
-- (void)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *))handler {
+- (uint64_t)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *))handler {
+    const uint64_t token = sMidiInputHandlerOwner.claim();
+    sMidiInputListening.store(false, std::memory_order_release); // until the new owner's JS listens
     void (^copied)(NSDictionary<NSString *, id> *) = [handler copy];
-    dispatch_async(midiInputQueue(), ^{ sMidiInputHandler = copied; });
+    dispatch_async(midiInputQueue(), ^{
+        if (sMidiInputHandlerOwner.isCurrent(token)) sMidiInputHandler = copied;
+    });
+    return token;
+}
+
+- (void)clearMidiInputHandler:(uint64_t)token {
+    if (!sMidiInputHandlerOwner.release(token)) return; // a newer module set its own
+    sMidiInputListening.store(false, std::memory_order_release);
+    dispatch_async(midiInputQueue(), ^{
+        if (sMidiInputHandlerOwner.current() == 0) sMidiInputHandler = nil;
+    });
+}
+
+- (void)setMidiInputListening:(BOOL)listening token:(uint64_t)token {
+    if (sMidiInputHandlerOwner.isCurrent(token)) sMidiInputListening.store(listening == YES, std::memory_order_release);
+}
+
+- (uint64_t)claimModule { return sModuleOwner.claim(); }
+
+- (void)releaseModule:(uint64_t)token {
+    if (sModuleOwner.release(token)) {
+        [self stopBeatTimer];
+        [self shutdown];
+        return;
+    }
+    // A newer module (a reload) owns the engine and may have set it up already: leave it running
+    // and only end the notes the old runtime left on.
+    [self allNotesOff];
 }
 
 + (void *)midiInputBytesFunction { return (void *)&expojuce_midi_input_bytes; }

@@ -27,7 +27,15 @@
 - Diagnostics: `midiInput` (`enabled`, `mapVersion`, `packets`, `messages`, `played`, `passed`,
   `dropped`, `rejectedPackets`, `eventsDropped`, `held`, `epoch`, `midiInputToRenderMs`) and
   `touchLatency.midiInputToRenderMs`: bytes' arrival → the render block that consumed the note.
-- Harness cases `mip`, `mim`, `mih`, `mic`.
+- `rawPackets`: a packet rejected as not complete MIDI still releases the input's holds through
+  the complete note-offs in it (`8n kk vv`, `9n kk 00`); its note-ons never play.
+- `midiInputBytes` returns -1 for more than 512 bytes (one call is one packet; never truncated).
+- Reload safety: the module's MIDI input handler and the engine's lifetime are claimed with tokens,
+  so a module destroyed after its replacement was created (an `expo-updates` reload, a dev reload)
+  no longer clears the new handler, stops its beat timer or shuts the engine down under it; it only
+  releases held notes. Events are not built while no JS listener is subscribed.
+- The input's producer lock is an `os_unfair_lock` on Apple platforms (priority donation).
+- Harness cases `mip`, `mim`, `mih`, `mic`, `own`.
 
 ### Compatibility
 

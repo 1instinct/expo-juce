@@ -19,6 +19,7 @@
 #include "DeviceFormat.h"
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
+#include "OwnerToken.h"
 
 #include <atomic>
 #include <chrono>
@@ -4412,6 +4413,53 @@ static bool runMidiHolds() {
         sink.take();
         drain(in);
     }
+    { // a rejected raw packet's note-offs still end what they held; its note-ons never play
+        const Bytes nusOn = {0x90, 36, 100};
+        in.input(nusOn.data(), nusOn.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {"on 60 51"}, "raw note-on held");
+        drain(in);
+        // A bridge log line around a note-off (8n): not complete MIDI, so rejected whole; before
+        // the salvage the note-off was lost with it and synth note 60 stayed on.
+        const Bytes mixed = {'o', 'k', ' ', 0x80, 36, 0x40, '\r', '\n'};
+        const uint64_t rejected = in.stats().rejectedPackets;
+        const int parsed = in.input(mixed.data(), mixed.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {"off 60"}, "note-off salvaged from a rejected packet");
+        check(parsed == 1 && in.heldNoteForTests(36) == -1 && in.holdCountForTests(60) == 0
+              && in.stats().rejectedPackets == rejected + 1, "salvaged note-off releases the hold");
+        auto evs = drain(in);
+        check(evs.size() == 1 && evs[0].message.type == midiin::kNoteOff && evs[0].message.data1 == 36
+              && (evs[0].flags & midiin::kEventPlayed) && (evs[0].flags & midiin::kEventLast) && evs[0].out == 60,
+              "salvaged note-off event");
+        // 9n kk 00 is a note-off too; a note-on in a rejected packet never plays.
+        in.input(nusOn.data(), nusOn.size(), midiin::kFormatRawPackets, 1.0);
+        sink.take();
+        const Bytes mixed2 = {'x', 0x90, 38, 100, 0x91, 36, 0x00, 'y'};
+        in.input(mixed2.data(), mixed2.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {"off 60"}, "9n velocity 0 salvaged, the note-on beside it ignored");
+        check(in.heldNoteForTests(38) == -1, "no hold from a rejected note-on");
+        drain(in);
+        // A salvaged note-off of a note the input does not hold is reported, not played.
+        const Bytes mixed3 = {'z', 0x80, 50, 0};
+        in.input(mixed3.data(), mixed3.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {}, "unheld salvaged note-off sends nothing");
+        evs = drain(in);
+        check(evs.size() == 1 && evs[0].message.data1 == 50 && !(evs[0].flags & midiin::kEventPlayed), "unheld note-off passed");
+    }
+    { // the engine's own noteOn marks before its push and restores the mark when the push failed
+        send(in, on(36, 100));
+        sink.take();
+        const bool previous = in.externalNoteOn(60);
+        in.restoreExternal(60, previous); // the queue refused the engine's note-on
+        send(in, off(36));
+        expectOps(sink, {"off 60"}, "a restored mark does not hold the input's release back");
+        send(in, on(36, 100));
+        sink.take();
+        check(!in.externalNoteOn(60), "mark was clear");      // the engine's note-on, queued
+        send(in, off(36));
+        expectOps(sink, {}, "a kept mark leaves the release to the other source");
+        in.externalNoteOff(60);
+        drain(in);
+    }
     { // the event ring: full -> counted, nothing else breaks
         const uint64_t before = in.stats().eventsDropped;
         for (int k = 0; k < midiin::MidiInput::kEventCapacity + 10; ++k) send(in, {0x80, 0x80, 0xB0, 1, (uint8_t)(k & 127)});
@@ -4479,6 +4527,50 @@ static bool runMidiHolds() {
     const bool pass = failed == 0;
     std::printf("mih   MIDI input holds: map change, shared notes, other sources, retrigger, releaseAll, real synth  %-4s"
                 " %d failed checks; arrival->render %.2f ms%s\n", pass ? "PASS" : "FAIL", failed, legMs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// OwnerToken (ios/OwnerToken.h): a reload can create the new module before the old one is
+// destroyed. The old one's teardown (clear the MIDI input handler, shut the engine down) must
+// then do nothing; the plain "clear / shut down" it replaced removed the new module's handler.
+static bool runOwnerToken() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; detail += "; FAIL " + what; }
+    };
+    OwnerToken owner;
+    check(owner.current() == 0 && !owner.isCurrent(0), "none at start");
+    const uint64_t oldModule = owner.claim();
+    check(owner.isCurrent(oldModule), "first claim owns");
+    // Reload: the new module is created, then the old one is destroyed.
+    const uint64_t newModule = owner.claim();
+    check(newModule != oldModule && !owner.isCurrent(oldModule) && owner.isCurrent(newModule), "new claim takes over");
+    check(!owner.release(oldModule) && owner.isCurrent(newModule), "late release of the old token does nothing");
+    // The usual order: destroyed, then the next one created.
+    check(owner.release(newModule) && owner.current() == 0, "release by the owner");
+    check(!owner.release(newModule), "second release does nothing");
+    const uint64_t third = owner.claim();
+    check(owner.isCurrent(third) && !owner.release(0), "claim after release; token 0 never owns");
+    // Racing claims and stale releases from 4 threads: exactly one current owner at the end.
+    std::vector<std::thread> threads;
+    std::atomic<uint64_t> lastClaim{0};
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&] {
+            for (int k = 0; k < 5000; ++k) {
+                const uint64_t mine = owner.claim();
+                lastClaim.store(mine);
+                owner.release(mine - 1); // a stale token (often another thread's)
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    const uint64_t cur = owner.current();
+    check(cur == 0 || owner.isCurrent(cur), "consistent after races");
+    const bool pass = failed == 0;
+    std::printf("own   owner tokens: a destroyed module's late teardown leaves its replacement alone  %-4s %d failed checks%s\n",
+                pass ? "PASS" : "FAIL", failed, detail.c_str());
     std::fflush(stdout);
     return pass;
 }
@@ -4691,6 +4783,7 @@ int main(int argc, char** argv) {
     if (want("mim")) unexpected += runMidiMap() ? 0 : 1;
     if (want("mih")) unexpected += runMidiHolds() ? 0 : 1;
     if (want("mic")) unexpected += runMidiEntry() ? 0 : 1;
+    if (want("own")) unexpected += runOwnerToken() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

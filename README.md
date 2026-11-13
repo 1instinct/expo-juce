@@ -437,7 +437,8 @@ if (fn) fn(bytes, length, 0 /* EXPOJUCE_MIDI_FORMAT_BLE_MIDI */, arrival);
 
 Formats: `0` one BLE-MIDI packet per call (header and timestamp bytes, running status, SysEx
 skipped), `1` a raw MIDI stream (any split across calls), `2` raw packets that must each be
-complete MIDI (anything else, such as a text log a serial bridge interleaves, is ignored whole).
+complete MIDI (anything else, such as a text log a serial bridge interleaves, is ignored whole,
+except that its complete note-offs still end what the input holds).
 `ios/ExpoJuceMidiInput.h` documents the function; code that must run without this library looks
 it up with `dlsym`, or `+[ExpoJuceBridge midiInputBytesFunction]` when the executable's global
 symbols are stripped.
@@ -474,7 +475,10 @@ if (hasMidiInput()) {
   releases the first (an event with `synthetic: true`).
 - Events carry the release epoch: `releaseMidiInputHolds()` and `allNotesOff()` bump it, so
   events from before a release can be told apart.
-- `midiInputBytes(bytes, format, arrival?)` feeds the same path from JS (tests, a JS transport).
+- `midiInputBytes(bytes, format, arrival?)` feeds the same path from JS (tests, a JS transport);
+  one call is one packet of at most 512 bytes (more returns -1).
+- `midiInputToRenderMs` starts at the caller's `arrivalSeconds`: stamp it first thing in the
+  callback (work done before the stamp is not counted).
 - Android and older binaries: `hasMidiInput()` is false, the setters return false.
 
 ### Diagnostics

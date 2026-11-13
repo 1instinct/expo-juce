@@ -217,6 +217,10 @@ the controller's scan, its BLE connection interval (a note waits up to one inter
 connection event) and the system's Bluetooth stack. Add `bufferMs` and `outputLatencyMs` for the
 rest of the path to the speaker.
 
+The leg starts at the caller's stamp. A caller that stamps after some processing of its own (a
+Bluetooth library that has already copied and re-encoded the value before handing it over) reads
+slightly low by that processing; stamp as early as the caller can.
+
 ## 6. Slow-motion measurement procedure
 
 Measures finger contact → sound, the only figure that includes the digitizer and the speaker.

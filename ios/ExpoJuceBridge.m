@@ -51,9 +51,15 @@
 + (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds {
     return [[ExpoJuceAudioEngine sharedInstance] midiInputBytes:bytes format:format arrival:arrivalSeconds];
 }
-+ (void)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *))handler {
-    [[ExpoJuceAudioEngine sharedInstance] setMidiInputHandler:handler];
++ (uint64_t)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *))handler {
+    return [[ExpoJuceAudioEngine sharedInstance] setMidiInputHandler:handler];
 }
++ (void)clearMidiInputHandler:(uint64_t)token { [[ExpoJuceAudioEngine sharedInstance] clearMidiInputHandler:token]; }
++ (void)setMidiInputListening:(BOOL)listening token:(uint64_t)token {
+    [[ExpoJuceAudioEngine sharedInstance] setMidiInputListening:listening token:token];
+}
++ (uint64_t)claimModule { return [[ExpoJuceAudioEngine sharedInstance] claimModule]; }
++ (void)releaseModule:(uint64_t)token { [[ExpoJuceAudioEngine sharedInstance] releaseModule:token]; }
 + (void *)midiInputBytesFunction { return [ExpoJuceAudioEngine midiInputBytesFunction]; }
 
 // ── Global Params ──

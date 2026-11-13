@@ -2,6 +2,11 @@ import ExpoModulesCore
 
 public class ExpoJuceModule: Module {
   private var hasListeners = false
+  // Tokens of this instance's MIDI input handler and engine ownership: on a reload the new
+  // instance can be created before this one is destroyed, and this one's teardown then must not
+  // undo what the new one set up (the bridge ignores a stale token).
+  private var midiInputHandlerToken: UInt64 = 0
+  private var moduleToken: UInt64 = 0
 
   // Reads a finite number from an options dictionary passed from JS.
   private static func numberOption(_ options: [String: Any]?, _ key: String) -> Double? {
@@ -26,17 +31,18 @@ public class ExpoJuceModule: Module {
     Name("ExpoJuce")
 
     OnCreate {
-      // MIDI input batches (on the input's background queue) go to JS while anything listens.
-      ExpoJuceBridge.setMidiInputHandler { [weak self] batch in
-        guard let self = self, self.hasListeners else { return }
-        self.sendEvent("onMidiInput", batch)
+      self.moduleToken = ExpoJuceBridge.claimModule()
+      // MIDI input batches (on the input's background queue) go to JS while anything listens; the
+      // engine checks that (setMidiInputListening), so this block reads no state of the module.
+      self.midiInputHandlerToken = ExpoJuceBridge.setMidiInputHandler { [weak self] batch in
+        self?.sendEvent("onMidiInput", batch)
       }
     }
 
     OnDestroy {
-      ExpoJuceBridge.setMidiInputHandler(nil)
-      ExpoJuceBridge.stopBeatTimer()
-      ExpoJuceBridge.shutdown()
+      ExpoJuceBridge.clearMidiInputHandler(self.midiInputHandlerToken)
+      // Stops the beat timer and shuts the engine down unless a newer instance owns it.
+      ExpoJuceBridge.releaseModule(self.moduleToken)
     }
 
     Constants([
@@ -54,11 +60,13 @@ public class ExpoJuceModule: Module {
     // beat callback, so the next subscriber gets events again without another setup.
     OnStartObserving {
       self.hasListeners = true
+      ExpoJuceBridge.setMidiInputListening(true, token: self.midiInputHandlerToken)
       ExpoJuceBridge.startBeatTimer()
     }
 
     OnStopObserving {
       self.hasListeners = false
+      ExpoJuceBridge.setMidiInputListening(false, token: self.midiInputHandlerToken)
       ExpoJuceBridge.stopBeatTimer()
     }
 
