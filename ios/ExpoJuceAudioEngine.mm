@@ -1001,12 +1001,15 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     if (reasonValue == nil) return;
     const AVAudioSessionRouteChangeReason reason = (AVAudioSessionRouteChangeReason)reasonValue.unsignedIntegerValue;
     __weak ExpoJuceAudioEngine *weakSelf = self;
+    // Each case body that holds a block literal is braced: under ARC a block capturing a __weak
+    // variable opens a cleanup scope, and clang rejects a later case label that jumps past it.
     switch (reason) {
-        case AVAudioSessionRouteChangeReasonCategoryChange:
+        case AVAudioSessionRouteChangeReasonCategoryChange: {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf reassertSessionCategoryIfNeeded];
             });
             return;
+        }
         // The reasons JUCE's iOS device restarts itself for (asynchronously, keeping the size and
         // rate it was opened with). Afterwards, check the format again (ensurePreferredFormat).
         case AVAudioSessionRouteChangeReasonNewDeviceAvailable:
@@ -1014,11 +1017,12 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
         case AVAudioSessionRouteChangeReasonOverride:
         case AVAudioSessionRouteChangeReasonWakeFromSleep:
         case AVAudioSessionRouteChangeReasonNoSuitableRouteForCategory:
-        case AVAudioSessionRouteChangeReasonUnknown:
+        case AVAudioSessionRouteChangeReasonUnknown: {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf scheduleRouteFormatCheck];
             });
             return;
+        }
         default:
             return;
     }
