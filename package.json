@@ -1,6 +1,6 @@
 {
   "name": "expo-juce",
-  "version": "0.9.0-rc.2",
+  "version": "0.9.0-rc.3",
   "description": "Realtime DSP w/C++ & JUCE",
   "type": "module",
   "main": "build/index.js",

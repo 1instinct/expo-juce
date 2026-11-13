@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0-rc.3
+
+### Fixed (iOS)
+
+- **0.9.0-rc.1 and 0.9.0-rc.2 do not compile for iOS.** `ExpoJuceAudioEngine.mm` failed with
+  "cannot jump from switch statement to this case label" in `-handleSessionRouteChange:`: under
+  ARC, a block literal capturing a `__weak` variable opens a cleanup scope, and the later `case`
+  labels jumped past it. The case bodies holding blocks are now braced. Use rc.3 or later.
+- CI compiles every `ios/*.mm` and `ios/*.m` for the iOS simulator (`clang++ -fsyntax-only` with
+  the podspec's flags) on pull requests and pushes to `main`.
+
 ## 0.9.0-rc.2
 
 ### Added (iOS)
