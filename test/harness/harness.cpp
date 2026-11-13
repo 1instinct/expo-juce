@@ -17,6 +17,9 @@
 #include "DrumMachine.h"
 #include "LatencyStats.h"
 #include "DeviceFormat.h"
+#include "MidiInput.h"
+#include "ExpoJuceMidiInput.h"
+#include "OwnerToken.h"
 
 #include <atomic>
 #include <chrono>
@@ -25,6 +28,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -3998,6 +4002,681 @@ static bool runDeviceRoutes() {
     return pass;
 }
 
+//==============================================================================
+// MIDI byte input (ios/MidiInput.h, ios/ExpoJuceMidiInput.mm).
+
+// A message as a compact string ("on c0 60 100", "off c1 64 0", "pp c0 60 33", "cc c3 74 12",
+// "pb c0 8192"), so the vectors read like (and match) the tests of a JS parser with the same rules.
+static std::string midiStr(const midiin::Message& m) {
+    const std::string ch = " c" + std::to_string(m.channel) + " ";
+    switch (m.type) {
+        case midiin::kNoteOn: return "on" + ch + std::to_string(m.data1) + " " + std::to_string(m.data2);
+        case midiin::kNoteOff: return "off" + ch + std::to_string(m.data1) + " " + std::to_string(m.data2);
+        case midiin::kPolyPressure: return "pp" + ch + std::to_string(m.data1) + " " + std::to_string(m.data2);
+        case midiin::kControlChange: return "cc" + ch + std::to_string(m.data1) + " " + std::to_string(m.value);
+        case midiin::kPitchBend: return "pb" + ch + std::to_string(m.value);
+        default: return "?";
+    }
+}
+
+static std::string joinStrs(const std::vector<std::string>& v) {
+    std::string s;
+    for (const auto& x : v) s += (s.empty() ? "" : ", ") + x;
+    return "[" + s + "]";
+}
+
+// Parsers: every vector of the TypeScript reference, plus the raw-packet (serial bridge) rule.
+static bool runMidiParsers() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; if (detail.size() < 900) detail += "; FAIL " + what; }
+    };
+    using Bytes = std::vector<uint8_t>;
+    auto ble = [](midiin::ParserState& s, const Bytes& b) {
+        std::vector<std::string> out;
+        midiin::parseBleMidiPacket(b.data(), b.size(), s, [&](const midiin::Message& m) { out.push_back(midiStr(m)); });
+        return out;
+    };
+    auto raw = [](midiin::ParserState& s, const Bytes& b) {
+        std::vector<std::string> out;
+        midiin::parseRawStream(b.data(), b.size(), s, [&](const midiin::Message& m) { out.push_back(midiStr(m)); });
+        return out;
+    };
+    auto expect = [&](const std::vector<std::string>& got, const std::vector<std::string>& want, const std::string& what) {
+        check(got == want, what + ": got " + joinStrs(got) + " want " + joinStrs(want));
+    };
+    using V = std::vector<std::string>;
+
+    { midiin::ParserState s; expect(ble(s, {0x80, 0x80, 0x90, 60, 100}), V{"on c0 60 100"}, "single note on"); }
+    { midiin::ParserState s;
+      expect(ble(s, {0x81, 0x82, 0x91, 64, 90, 0x85, 0x81, 64, 0}), V{"on c1 64 90", "off c1 64 0"}, "on + off with timestamps"); }
+    { midiin::ParserState s;
+      expect(ble(s, {0x80, 0x80, 0x90, 60, 100, 0x81, 62, 101, 64, 102}), V{"on c0 60 100", "on c0 62 101", "on c0 64 102"},
+             "running status with / without timestamp"); }
+    { midiin::ParserState s; expect(ble(s, {0x80, 0x80, 0x90, 60, 0}), V{"off c0 60 0"}, "velocity 0 is a note-off"); }
+    { midiin::ParserState s;
+      expect(ble(s, {0x80, 0x80, 0x92, 67}), V{}, "split: first half");
+      expect(ble(s, {0x80, 80}), V{"on c2 67 80"}, "split: completes on the next packet"); }
+    { midiin::ParserState s;
+      ble(s, {0x80, 0x80, 0x90, 60, 100});
+      expect(ble(s, {0x80, 0x80, 61, 99}), V{"on c0 61 99"}, "running status across packets"); }
+    { midiin::ParserState s;
+      expect(ble(s, {0x80, 0x80, 0xA0, 60, 33, 0x80, 0xB3, 74, 12, 0x80, 0xE0, 0x00, 0x40}),
+             V{"pp c0 60 33", "cc c3 74 12", "pb c0 8192"}, "pressure, cc, bend"); }
+    { midiin::ParserState s;
+      expect(ble(s, {0x80, 0x80, 0xF0, 0x7E, 0x7F, 0x06}), V{}, "SysEx start");
+      expect(ble(s, {0x80, 0x01, 0x02, 0x80, 0xF7, 0x80, 0x90, 60, 100}), V{"on c0 60 100"}, "SysEx across packets, then a note"); }
+    { midiin::ParserState s;
+      expect(ble(s, {0x80, 0x80, 0x90, 60, 100, 0x80, 0xF8, 61, 90}), V{"on c0 60 100", "on c0 61 90"},
+             "real-time keeps running status"); }
+    { midiin::ParserState s;
+      expect(ble(s, {}), V{}, "empty");
+      expect(ble(s, {0x80}), V{}, "header only");
+      expect(ble(s, {0x12, 0x90, 60, 100}), V{}, "no header bit");
+      expect(ble(s, {0x80, 0x80}), V{}, "truncated after timestamp");
+      expect(ble(s, {0x80, 1, 2, 3}), V{}, "data with no status");
+      Bytes noise(64);
+      for (size_t i = 0; i < noise.size(); ++i) noise[i] = (uint8_t)((i * 73 + 11) & 0xFF);
+      midiin::ParserState n;
+      ble(n, noise); // must not crash
+    }
+    { midiin::ParserState s;
+      expect(raw(s, {0x90, 60, 100, 60, 0}), V{"on c0 60 100", "off c0 60 0"}, "raw with running status");
+      midiin::ParserState t;
+      const std::string text = "hello device\r\n";
+      expect(raw(t, Bytes(text.begin(), text.end())), V{}, "raw text yields nothing");
+      midiin::ParserState u;
+      expect(raw(u, {0xC0, 5, 0xF2, 1, 2, 0x80, 60, 64}), V{"off c0 60 64"}, "program change and system common skipped"); }
+    { // Raw packets (the serial bridge rule): complete MIDI plays, anything else is rejected whole.
+      auto pkt = [](midiin::ParserState& s, const Bytes& b, std::vector<std::string>& out) {
+          return midiin::parseRawPacket(b.data(), b.size(), s, [&](const midiin::Message& m) { out.push_back(midiStr(m)); });
+      };
+      midiin::ParserState s;
+      V out;
+      const bool played = pkt(s, {0x90, 60, 100, 62, 90, 0xF8, 0x80, 60, 0}, out);
+      check(played && out == V{"on c0 60 100", "on c0 62 90", "off c0 60 0"},
+            "raw packet: complete MIDI with running status and real-time: " + joinStrs(out));
+      const std::string t = "note 60\r\n";
+      const std::vector<Bytes> bad = {Bytes(t.begin(), t.end()), {0x90, 60}, {0x90, 60, 100, 61}, {0xF0, 1, 0xF7},
+                                      {0x90, 200, 100}, {}, {0xC3, 0xA9, 0x20}};
+      int i = 0;
+      for (const Bytes& b : bad) {
+          V o;
+          const bool played = pkt(s, b, o);
+          check(!played && o.empty() && s.status == 0, "raw packet rejected #" + std::to_string(i));
+          ++i;
+      }
+    }
+    { // No allocation in the parsers.
+        midiin::ParserState s;
+        const uint8_t pkt[] = {0x80, 0x80, 0x90, 60, 100, 0x81, 62, 101, 64, 102, 0x80, 0xE0, 0, 0x40};
+        int n = 0;
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        for (int k = 0; k < 1000; ++k)
+            midiin::parseBleMidiPacket(pkt, sizeof(pkt), s, [&](const midiin::Message&) { ++n; });
+        tCountAllocs = false;
+        check(gRenderAllocs.load() + gRenderFrees.load() == 0 && n == 4000, "parsers allocate / count " + std::to_string(n));
+    }
+    const bool pass = failed == 0;
+    std::printf("mip   MIDI input parsers: BLE-MIDI, raw stream, raw packets (JS parser vectors)  %-4s %d failed checks%s\n",
+                pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Records what the input asks the engine for (thread-safe), and can refuse note-ons.
+struct RecordingMidiSink : midiin::MidiInputSink {
+    std::mutex m;
+    std::vector<std::string> ops;
+    std::atomic<bool> accept{true};
+    int lastOp[128] = {}; // per synth note: 0 none, 1 on, 2 off (after the last allNotesOff)
+    bool noteOn(int note, int velocity, double) override {
+        if (!accept.load()) return false;
+        std::lock_guard<std::mutex> g(m);
+        ops.push_back("on " + std::to_string(note) + " " + std::to_string(velocity));
+        lastOp[note & 127] = 1;
+        return true;
+    }
+    bool drumHit(int voice, int velocity, double) override {
+        if (!accept.load()) return false;
+        std::lock_guard<std::mutex> g(m);
+        ops.push_back("drum " + std::to_string(voice) + " " + std::to_string(velocity));
+        return true;
+    }
+    void noteOff(int note) override {
+        std::lock_guard<std::mutex> g(m);
+        ops.push_back("off " + std::to_string(note));
+        lastOp[note & 127] = 2;
+    }
+    void allNotesOff() override {
+        std::lock_guard<std::mutex> g(m);
+        ops.push_back("all");
+        for (int& x : lastOp) x = 0;
+    }
+    std::vector<std::string> take() {
+        std::lock_guard<std::mutex> g(m);
+        std::vector<std::string> out;
+        out.swap(ops);
+        return out;
+    }
+};
+
+static void identityMap(int* actions, int* velocity) {
+    for (int i = 0; i < 128; ++i) { actions[i] = i; velocity[i] = i; }
+}
+
+// The input map: sanitising, and a writer swapping two maps while readers read (every read is
+// wholly one map or the other), no allocation, the reader never blocked by a lock.
+static bool runMidiMap() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; if (detail.size() < 600) detail += "; FAIL " + what; }
+    };
+    midiin::InputMap map;
+    { // defaults: pass, identity velocity (0 -> 1)
+        const auto e = map.read(60, 0), f = map.read(60, 100);
+        check(e.action == midiin::InputMap::kPass && e.velocity == 1 && f.velocity == 100 && map.version() == 0, "defaults");
+    }
+    { // sanitising
+        int a[128], v[128];
+        identityMap(a, v);
+        a[1] = 128; a[2] = -5; a[3] = 256 + 8; a[4] = 256 + 9; a[5] = 255; v[10] = 0; v[11] = 300;
+        map.set(a, v);
+        check(map.read(1, 1).action == -1 && map.read(2, 1).action == -1 && map.read(3, 1).action == 264
+              && map.read(4, 1).action == -1 && map.read(5, 1).action == -1 && map.read(6, 1).action == 6,
+              "actions sanitised");
+        check(map.read(0, 10).velocity == 1 && map.read(0, 11).velocity == 127 && map.version() == 1, "velocity clamped");
+        map.set(a, nullptr);
+        check(map.read(0, 77).velocity == 77, "null velocity = identity");
+    }
+    { // swap under load
+        int a1[128], v1[128], a2[128], v2[128];
+        for (int i = 0; i < 128; ++i) {
+            a1[i] = i; v1[i] = 1;                      // map 1: synth notes, velocity 1
+            a2[i] = 256 + (i % 9); v2[i] = 127;        // map 2: drum voices, velocity 127
+        }
+        map.set(a1, v1);
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> reads{0}, torn{0};
+        std::vector<std::thread> readers;
+        for (int r = 0; r < 3; ++r) {
+            readers.emplace_back([&, r] {
+                uint64_t n = 0, bad = 0;
+                int note = r;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    note = (note + 7) & 127;
+                    const auto e = map.read(note, (note * 5) & 127);
+                    const bool drum = e.action >= 256;
+                    const bool ok = drum ? (e.velocity == 127 && e.action == 256 + note % 9)
+                                         : (e.velocity == 1 && e.action == note);
+                    if (!ok) ++bad;
+                    ++n;
+                }
+                reads.fetch_add(n);
+                torn.fetch_add(bad);
+            });
+        }
+        const uint32_t before = map.version();
+        for (int k = 0; k < 20000; ++k) map.set((k & 1) ? a1 : a2, (k & 1) ? v1 : v2);
+        stop.store(true);
+        for (auto& t : readers) t.join();
+        check(torn.load() == 0, "torn reads " + std::to_string(torn.load()) + " of " + std::to_string(reads.load()));
+        check(map.version() - before == 20000, "version counts swaps");
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        for (int k = 0; k < 100; ++k) { map.set(a1, v1); (void)map.read(k & 127, k & 127); }
+        tCountAllocs = false;
+        check(gRenderAllocs.load() + gRenderFrees.load() == 0, "set / read allocate");
+        std::printf("mim   MIDI input map: sanitising, 20000 swaps vs 3 readers (%llu reads)  ",
+                    (unsigned long long)reads.load());
+    }
+    const bool pass = failed == 0;
+    std::printf("%-4s %d failed checks%s\n", pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Holds: a note-off releases what its note-on played whatever the map says by then; shared synth
+// notes are counted; a note another source holds is left to it; retrigger, disabled, refused,
+// drums, releaseAll and allNotesOff; events and their flags. Then the real queue + synth: a mapped
+// note sounds, the latency leg is recorded, the release stops it, the render does not allocate.
+static bool runMidiHolds() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; if (detail.size() < 1200) detail += "; FAIL " + what; }
+    };
+    using V = std::vector<std::string>;
+    auto expectOps = [&](RecordingMidiSink& sink, const V& want, const std::string& what) {
+        const V got = sink.take();
+        check(got == want, what + ": got " + joinStrs(got) + " want " + joinStrs(want));
+    };
+    using Bytes = std::vector<uint8_t>;
+    auto send = [](midiin::MidiInput& in, const Bytes& b, int format = midiin::kFormatBleMidi) {
+        return in.input(b.data(), b.size(), format, 1.0);
+    };
+    auto on = [](int n, int v) { return Bytes{0x80, 0x80, 0x90, (uint8_t)n, (uint8_t)v}; };
+    auto off = [](int n) { return Bytes{0x80, 0x80, 0x80, (uint8_t)n, 0}; };
+    auto drain = [](midiin::MidiInput& in) {
+        std::vector<midiin::Event> out;
+        in.beginDrain();
+        in.drainEvents([&](const midiin::Event& e) { out.push_back(e); });
+        return out;
+    };
+    int a[128], v[128];
+
+    RecordingMidiSink sink;
+    midiin::MidiInput in(sink);
+    identityMap(a, v);
+    for (int i = 0; i < 128; ++i) v[i] = i < 1 ? 1 : (i + 1) / 2 + 1; // a soft curve, to see it applied
+    a[36] = 60; a[38] = 60; a[40] = 256 + 2; a[41] = -1;
+    in.map().set(a, v);
+
+    // Disabled by default: everything passes.
+    send(in, on(36, 100));
+    expectOps(sink, {}, "disabled note-on passes");
+    auto ev = drain(in);
+    check(ev.size() == 1 && ev[0].message.type == midiin::kNoteOn && !(ev[0].flags & midiin::kEventPlayed) && ev[0].out == -1,
+          "passed event");
+    send(in, off(36));
+    expectOps(sink, {}, "note-off of a passed note passes");
+    drain(in);
+
+    in.setEnabled(true);
+    { // map change between on and off
+        bool flush = false;
+        in.input(on(36, 100).data(), 5, midiin::kFormatBleMidi, 2.5, &flush);
+        check(flush, "first event asks for a drain");
+        bool again = true;
+        in.input(on(50, 90).data(), 5, midiin::kFormatBleMidi, 2.6, &again);
+        check(!again, "second event before the drain does not");
+        int b[128];
+        for (int i = 0; i < 128; ++i) b[i] = 100;
+        in.map().set(b, nullptr);
+        send(in, off(36));
+        send(in, off(50));
+        expectOps(sink, {"on 60 51", "on 50 46", "off 60", "off 50"}, "off releases what on played after a map change");
+        ev = drain(in);
+        check(ev.size() == 4 && (ev[0].flags & midiin::kEventPlayed) && ev[0].out == 60 && ev[0].outVelocity == 51
+              && ev[0].arrival == 2.5 && (ev[2].flags & midiin::kEventLast) && ev[2].out == 60, "events of the map change");
+        in.map().set(a, v);
+    }
+    { // two input notes on one synth note
+        send(in, on(36, 127)); send(in, on(38, 127));
+        send(in, off(36));
+        expectOps(sink, {"on 60 65", "on 60 65"}, "first off of a shared note: no release");
+        check(in.holdCountForTests(60) == 1 && in.stats().held == 1, "one hold left");
+        send(in, off(38));
+        expectOps(sink, {"off 60"}, "last off releases");
+        ev = drain(in);
+        check(ev.size() == 4 && !(ev[2].flags & midiin::kEventLast) && (ev[3].flags & midiin::kEventLast), "last flag on the last off only");
+    }
+    { // another source holds the note
+        in.externalNoteOn(60);
+        send(in, on(36, 100)); send(in, off(36));
+        expectOps(sink, {"on 60 51"}, "a note held elsewhere is not released");
+        ev = drain(in);
+        check(ev.size() == 2 && (ev[1].flags & midiin::kEventPlayed) && (ev[1].flags & midiin::kEventLast), "still a played, last off");
+        in.externalNoteOff(60);
+        send(in, on(36, 100)); send(in, off(36));
+        expectOps(sink, {"on 60 51", "off 60"}, "released again once the other source let go");
+        drain(in);
+    }
+    { // retrigger without a note-off
+        send(in, on(36, 100)); send(in, on(36, 80));
+        expectOps(sink, {"on 60 51", "off 60", "on 60 41"}, "second note-on releases the first");
+        ev = drain(in);
+        check(ev.size() == 3 && ev[1].message.type == midiin::kNoteOff && (ev[1].flags & midiin::kEventSynthetic)
+              && ev[1].message.data1 == 36 && ev[1].out == 60, "synthetic off event");
+        send(in, off(36));
+        expectOps(sink, {"off 60"}, "then the off");
+        drain(in);
+    }
+    { // disabled while held: the off still releases
+        send(in, on(36, 100));
+        in.setEnabled(false);
+        send(in, off(36));
+        expectOps(sink, {"on 60 51", "off 60"}, "off while disabled releases the hold");
+        ev = drain(in);
+        check(ev.size() == 2 && (ev[1].flags & midiin::kEventPlayed), "played off while disabled");
+        in.setEnabled(true);
+    }
+    { // drums, unmapped, velocity 0
+        send(in, on(40, 127)); send(in, off(40));
+        send(in, on(41, 127)); send(in, off(41));
+        send(in, {0x80, 0x80, 0x90, 36, 100, 0x80, 36, 0});
+        expectOps(sink, {"drum 2 65", "on 60 51", "off 60"}, "drum hit; unmapped passes; velocity 0 is the off");
+        ev = drain(in);
+        check(ev.size() == 6 && (ev[0].flags & midiin::kEventDrum) && ev[0].out == 2 && !(ev[1].flags & midiin::kEventPlayed)
+              && !(ev[2].flags & midiin::kEventPlayed) && (ev[5].flags & midiin::kEventPlayed), "drum / pass events");
+    }
+    { // the engine refuses: passes to the app, counted
+        const uint64_t dropped = in.stats().dropped;
+        sink.accept.store(false);
+        send(in, on(36, 100)); send(in, off(36));
+        sink.accept.store(true);
+        expectOps(sink, {}, "refused note-on: nothing held");
+        ev = drain(in);
+        check(ev.size() == 2 && !(ev[0].flags & midiin::kEventPlayed) && !(ev[1].flags & midiin::kEventPlayed)
+              && in.stats().dropped == dropped + 1, "refused events pass");
+    }
+    { // releaseAll (disconnect)
+        const uint32_t epoch = in.epoch();
+        in.externalNoteOn(62);
+        a[37] = 62; in.map().set(a, v);
+        send(in, on(36, 100)); send(in, on(37, 100)); send(in, {0x80, 0x80, 0x92, 67}); // half a message
+        sink.take();
+        const uint32_t next = in.releaseAll();
+        expectOps(sink, {"off 60"}, "releaseAll: releases its holds, not one held elsewhere");
+        check(next == epoch + 1 && in.epoch() == next && in.stats().held == 0, "epoch bumped");
+        send(in, {0x80, 80}); // the half message's second half: the parser was reset
+        send(in, off(36));
+        expectOps(sink, {}, "after releaseAll: offs pass");
+        ev = drain(in);
+        check(ev.size() == 3 && ev[2].epoch == next && !(ev[2].flags & midiin::kEventPlayed), "later events carry the new epoch");
+        in.externalNoteOff(62);
+    }
+    { // allNotesOff
+        send(in, on(36, 100));
+        in.allNotesOff();
+        expectOps(sink, {"on 60 51", "all"}, "allNotesOff goes to the sink");
+        send(in, off(36));
+        expectOps(sink, {}, "and forgets the hold");
+        drain(in);
+    }
+    { // raw packets: text rejected, counted; no allocation per call
+        const uint64_t rejected = in.stats().rejectedPackets;
+        const std::string text = "pad 1 down\r\n";
+        in.input((const uint8_t*)text.data(), text.size(), midiin::kFormatRawPackets, 1.0);
+        Bytes nus = {0x90, 36, 100};
+        // The recording sink allocates its strings: refuse, so only the input's own work is counted.
+        sink.accept.store(false);
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        for (int k = 0; k < 100; ++k) {
+            in.input(nus.data(), nus.size(), midiin::kFormatRawPackets, 1.0);
+            in.input((const uint8_t*)text.data(), text.size(), midiin::kFormatRawPackets, 1.0);
+        }
+        tCountAllocs = false;
+        sink.accept.store(true);
+        check(gRenderAllocs.load() + gRenderFrees.load() == 0, "input() allocates");
+        drain(in);
+        const uint64_t rejectedNow = in.stats().rejectedPackets;
+        in.input(nus.data(), nus.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {"on 60 51"}, "raw packet note-on plays");
+        check(rejectedNow == rejected + 101, "text rejected " + std::to_string(rejectedNow - rejected));
+        check(in.input(nullptr, 3, 0, 1.0) == -1 && in.input(nus.data(), 3, 3, 1.0) == -1, "bad args");
+        in.releaseAll();
+        sink.take();
+        drain(in);
+    }
+    { // a rejected raw packet's note-offs still end what they held; its note-ons never play
+        const Bytes nusOn = {0x90, 36, 100};
+        in.input(nusOn.data(), nusOn.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {"on 60 51"}, "raw note-on held");
+        drain(in);
+        // A bridge log line around a note-off (8n): not complete MIDI, so rejected whole; before
+        // the salvage the note-off was lost with it and synth note 60 stayed on.
+        const Bytes mixed = {'o', 'k', ' ', 0x80, 36, 0x40, '\r', '\n'};
+        const uint64_t rejected = in.stats().rejectedPackets;
+        const int parsed = in.input(mixed.data(), mixed.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {"off 60"}, "note-off salvaged from a rejected packet");
+        check(parsed == 1 && in.heldNoteForTests(36) == -1 && in.holdCountForTests(60) == 0
+              && in.stats().rejectedPackets == rejected + 1, "salvaged note-off releases the hold");
+        auto evs = drain(in);
+        check(evs.size() == 1 && evs[0].message.type == midiin::kNoteOff && evs[0].message.data1 == 36
+              && (evs[0].flags & midiin::kEventPlayed) && (evs[0].flags & midiin::kEventLast) && evs[0].out == 60,
+              "salvaged note-off event");
+        // 9n kk 00 is a note-off too; a note-on in a rejected packet never plays.
+        in.input(nusOn.data(), nusOn.size(), midiin::kFormatRawPackets, 1.0);
+        sink.take();
+        const Bytes mixed2 = {'x', 0x90, 38, 100, 0x91, 36, 0x00, 'y'};
+        in.input(mixed2.data(), mixed2.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {"off 60"}, "9n velocity 0 salvaged, the note-on beside it ignored");
+        check(in.heldNoteForTests(38) == -1, "no hold from a rejected note-on");
+        drain(in);
+        // A salvaged note-off of a note the input does not hold is reported, not played.
+        const Bytes mixed3 = {'z', 0x80, 50, 0};
+        in.input(mixed3.data(), mixed3.size(), midiin::kFormatRawPackets, 1.0);
+        expectOps(sink, {}, "unheld salvaged note-off sends nothing");
+        evs = drain(in);
+        check(evs.size() == 1 && evs[0].message.data1 == 50 && !(evs[0].flags & midiin::kEventPlayed), "unheld note-off passed");
+    }
+    { // the engine's own noteOn marks before its push and restores the mark when the push failed
+        send(in, on(36, 100));
+        sink.take();
+        const bool previous = in.externalNoteOn(60);
+        in.restoreExternal(60, previous); // the queue refused the engine's note-on
+        send(in, off(36));
+        expectOps(sink, {"off 60"}, "a restored mark does not hold the input's release back");
+        send(in, on(36, 100));
+        sink.take();
+        check(!in.externalNoteOn(60), "mark was clear");      // the engine's note-on, queued
+        send(in, off(36));
+        expectOps(sink, {}, "a kept mark leaves the release to the other source");
+        in.externalNoteOff(60);
+        drain(in);
+    }
+    { // the event ring: full -> counted, nothing else breaks
+        const uint64_t before = in.stats().eventsDropped;
+        for (int k = 0; k < midiin::MidiInput::kEventCapacity + 10; ++k) send(in, {0x80, 0x80, 0xB0, 1, (uint8_t)(k & 127)});
+        check(in.stats().eventsDropped == before + 11, "full ring drops " + std::to_string(in.stats().eventsDropped - before));
+        check(drain(in).size() == (size_t)midiin::MidiInput::kEventCapacity - 1, "ring holds capacity - 1");
+    }
+
+    // Through the real queue and synth.
+    double legMs = -1.0;
+    {
+        NoteEventQueue queue;
+        std::atomic<bool> accepting{false};
+        midiin::NoteQueueSink qsink(queue, &accepting);
+        midiin::MidiInput input(qsink);
+        identityMap(a, v);
+        a[36] = 60;
+        input.map().set(a, v);
+        input.setEnabled(true);
+        LatencyWindow leg;
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        synth.setNoteQueue(&queue);
+        synth.setTransport(&transport);
+        synth.setInputLatency(&leg);
+        synth.setRelease(1.0);
+        synth.setRateAndBufferSizeDetails(48000, 128);
+        synth.prepareToPlay(48000, 128);
+        juce::AudioBuffer<float> buf(2, 128);
+        juce::MidiBuffer midi;
+        auto render = [&](int blocks) {
+            float peak = 0.0f;
+            for (int b = 0; b < blocks; ++b) {
+                tCountAllocs = true;
+                synth.processBlock(buf, midi);
+                tCountAllocs = false;
+                peak = std::max(peak, buf.getMagnitude(0, 0, 128));
+            }
+            return peak;
+        };
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        const Bytes n1 = on(36, 100);
+        const int parsedNotReady = input.input(n1.data(), n1.size(), midiin::kFormatBleMidi, 0.0);
+        check(parsedNotReady == 1 && input.stats().dropped == 1 && queue.notesQueued.load() == 0, "not accepting: dropped, not queued");
+        accepting.store(true);
+        const double arrival = midiin::NoteQueueSink::nowSeconds() - 0.005; // arrived 5 ms ago
+        input.input(n1.data(), n1.size(), midiin::kFormatBleMidi, arrival);
+        const float held = render(4);
+        const LatencySummary s = leg.summary();
+        legMs = s.last;
+        check(held > 0.01f && synth.diag.activeVoices.load() == 1, "mapped note sounds: peak " + std::to_string(held));
+        check(s.count == 1 && s.last >= 5.0 && s.last < 200.0, "arrival -> render leg " + std::to_string(s.last));
+        const Bytes f1 = off(36);
+        input.input(f1.data(), f1.size(), midiin::kFormatBleMidi, 0.0);
+        render(20);
+        check(synth.diag.activeVoices.load() == 0, "released by the input's note-off");
+        // A drum hit through the queue records the leg too.
+        a[38] = 256 + 0; input.map().set(a, v);
+        const Bytes d1 = on(38, 120);
+        input.input(d1.data(), d1.size(), midiin::kFormatBleMidi, midiin::NoteQueueSink::nowSeconds());
+        render(1);
+        check(leg.summary().count == 2, "drum hit leg");
+        check(gRenderAllocs.load() + gRenderFrees.load() == 0, "render allocations");
+    }
+
+    const bool pass = failed == 0;
+    std::printf("mih   MIDI input holds: map change, shared notes, other sources, retrigger, releaseAll, real synth  %-4s"
+                " %d failed checks; arrival->render %.2f ms%s\n", pass ? "PASS" : "FAIL", failed, legMs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// OwnerToken (ios/OwnerToken.h): a reload can create the new module before the old one is
+// destroyed. The old one's teardown (clear the MIDI input handler, shut the engine down) must
+// then do nothing; the plain "clear / shut down" it replaced removed the new module's handler.
+static bool runOwnerToken() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; detail += "; FAIL " + what; }
+    };
+    OwnerToken owner;
+    check(owner.current() == 0 && !owner.isCurrent(0), "none at start");
+    const uint64_t oldModule = owner.claim();
+    check(owner.isCurrent(oldModule), "first claim owns");
+    // Reload: the new module is created, then the old one is destroyed.
+    const uint64_t newModule = owner.claim();
+    check(newModule != oldModule && !owner.isCurrent(oldModule) && owner.isCurrent(newModule), "new claim takes over");
+    check(!owner.release(oldModule) && owner.isCurrent(newModule), "late release of the old token does nothing");
+    // The usual order: destroyed, then the next one created.
+    check(owner.release(newModule) && owner.current() == 0, "release by the owner");
+    check(!owner.release(newModule), "second release does nothing");
+    const uint64_t third = owner.claim();
+    check(owner.isCurrent(third) && !owner.release(0), "claim after release; token 0 never owns");
+    // Racing claims and stale releases from 4 threads: exactly one current owner at the end.
+    std::vector<std::thread> threads;
+    std::atomic<uint64_t> lastClaim{0};
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&] {
+            for (int k = 0; k < 5000; ++k) {
+                const uint64_t mine = owner.claim();
+                lastClaim.store(mine);
+                owner.release(mine - 1); // a stale token (often another thread's)
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    const uint64_t cur = owner.current();
+    check(cur == 0 || owner.isCurrent(cur), "consistent after races");
+    const bool pass = failed == 0;
+    std::printf("own   owner tokens: a destroyed module's late teardown leaves its replacement alone  %-4s %d failed checks%s\n",
+                pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+static std::atomic<int> gMidiDrainRequests{0};
+static void countMidiDrainRequest() { gMidiDrainRequests.fetch_add(1); }
+
+// The exported C entry point: before install, then 4 threads sending BLE-MIDI note pairs while a
+// fifth swaps the map, a sixth drains events and a seventh flips `enabled`. Afterwards every synth
+// note the input started was released last, nothing is held, and events add up.
+static bool runMidiEntry() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; if (detail.size() < 800) detail += "; FAIL " + what; }
+    };
+    const uint8_t one[] = {0x80, 0x80, 0x90, 60, 100};
+    check(expojuce_midi_input_bytes(one, sizeof(one), EXPOJUCE_MIDI_FORMAT_BLE_MIDI, 0.0) == -1, "before install: -1");
+
+    RecordingMidiSink sink;
+    midiin::MidiInput input(sink);
+    midiin::installEntryPoint(&input, countMidiDrainRequest);
+    int a1[128], a2[128], v[128];
+    for (int i = 0; i < 128; ++i) { a1[i] = i; a2[i] = (i + 1) & 127; v[i] = i; }
+    input.map().set(a1, v);
+    input.setEnabled(true);
+
+    check(expojuce_midi_input_bytes(one, sizeof(one), 7, 0.0) == -1, "unknown format: -1");
+    check(expojuce_midi_input_bytes(nullptr, 0, EXPOJUCE_MIDI_FORMAT_RAW_STREAM, 0.0) == 0, "empty: 0");
+    const uint8_t off60[] = {0x80, 0x80, 0x80, 60, 0};
+    expojuce_midi_input_bytes(off60, sizeof(off60), EXPOJUCE_MIDI_FORMAT_BLE_MIDI, 0.0);
+
+    constexpr int kThreads = 4, kPairs = 20000;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> drained{0}, synthetic{0};
+    std::thread swapper([&] {
+        for (int k = 0; !stop.load(); ++k) input.map().set((k & 1) ? a1 : a2, v);
+    });
+    std::thread toggler([&] {
+        for (int k = 0; !stop.load(); ++k) { input.setEnabled((k % 3) != 0); std::this_thread::yield(); }
+    });
+    std::thread consumer([&] {
+        for (;;) {
+            const bool last = stop.load();
+            input.beginDrain();
+            input.drainEvents([&](const midiin::Event& e) {
+                drained.fetch_add(1);
+                if (e.flags & midiin::kEventSynthetic) synthetic.fetch_add(1);
+            });
+            if (last) break;
+            std::this_thread::yield();
+        }
+    });
+    std::vector<std::thread> senders;
+    std::atomic<int> parsedTotal{0};
+    for (int t = 0; t < kThreads; ++t) {
+        senders.emplace_back([&, t] {
+            int parsed = 0;
+            for (int k = 0; k < kPairs; ++k) {
+                const uint8_t n = (uint8_t)(t * 20 + (k % 20)); // 20 notes per thread, neighbours share synth notes under map 2
+                const uint8_t pkt[] = {0x80, 0x80, 0x90, n, 100, 0x80, 0x80, n, 0};
+                if (k % 7 == 3) { // note-on now, note-off in its own packet
+                    parsed += expojuce_midi_input_bytes(pkt, 5, EXPOJUCE_MIDI_FORMAT_BLE_MIDI, 0.0);
+                    const uint8_t offPkt[] = {0x80, 0x80, 0x80, n, 0};
+                    parsed += expojuce_midi_input_bytes(offPkt, sizeof(offPkt), EXPOJUCE_MIDI_FORMAT_BLE_MIDI, 0.0);
+                } else {
+                    parsed += expojuce_midi_input_bytes(pkt, sizeof(pkt), EXPOJUCE_MIDI_FORMAT_BLE_MIDI, 0.0);
+                }
+            }
+            parsedTotal.fetch_add(parsed);
+        });
+    }
+    for (auto& s : senders) s.join();
+    stop.store(true);
+    swapper.join();
+    toggler.join();
+    consumer.join();
+    input.beginDrain();
+    input.drainEvents([&](const midiin::Event&) { drained.fetch_add(1); });
+
+    const midiin::Stats st = input.stats();
+    check(parsedTotal.load() == kThreads * kPairs * 2, "parsed " + std::to_string(parsedTotal.load()));
+    check(st.held == 0, "held after every pair: " + std::to_string(st.held));
+    int hanging = 0;
+    {
+        std::lock_guard<std::mutex> g(sink.m);
+        for (int s = 0; s < 128; ++s) if (sink.lastOp[s] == 1) ++hanging;
+    }
+    check(hanging == 0, std::to_string(hanging) + " synth notes left on");
+    for (int s = 0; s < 128; ++s)
+        if (input.holdCountForTests(s) != 0) { check(false, "hold count of " + std::to_string(s)); break; }
+    check(drained.load() + st.eventsDropped == st.messages + synthetic.load() && synthetic.load() == 0,
+          "events: drained " + std::to_string(drained.load()) + " + dropped " + std::to_string(st.eventsDropped)
+          + " vs messages " + std::to_string(st.messages));
+    check(st.played + st.passed + st.dropped == (uint64_t)(kThreads * kPairs), "every note-on counted once");
+    check(gMidiDrainRequests.load() > 0, "drains requested");
+    midiin::installEntryPoint(nullptr, nullptr);
+
+    const bool pass = failed == 0;
+    std::printf("mic   MIDI input C entry: 4 senders x %d pairs, map swaps, enable flips, a drainer  %-4s %d failed checks;"
+                " played %llu passed %llu, drain requests %d%s\n", kPairs, pass ? "PASS" : "FAIL", failed,
+                (unsigned long long)st.played, (unsigned long long)st.passed, gMidiDrainRequests.load(), detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the cases named on the command line run (none: every case).
 static std::vector<std::string> gOnlyCases;
 static bool want(const char* id) {
@@ -4100,6 +4779,11 @@ int main(int argc, char** argv) {
     if (want("stall")) unexpected += runStallWindow() ? 0 : 1;
     if (want("bsel")) unexpected += runDeviceFormat() ? 0 : 1;
     if (want("broute")) unexpected += runDeviceRoutes() ? 0 : 1;
+    if (want("mip")) unexpected += runMidiParsers() ? 0 : 1;
+    if (want("mim")) unexpected += runMidiMap() ? 0 : 1;
+    if (want("mih")) unexpected += runMidiHolds() ? 0 : 1;
+    if (want("mic")) unexpected += runMidiEntry() ? 0 : 1;
+    if (want("own")) unexpected += runOwnerToken() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

@@ -41,6 +41,27 @@
 }
 + (void)allNotesOff { [[ExpoJuceAudioEngine sharedInstance] allNotesOff]; }
 
+// ── MIDI byte input ──
++ (BOOL)setMidiInputMapActions:(NSArray<NSNumber *> *)actions velocity:(NSArray<NSNumber *> *)velocity {
+    return [[ExpoJuceAudioEngine sharedInstance] setMidiInputMapActions:actions velocity:velocity];
+}
++ (void)setMidiInputEnabled:(BOOL)enabled { [[ExpoJuceAudioEngine sharedInstance] setMidiInputEnabled:enabled]; }
++ (int)releaseMidiInputHolds { return [[ExpoJuceAudioEngine sharedInstance] releaseMidiInputHolds]; }
++ (double)midiInputClock { return [[ExpoJuceAudioEngine sharedInstance] midiInputClock]; }
++ (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds {
+    return [[ExpoJuceAudioEngine sharedInstance] midiInputBytes:bytes format:format arrival:arrivalSeconds];
+}
++ (uint64_t)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *))handler {
+    return [[ExpoJuceAudioEngine sharedInstance] setMidiInputHandler:handler];
+}
++ (void)clearMidiInputHandler:(uint64_t)token { [[ExpoJuceAudioEngine sharedInstance] clearMidiInputHandler:token]; }
++ (void)setMidiInputListening:(BOOL)listening token:(uint64_t)token {
+    [[ExpoJuceAudioEngine sharedInstance] setMidiInputListening:listening token:token];
+}
++ (uint64_t)claimModule { return [[ExpoJuceAudioEngine sharedInstance] claimModule]; }
++ (void)releaseModule:(uint64_t)token { [[ExpoJuceAudioEngine sharedInstance] releaseModule:token]; }
++ (void *)midiInputBytesFunction { return [ExpoJuceAudioEngine midiInputBytesFunction]; }
+
 // ── Global Params ──
 + (void)setWaveform:(NSString *)waveform { [[ExpoJuceAudioEngine sharedInstance] setWaveform:waveform]; }
 + (void)setFilterCutoff:(double)hz { [[ExpoJuceAudioEngine sharedInstance] setFilterCutoff:hz]; }

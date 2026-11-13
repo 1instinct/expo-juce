@@ -67,6 +67,14 @@ export type ExpoJuceNativeModule = {
   setDrumKit?(params: Partial<DrumKitParams>): boolean;
   getDrumState?(): DrumState;
 
+  // MIDI byte input (0.9.0-rc.2+, iOS)
+  hasMidiInput?(): boolean;
+  setMidiInputMap?(actions: number[], velocity: number[] | null): boolean;
+  setMidiInputEnabled?(enabled: boolean): void;
+  releaseMidiInputHolds?(): number;
+  getMidiInputClock?(): number;
+  midiInputBytes?(bytes: number[], format: number, arrival: number | null): number;
+
   // Transport
   startTransport(): void;
   stopTransport(): void;

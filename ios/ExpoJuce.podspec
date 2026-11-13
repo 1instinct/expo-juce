@@ -42,6 +42,7 @@ Pod::Spec.new do |s|
     "JuceConfig.h",
     "Voice.h",
     "VoiceAllocator.h",
+    "OwnerToken.h",
     "PolySynthProcessor.h",
     "FxChainProcessor.h",
     "AuxProcessor.h",
@@ -55,6 +56,8 @@ Pod::Spec.new do |s|
     "DrumMachine.h",
     "LatencyStats.h",
     "DeviceFormat.h",
+    "MidiInput.h",
+    "ExpoJuceMidiInput.h", # plain C, but its <stdint.h> include trips check:headers; native callers dlsym it
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)

@@ -424,6 +424,93 @@ export type AudioDiagnostics = {
   mainThreadMaxGapMs?: number;
   /** Main-thread gaps longer than 50 ms since launch. */
   mainThreadStalls50?: number;
+  /** MIDI byte input (0.9.0-rc.2+, iOS): counters since launch and the arrival → render leg. */
+  midiInput?: MidiInputDiagnostics;
+};
+
+export type MidiInputDiagnostics = {
+  /** The map is on (setMidiInputEnabled). */
+  enabled: boolean;
+  /** Maps set since launch. */
+  mapVersion: number;
+  /** Byte batches received (native calls and midiInputBytes). */
+  packets: number;
+  /** Complete MIDI messages parsed. */
+  messages: number;
+  /** Note-ons played by the map (synth and drums). */
+  played: number;
+  /** Note-ons passed to the app (map off, or the note unmapped). */
+  passed: number;
+  /** Note-ons the map would have played that the engine refused (not set up, queue full); passed to the app. */
+  dropped: number;
+  /** Raw-packet batches that were not complete MIDI (ignored whole). */
+  rejectedPackets: number;
+  /** Events lost because the ring was full. */
+  eventsDropped: number;
+  /** Input notes holding a synth note now. */
+  held: number;
+  /** releaseMidiInputHolds / allNotesOff count. */
+  epoch: number;
+  /** Bytes' arrival → the render block that consumed the note-on / hit (the same leg as `touchLatency.midiInputToRenderMs`). */
+  midiInputToRenderMs: LatencyLegStats;
+};
+
+/** Byte formats of `midiInputBytes` and the native `expojuce_midi_input_bytes`. */
+export type MidiInputFormat = 'bleMidi' | 'rawStream' | 'rawPackets';
+
+/**
+ * What an input note plays: a synth note (0–127), a drum voice (0–8), or nothing (`null`: the
+ * note-on passes to the app, as every note does while the map is off).
+ */
+export type MidiInputAction = { note: number } | { drum: number } | null;
+
+export type MidiInputMap = {
+  /** Per input note 0–127 (index); missing entries pass. */
+  actions: MidiInputAction[];
+  /** Input velocity (index 0–127) → velocity played, 1–127. Omitted: the input's own. */
+  velocity?: number[];
+};
+
+/**
+ * One parsed message. `played`: handled natively (a note-on that sounded, a note-off that ended
+ * the input's own hold); then `part` / `out` say what it played or released. Anything not played
+ * is the app's to handle.
+ */
+export type MidiInputEvent = {
+  type: 'noteOn' | 'noteOff' | 'polyPressure' | 'cc' | 'pitchBend';
+  /** 0–15. */
+  channel: number;
+  /** noteOn / noteOff / polyPressure. */
+  note?: number;
+  /** noteOn / noteOff (0 for a note-on with velocity 0). */
+  velocity?: number;
+  pressure?: number;
+  controller?: number;
+  /** cc: 0–127; pitchBend: 0–16383 (8192 = centre). */
+  value?: number;
+  /** When the bytes arrived, seconds on the input clock (getMidiInputClock()). */
+  arrival: number;
+  /** The release epoch it was handled in (see releaseMidiInputHolds). */
+  epoch: number;
+  played: boolean;
+  part?: 'synth' | 'drums';
+  /** The synth note (or drum voice) played, or the synth note a note-off released. */
+  out?: number;
+  /** noteOn: the velocity played (after the curve). */
+  outVelocity?: number;
+  /** noteOff: the input's last hold of `out` ended. */
+  last?: boolean;
+  /** A note-off made natively: a second note-on of the same input note released the first. */
+  synthetic?: boolean;
+};
+
+/** One onMidiInput batch: events since the previous one, oldest first. */
+export type MidiInputBatch = {
+  events: MidiInputEvent[];
+  /** Input clock at delivery (seconds). */
+  now: number;
+  /** The current release epoch. */
+  epoch: number;
 };
 
 /** One device open made by the iOS engine (`AudioDiagnostics.deviceOpens`). */
@@ -470,6 +557,8 @@ export type TouchLatencyDiagnostics = {
   bufferMs: number;
   /** AVAudioSession.outputLatency in ms. */
   outputLatencyMs: number;
+  /** MIDI byte input arrival → render block (0.9.0-rc.2+; see `midiInput`). */
+  midiInputToRenderMs?: LatencyLegStats;
 };
 
 /** A gesture recognizer or scroll view on the path from a pad to its window. depth 0 = the pad. */

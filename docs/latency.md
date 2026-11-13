@@ -205,6 +205,22 @@ nothing (harness case `broute`). `deviceOpens` keeps the last 8 opens (context, 
 granted size and rate, `opened`: whether the device was actually reopened) and `xrunCount` the
 underruns since the last `setup()`, each device's counted once.
 
+### MIDI input leg (0.9.0-rc.2)
+
+Notes from an external controller can skip the JS thread too: native code that receives the
+bytes (a Bluetooth notification callback) calls `expojuce_midi_input_bytes` with
+`CACurrentMediaTime()` taken first thing, and mapped note-ons go onto the note queue from there
+(README, "MIDI byte input"). `midiInputToRenderMs` (in `touchLatency` and `midiInput`) is that
+arrival → the render block that consumed the note, recorded on the audio thread like the touch
+legs (harness case `mih`). It starts when the bytes reach the app, so it leaves out the radio:
+the controller's scan, its BLE connection interval (a note waits up to one interval for the next
+connection event) and the system's Bluetooth stack. Add `bufferMs` and `outputLatencyMs` for the
+rest of the path to the speaker.
+
+The leg starts at the caller's stamp. A caller that stamps after some processing of its own (a
+Bluetooth library that has already copied and re-encoded the value before handing it over) reads
+slightly low by that processing; stamp as early as the caller can.
+
 ## 6. Slow-motion measurement procedure
 
 Measures finger contact → sound, the only figure that includes the digitizer and the speaker.

@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.9.0-rc.2
+
+### Added (iOS)
+
+- **MIDI byte input that plays without JavaScript.** For MIDI that reaches the app's own native
+  code (a Bluetooth notification callback, a serial port): that code calls the C function
+  `expojuce_midi_input_bytes(bytes, length, format, arrivalSeconds)` (`ios/ExpoJuceMidiInput.h`)
+  on its own thread. The engine parses the bytes (`bleMidi`: one BLE-MIDI packet per call;
+  `rawStream`; `rawPackets`: each call must be complete MIDI, anything else is ignored whole) and a
+  mapped note-on or drum hit goes straight onto the note queue. The 128-entry input map and
+  velocity curve come from JS (`setMidiInputMap`, swapped atomically; `setMidiInputEnabled`).
+  A note-off releases what its note-on played whatever the map says by then; synth notes two
+  inputs share are counted; a note another source of the engine holds (`noteOn` from JS, a
+  `JucePadView`) is left to that source's release.
+- Every parsed message reaches JS (`addMidiInputListener`, event `onMidiInput`) in batches about
+  4 ms after the first of a burst, with its arrival time, the release epoch, and whether it was
+  played (`part`, `out`, `outVelocity`, `last`, `synthetic`). Anything not played is the app's
+  to handle.
+- `releaseMidiInputHolds()` ends the input's holds (its device went away) and returns the new
+  release epoch; `allNotesOff()` also ends them. `getMidiInputClock()` is the clock of
+  `arrival`. `midiInputBytes(bytes, format, arrival?)` feeds the same path from JS.
+  `hasMidiInput()` is false on older binaries and on Android.
+- `+[ExpoJuceBridge midiInputBytesFunction]` returns the entry point through the Objective-C
+  runtime, for code that cannot `dlsym` it (an executable whose global symbols are stripped).
+- Diagnostics: `midiInput` (`enabled`, `mapVersion`, `packets`, `messages`, `played`, `passed`,
+  `dropped`, `rejectedPackets`, `eventsDropped`, `held`, `epoch`, `midiInputToRenderMs`) and
+  `touchLatency.midiInputToRenderMs`: bytes' arrival → the render block that consumed the note.
+- `rawPackets`: a packet rejected as not complete MIDI still releases the input's holds through
+  the complete note-offs in it (`8n kk vv`, `9n kk 00`); its note-ons never play.
+- `midiInputBytes` returns -1 for more than 512 bytes (one call is one packet; never truncated).
+- Reload safety: the module's MIDI input handler and the engine's lifetime are claimed with tokens,
+  so a module destroyed after its replacement was created (an `expo-updates` reload, a dev reload)
+  no longer clears the new handler, stops its beat timer or shuts the engine down under it; it only
+  releases held notes. Events are not built while no JS listener is subscribed.
+- The input's producer lock is an `os_unfair_lock` on Apple platforms (priority donation).
+- Harness cases `mip`, `mim`, `mih`, `mic`, `own`.
+
+### Compatibility
+
+- New entry points only. Nothing plays from the input until the app enables the map, so apps
+  that never call the new functions behave as before.
+
 ## 0.9.0-rc.1
 
 ### Added (iOS)
