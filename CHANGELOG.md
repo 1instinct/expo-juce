@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.9.0-rc.1
+
+### Added (iOS)
+
+- **Touch latency per leg.** `getDiagnostics().touchLatency`: `touchDeliveryMs`
+  (`UITouch.timestamp` → `touchesBegan`), `touchHandlerMs` (`touchesBegan` → note queue),
+  `queueToRenderMs` and `touchToRenderMs`, each `last` / `p50` / `p95` / `max` / `count` over the
+  last 64 notes and drum hits started by a `JucePadView`, plus `bufferMs` and `outputLatencyMs`.
+  Lock-free single-writer windows; no lock or allocation on the audio thread.
+  `lastTouchToRenderMs` is unchanged.
+- **Touch path report.** `touchPath`: the gesture recognizers (class, owning view, enabled,
+  `delaysTouchesBegan`, `delaysTouchesEnded`, `cancelsTouchesInView`) and scroll views
+  (`delaysContentTouches`, `canCancelContentTouches`) between the most recently attached pad and
+  its window, at most 30. `lastTouch`: the recognizers the last pad touch was delivered to, its
+  delivery time and distance to the nearest screen edge (at most one report every 0.5 s, after
+  the note is queued).
+- **Main-thread stall probe.** A display link on the main run loop while the engine is set up:
+  `mainThreadMaxGapMs` (longest gap in the last 10 s) and `mainThreadStalls50` (gaps over 50 ms).
+- **Device format.** `hardwareSampleRate`, `requestedSampleRate`, `grantedSampleRate`,
+  `requestedBufferSize`, `grantedBufferSize`, `availableBufferSizes`, `deviceOpens` (the last 8
+  opens) and `xrunCount` (since setup, over every device opened).
+- Harness cases `lat`, `stall`, `bsel`.
+
+### Changed (iOS)
+
+- **The engine runs at the route's own sample rate** (the session's rate after activation, before
+  the device is created) instead of forcing 48 kHz; `setup({ sampleRate })` is now a hint used
+  only when the session reports no music rate. The IO buffer duration is computed at that rate.
+- **Recoveries keep the preferred buffer size.** The dead-device restart, the stopped-device
+  restart, the interruption recovery and route changes reapply the session's preferred rate and
+  IO buffer duration, and reopen the device with the nearest listed buffer size. Before, they went
+  through JUCE's `restartLastAudioDevice`, which fell back to JUCE's default 256 frames (+1,
+  rounded up by the route, e.g. 288 at 44.1 kHz) because the last granted size is not in the new
+  device's list.
+
+### Compatibility
+
+- New native entry points only (`padNoteOn` / `padDrumHit` with an entry time, the touch path
+  reports); the existing ones are unchanged. Every new diagnostics key is optional in
+  `AudioDiagnostics` and absent on older binaries and on Android.
+
 ## 0.9.0-rc.0
 
 ### Added

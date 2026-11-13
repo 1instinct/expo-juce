@@ -153,6 +153,50 @@ Recovery fields (0.5.2+): `sessionReassertCount` (Playback re-asserted after som
 the category — a rising count means another library keeps changing it), `interruptionCount`,
 `mediaResetCount`, `lastRecoveryError` (empty when all recoveries succeeded).
 
+### Touch latency legs and device format (0.9.0-rc.1)
+
+A device capture on 0.8 (iPhone 16 Pro, wired headphones, a camera scene) showed touch → render
+134 ms but queue → render 5.5 ms: almost all of the time passed before the note was queued. One
+"last" value could not say where, so the path is now split, each leg with `last` / `p50` / `p95`
+/ `max` over the last 64 pad notes and hits (`touchLatency`):
+
+| Leg | From → to | Written by |
+|---|---|---|
+| `touchDeliveryMs` | `UITouch.timestamp` → `touchesBegan` entry (`CACurrentMediaTime()`, same mach clock) | main thread |
+| `touchHandlerMs` | `touchesBegan` entry → note queue push | audio thread (from the event's stamps) |
+| `queueToRenderMs` | push → the render block that consumed it | audio thread |
+| `touchToRenderMs` | `UITouch.timestamp` → render block (`lastTouchToRenderMs` is its `last`) | audio thread |
+
+`bufferMs` and `outputLatencyMs` complete the path to the speaker. The windows are lock-free
+single-writer rings (`ios/LatencyStats.h`, harness case `lat`).
+
+**Reading it.** A large delivery leg means iOS held the touch back: either a recognizer or
+scroll view delayed it, or the main thread was busy.
+
+- `touchPath`: every gesture recognizer from the pad up to its window (window included) with
+  `delaysTouchesBegan` / `delaysTouchesEnded` / `cancelsTouchesInView`, and every scroll view
+  with `delaysContentTouches` / `canCancelContentTouches`. Reported when a pad attaches, a second
+  later, and after its first touch (some recognizers are attached after mount).
+- `lastTouch`: the recognizers the last touch was actually delivered to (`UITouch.gestureRecognizers`,
+  which also lists ones that sit on no ancestor, e.g. the system's screen-edge gate), its
+  `deliveryMs` and `edgeDistance` (points to the nearest window edge).
+- `mainThreadMaxGapMs` (longest gap between display-link ticks in the last 10 s) and
+  `mainThreadStalls50` (gaps over 50 ms since launch).
+
+**Device format.** The engine now runs at the route's own rate (`hardwareSampleRate`, read at
+setup before JUCE's device exists) instead of forcing 48 kHz; `preferredSampleRate` is a hint for
+when the session reports none. The IO buffer duration is computed at that rate. JUCE only
+accepts a buffer size from the device's list (`availableBufferSizes`: the sizes granted for 64,
+128, … frames), so the engine asks for the nearest listed size (`requestedBufferSize`) and reports
+what it got (`grantedBufferSize`). Recovery used JUCE's `restartLastAudioDevice`, which reopens a
+new device with the last *granted* size; that size is normally not in the list, so JUCE fell back
+to its default 256 (+1 frame, rounded up by the route: 288 at 44.1 kHz on 32-frame steps). The
+dead-device restart, the stopped-device restart, the interruption recovery and route changes now
+reapply the session preferences and reopen with the nearest listed size (`ios/DeviceFormat.h`,
+harness case `bsel`, which runs JUCE's real `AudioDeviceManager` against an iOS-like fake device).
+`deviceOpens` keeps the last 8 opens (context, requested and granted size and rate) and
+`xrunCount` the underruns since setup.
+
 ## 6. Slow-motion measurement procedure
 
 Measures finger contact → sound, the only figure that includes the digitizer and the speaker.
