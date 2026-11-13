@@ -25,6 +25,7 @@
     "expo-module": "expo-module",
     "check:headers": "node test/check-podspec-headers.cjs",
     "check:juce-patches": "node test/check-juce-patches.cjs",
+    "check:ios-syntax": "node test/check-ios-syntax.cjs",
     "download-juce": "node src/scripts/bundle-juce.js",
     "vendor-juce": "node src/scripts/vendor-juce.cjs",
     "open:ios": "xed example/ios",
