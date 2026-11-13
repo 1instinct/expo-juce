@@ -23,12 +23,18 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (BOOL)playTestTone:(double)durationMs NS_SWIFT_NAME(playTestTone(durationMs:));
 + (void)startBeatTimer;
 + (void)stopBeatTimer;
+// Touch path diagnostics from JucePadView (main thread): see ExpoJuceAudioEngine.h.
++ (void)reportTouchPath:(NSArray<NSDictionary<NSString *, id> *> *)entries NS_SWIFT_NAME(reportTouchPath(_:));
++ (void)reportLastTouch:(NSDictionary<NSString *, id> *)touch NS_SWIFT_NAME(reportLastTouch(_:));
 
 // ── Synth (MIDI-style) ───────────────────────────────────────────
 + (void)noteOn:(int)note velocity:(int)velocity;
 // noteOn from a native touch (JucePadView). touchTimestamp = UITouch.timestamp (seconds since boot).
 // Swift: `padNoteOn(_:velocity:touchTimestamp:)`.
 + (void)padNoteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp NS_SWIFT_NAME(padNoteOn(_:velocity:touchTimestamp:));
+// As padNoteOn, with entryTimestamp = CACurrentMediaTime() at touchesBegan entry (touch latency legs).
+// Swift: `padNoteOn(_:velocity:touchTimestamp:entryTimestamp:)`.
++ (void)padNoteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp entryTimestamp:(double)entryTimestamp NS_SWIFT_NAME(padNoteOn(_:velocity:touchTimestamp:entryTimestamp:));
 + (void)noteOff:(int)note;
 + (void)allNotesOff;
 
@@ -76,6 +82,7 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 // `padDrumHit(_:velocity:touchTimestamp:)`, `setDrumVoice(_:params:)`, `setDrumKit(_:)`, `getDrumState()`.
 + (void)drumHit:(int)voice velocity:(int)velocity NS_SWIFT_NAME(drumHit(_:velocity:));
 + (void)padDrumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp NS_SWIFT_NAME(padDrumHit(_:velocity:touchTimestamp:));
++ (void)padDrumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp entryTimestamp:(double)entryTimestamp NS_SWIFT_NAME(padDrumHit(_:velocity:touchTimestamp:entryTimestamp:));
 + (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params NS_SWIFT_NAME(setDrumVoice(_:params:));
 + (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params NS_SWIFT_NAME(setDrumKit(_:));
 + (NSDictionary<NSString *, id> *)getDrumState NS_SWIFT_NAME(getDrumState());

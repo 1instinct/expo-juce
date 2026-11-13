@@ -13,10 +13,13 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // Lifecycle
 // Returns YES on success (or if already initialized). On failure, setupStep
 // holds the step that failed and lastError a description.
-// -setup uses the defaults: 128-sample buffer at 48000 Hz.
+// -setup uses the defaults: a 128-sample buffer, at the route's own sample rate (48000 Hz if the
+// session reports none).
 - (BOOL)setup;
 // Preferred I/O buffer size (samples) and sample rate; the device grants the nearest it
-// supports (see diagnostics: bufferSize / sampleRate vs preferredBufferSize / preferredSampleRate).
+// supports (see diagnostics: requested* / granted* vs preferredBufferSize / preferredSampleRate).
+// The sample rate is a hint: the engine runs at the route's current hardware rate whenever the
+// session reports one (no resampling), and uses this value only when it does not.
 // Values <= 0 fall back to the defaults.
 - (BOOL)setupWithBufferSize:(int)bufferSize sampleRate:(double)sampleRate;
 - (void)shutdown;
@@ -33,6 +36,11 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // noteOn from a native touch: touchTimestamp is UITouch.timestamp (seconds since boot,
 // mach_absolute_time clock). Used for the lastTouchToRenderMs diagnostic.
 - (void)noteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp;
+// As above, plus entryTimestamp: CACurrentMediaTime() at the touch handler's entry (touchesBegan),
+// same clock. Feeds the touch latency legs (diagnostics touchLatency): delivery = entry − touch
+// (recorded here, main thread only), handler = entry → queue push, queueToRender = push → render.
+- (void)noteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp
+    entryTimestamp:(double)entryTimestamp;
 - (void)noteOff:(int)note;
 - (void)allNotesOff;
 
@@ -89,6 +97,14 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 - (void)drumHit:(int)voice velocity:(int)velocity;
 // drumHit from a native touch (JucePadView in drums mode); touchTimestamp as for noteOn.
 - (void)drumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp;
+- (void)drumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp
+    entryTimestamp:(double)entryTimestamp;
+
+// Touch path diagnostics from JucePadView (main thread). reportTouchPath: the gesture recognizers
+// and scroll views between the pad and its window (diagnostics touchPath, capped at 30 entries).
+// reportLastTouch: the recognizers attached to the last touch and where it landed (lastTouch).
+- (void)reportTouchPath:(NSArray<NSDictionary<NSString *, id> *> *)entries;
+- (void)reportLastTouch:(NSDictionary<NSString *, id> *)touch;
 // Parameters: lock-free, any thread, remembered before setup and across rebuilds; absent / unknown
 // keys and non-finite values unchanged, numbers clamped. Voice keys: tune (semitones −24..24),
 // decay, tone, level (0–1). NO for a voice outside 0–8 (nothing applied).

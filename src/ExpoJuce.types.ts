@@ -379,7 +379,11 @@ export type AudioDiagnostics = {
   platform?: 'android';
   /** Android: the device's native output sample rate (Hz) the engine asked for; 0 = unknown (0.9.0+). */
   nativeSampleRate?: number;
-  /** Android: output underruns reported by the audio stream since it opened; -1 = unknown (0.9.0+). */
+  /**
+   * Output underruns. Android (0.9.0+): reported by the audio stream since it opened; -1 = unknown.
+   * iOS (0.9.0-rc.1+): since setup, summed over every device the engine opened (JUCE's count: gaps
+   * in the device's sample time plus callbacks that overran their time budget).
+   */
   xrunCount?: number;
   /** Android: the app is in the background and the audio device is closed (0.9.0+). */
   backgrounded?: boolean;
@@ -387,4 +391,105 @@ export type AudioDiagnostics = {
   backgroundStops?: number;
   /** Android: times it was reopened when the app came back (0.9.0+). */
   foregroundRestarts?: number;
+
+  // ── iOS, 0.9.0-rc.1+ (absent on older binaries and on Android) ──
+  /** The session's sample rate at setup, before the device was created: the route's own rate (Hz). */
+  hardwareSampleRate?: number;
+  /** The sample rate the engine asked the device for: the route's rate (`preferredSampleRate` is only a hint). */
+  requestedSampleRate?: number;
+  /** The sample rate the device runs at (same as `sampleRate`). */
+  grantedSampleRate?: number;
+  /** The buffer size the engine asked the device for: the size in `availableBufferSizes` nearest to `preferredBufferSize`. */
+  requestedBufferSize?: number;
+  /** The buffer size the device runs at (same as `bufferSize`). */
+  grantedBufferSize?: number;
+  /** Buffer sizes the device lists (what it was granted for 64, 128, 256 … frames at the current rate). */
+  availableBufferSizes?: number[];
+  /** The last 8 device opens the engine made (setup, recoveries, route changes), oldest first. */
+  deviceOpens?: DeviceOpenRecord[];
+  /** Touch → sound, per leg, over the last 64 notes / drum hits started by a native pad (`JucePadView`). */
+  touchLatency?: TouchLatencyDiagnostics;
+  /** Gesture recognizers and scroll views between the most recently attached pad and its window (at most 30). */
+  touchPath?: TouchPathEntry[];
+  /** The last pad touch (at most one report every 0.5 s): its delivery time, position and recognizers. */
+  lastTouch?: LastTouchReport | Record<string, never>;
+  /** Longest gap between main-thread display-link ticks in the last 10 s (ms); 0 when not set up. */
+  mainThreadMaxGapMs?: number;
+  /** Main-thread gaps longer than 50 ms since launch. */
+  mainThreadStalls50?: number;
+};
+
+/** One device open made by the iOS engine (`AudioDiagnostics.deviceOpens`). */
+export type DeviceOpenRecord = {
+  /** "setup", "route change", "interruption", "dead device (…)", "stopped device (…)". */
+  context: string;
+  /** CACurrentMediaTime() in ms (time since boot), to order and space the entries. */
+  atMs: number;
+  preferredBufferSize: number;
+  requestedBufferSize: number;
+  grantedBufferSize: number;
+  requestedSampleRate: number;
+  grantedSampleRate: number;
+  /** A new device object was created (a reopen) rather than the open one reconfigured. */
+  newDevice: boolean;
+  /** Empty when the open succeeded. */
+  error: string;
+};
+
+/** last / p50 / p95 / max in ms over the last 64 values; count = values ever recorded. -1 when none. */
+export type LatencyLegStats = {
+  last: number;
+  p50: number;
+  p95: number;
+  max: number;
+  count: number;
+};
+
+export type TouchLatencyDiagnostics = {
+  /** UITouch.timestamp → touchesBegan entry: iOS delivering the touch to the pad. */
+  touchDeliveryMs: LatencyLegStats;
+  /** touchesBegan entry → note queue push: the pad's own code. */
+  touchHandlerMs: LatencyLegStats;
+  /** Note queue push → the render block that consumed it. */
+  queueToRenderMs: LatencyLegStats;
+  /** UITouch.timestamp → render block (the whole in-app path; `lastTouchToRenderMs` is its `last`). */
+  touchToRenderMs: LatencyLegStats;
+  /** One device buffer (bufferSize / sampleRate) in ms. */
+  bufferMs: number;
+  /** AVAudioSession.outputLatency in ms. */
+  outputLatencyMs: number;
+};
+
+/** A gesture recognizer or scroll view on the path from a pad to its window. depth 0 = the pad. */
+export type TouchPathEntry =
+  | {
+      kind: 'recognizer';
+      class: string;
+      /** Class of the view the recognizer is attached to. */
+      view: string;
+      depth: number;
+      enabled: boolean;
+      delaysTouchesBegan: boolean;
+      delaysTouchesEnded: boolean;
+      cancelsTouchesInView: boolean;
+    }
+  | {
+      kind: 'scrollView';
+      class: string;
+      depth: number;
+      scrollEnabled: boolean;
+      delaysContentTouches: boolean;
+      canCancelContentTouches: boolean;
+    };
+
+/** `AudioDiagnostics.lastTouch`. Recognizers are the ones the touch was delivered to (`UITouch.gestureRecognizers`). */
+export type LastTouchReport = {
+  deliveryMs: number;
+  x: number;
+  y: number;
+  windowWidth: number;
+  windowHeight: number;
+  /** Distance from the touch to the nearest window edge (points). */
+  edgeDistance: number;
+  recognizers: Omit<Extract<TouchPathEntry, { kind: 'recognizer' }>, 'depth'>[];
 };

@@ -199,6 +199,16 @@ void PolySynthProcessor::recordNoteLatency(const NoteEvent& event) {
         diag.lastTouchToRenderMs.store(juce::Time::highResolutionTicksToSeconds(elapsed) * 1000.0,
                                        std::memory_order_relaxed);
     }
+    // Per-leg windows for touch-originated events (this thread is their only writer). Raw
+    // differences: a negative value would mean the clocks are not the same, so it is kept.
+    if (event.touchTicks != 0 && touchLatency != nullptr) {
+        const auto ms = [](juce::int64 ticks) { return juce::Time::highResolutionTicksToSeconds(ticks) * 1000.0; };
+        if (event.entryTicks != 0 && event.stampTicks != 0)
+            touchLatency->handler.push(ms(event.stampTicks - event.entryTicks));
+        if (event.stampTicks != 0)
+            touchLatency->queueToRender.push(ms(nowTicks - event.stampTicks));
+        touchLatency->touchToRender.push(ms(nowTicks - event.touchTicks));
+    }
 }
 
 void PolySynthProcessor::setWaveform(Waveform wf) { waveform.store(static_cast<int>(wf)); }

@@ -53,6 +53,8 @@ Pod::Spec.new do |s|
     "Arpeggiator.h",
     "SpectrumAnalyser.h",
     "DrumMachine.h",
+    "LatencyStats.h",
+    "DeviceFormat.h",
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)
