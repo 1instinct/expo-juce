@@ -126,6 +126,9 @@ public:
     // Touch-originated notes and hits record their legs here (audio thread: handler, queueToRender,
     // touchToRender). The engine passes its process-lifetime stats. nullptr = none.
     void setTouchLatency(TouchLatencyStats* s) { touchLatency = s; }
+    // MIDI input (MidiInput.h): note-ons and hits that carry an input arrival record arrival → the
+    // render block that consumed them here (audio thread). nullptr = none.
+    void setInputLatency(LatencyWindow* w) { inputLatency = w; }
     BeatState beatState;
     SynthDiagnostics diag;
 
@@ -143,6 +146,7 @@ private:
     TransportEngine* transport = nullptr;
     AnalysisRing* analysis = nullptr;
     TouchLatencyStats* touchLatency = nullptr;
+    LatencyWindow* inputLatency = nullptr;
     Arpeggiator arpeggiator;
     DrumMachine drumMachine;
     ArpEvent arpEvents[kArpEventCapacity]; // this block's arp events (audio thread)

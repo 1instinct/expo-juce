@@ -41,6 +41,21 @@
 }
 + (void)allNotesOff { [[ExpoJuceAudioEngine sharedInstance] allNotesOff]; }
 
+// ── MIDI byte input ──
++ (BOOL)setMidiInputMapActions:(NSArray<NSNumber *> *)actions velocity:(NSArray<NSNumber *> *)velocity {
+    return [[ExpoJuceAudioEngine sharedInstance] setMidiInputMapActions:actions velocity:velocity];
+}
++ (void)setMidiInputEnabled:(BOOL)enabled { [[ExpoJuceAudioEngine sharedInstance] setMidiInputEnabled:enabled]; }
++ (int)releaseMidiInputHolds { return [[ExpoJuceAudioEngine sharedInstance] releaseMidiInputHolds]; }
++ (double)midiInputClock { return [[ExpoJuceAudioEngine sharedInstance] midiInputClock]; }
++ (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds {
+    return [[ExpoJuceAudioEngine sharedInstance] midiInputBytes:bytes format:format arrival:arrivalSeconds];
+}
++ (void)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *))handler {
+    [[ExpoJuceAudioEngine sharedInstance] setMidiInputHandler:handler];
+}
++ (void *)midiInputBytesFunction { return [ExpoJuceAudioEngine midiInputBytesFunction]; }
+
 // ── Global Params ──
 + (void)setWaveform:(NSString *)waveform { [[ExpoJuceAudioEngine sharedInstance] setWaveform:waveform]; }
 + (void)setFilterCutoff:(double)hz { [[ExpoJuceAudioEngine sharedInstance] setFilterCutoff:hz]; }

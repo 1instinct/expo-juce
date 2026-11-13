@@ -209,6 +209,9 @@ void PolySynthProcessor::recordNoteLatency(const NoteEvent& event) {
             touchLatency->queueToRender.push(ms(nowTicks - event.stampTicks));
         touchLatency->touchToRender.push(ms(nowTicks - event.touchTicks));
     }
+    // MIDI input: arrival → this block (this thread is the window's only writer).
+    if (event.inputTicks != 0 && inputLatency != nullptr)
+        inputLatency->push(juce::Time::highResolutionTicksToSeconds(nowTicks - event.inputTicks) * 1000.0);
 }
 
 void PolySynthProcessor::setWaveform(Waveform wf) { waveform.store(static_cast<int>(wf)); }

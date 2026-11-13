@@ -36,6 +36,12 @@ import {
   DrumVoiceParams,
   DrumKitParams,
   DrumState,
+  MidiInputDiagnostics,
+  MidiInputFormat,
+  MidiInputAction,
+  MidiInputMap,
+  MidiInputEvent,
+  MidiInputBatch,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
 import { ARP_DEFAULTS, arpDefaults } from './arpDefaults';
@@ -332,6 +338,93 @@ export function getDrumState(): { kit: DrumKitParams; voices: DrumVoiceParams[] 
   return ExpoJuceModule.getDrumState();
 }
 
+// ── MIDI byte input (0.9.0-rc.2+, iOS) ───────────────────────────
+// For MIDI that arrives in the app's own native code (a Bluetooth notification callback, a serial
+// port): that code calls the C function expojuce_midi_input_bytes (ios/ExpoJuceMidiInput.h) with
+// the raw bytes, on its own thread. The engine parses them, plays what the input map says
+// straight from the note queue (no JS on the way), and reports every parsed message here in
+// batches (onMidiInput, about 4 ms after the first message of a burst) with its arrival time and
+// whether it was played. The map is pushed from JS and swapped atomically. Note-offs always end
+// the holds the input started, whatever the map says by then; a note another source of the
+// engine holds (noteOn from JS, a JucePadView) is left to that source's release. Binaries without
+// it: hasMidiInput() is false, the setters return false and no events arrive.
+
+export const MIDI_INPUT_FORMATS: Record<MidiInputFormat, number> = {
+  bleMidi: 0,
+  rawStream: 1,
+  rawPackets: 2,
+};
+
+/** True when this binary has the MIDI byte input. */
+export function hasMidiInput(): boolean {
+  return typeof ExpoJuceModule?.hasMidiInput === 'function' && ExpoJuceModule.hasMidiInput() === true;
+}
+
+const DRUM_ACTION_BASE = 256;
+
+function encodeMidiInputAction(a: MidiInputAction | undefined): number {
+  if (a == null) return -1;
+  if ('drum' in a) return isDrumVoice(a.drum) ? DRUM_ACTION_BASE + a.drum : -1;
+  return Number.isInteger(a.note) && a.note >= 0 && a.note <= 127 ? a.note : -1;
+}
+
+/**
+ * Replaces the input map (whole; readers see the old map or the new one). Returns false if the
+ * binary has no MIDI input. Does not change `enabled` (setMidiInputEnabled).
+ */
+export function setMidiInputMap(map: MidiInputMap): boolean {
+  if (typeof ExpoJuceModule?.setMidiInputMap !== 'function') return false;
+  const actions = new Array<number>(128);
+  for (let i = 0; i < 128; i++) actions[i] = encodeMidiInputAction(map.actions?.[i]);
+  let velocity: number[] | null = null;
+  if (Array.isArray(map.velocity)) {
+    velocity = new Array<number>(128);
+    for (let i = 0; i < 128; i++) {
+      const v = map.velocity[i];
+      velocity[i] = typeof v === 'number' && Number.isFinite(v) ? Math.min(127, Math.max(1, Math.round(v))) : Math.max(1, i);
+    }
+  }
+  return ExpoJuceModule.setMidiInputMap(actions, velocity) === true;
+}
+
+/** Off (the default): every note-on passes to the app. Returns false if unsupported. */
+export function setMidiInputEnabled(enabled: boolean): boolean {
+  if (typeof ExpoJuceModule?.setMidiInputEnabled !== 'function') return false;
+  ExpoJuceModule.setMidiInputEnabled(enabled === true);
+  return true;
+}
+
+/**
+ * Ends every hold the input started (its device went away) and resets the parsers. Returns the
+ * new release epoch (events from before it carry a lower one), or -1 if unsupported.
+ */
+export function releaseMidiInputHolds(): number {
+  if (typeof ExpoJuceModule?.releaseMidiInputHolds !== 'function') return -1;
+  return ExpoJuceModule.releaseMidiInputHolds();
+}
+
+/** Now on the input clock (seconds; `MidiInputEvent.arrival` uses it), or -1 if unsupported. */
+export function getMidiInputClock(): number {
+  if (typeof ExpoJuceModule?.getMidiInputClock !== 'function') return -1;
+  return ExpoJuceModule.getMidiInputClock();
+}
+
+/**
+ * Bytes from JS through the same path (at most 512 per call). Returns the messages parsed, or -1
+ * (unknown format, unsupported binary).
+ */
+export function midiInputBytes(bytes: ArrayLike<number>, format: MidiInputFormat, arrivalSeconds?: number): number {
+  if (typeof ExpoJuceModule?.midiInputBytes !== 'function') return -1;
+  const code = MIDI_INPUT_FORMATS[format];
+  if (code === undefined) return -1;
+  return ExpoJuceModule.midiInputBytes(Array.from(bytes), code, arrivalSeconds ?? null);
+}
+
+/** Every parsed message, in batches. */
+export function addMidiInputListener(listener: (batch: MidiInputBatch) => void): Subscription {
+  return emitter.addListener<MidiInputBatch>('onMidiInput', listener);
+}
+
 // ── Transport ────────────────────────────────────────────────────
 
 export function startTransport(): void {
@@ -413,4 +506,10 @@ export {
   DrumVoiceParams,
   DrumKitParams,
   DrumState,
+  MidiInputDiagnostics,
+  MidiInputFormat,
+  MidiInputAction,
+  MidiInputMap,
+  MidiInputEvent,
+  MidiInputBatch,
 };

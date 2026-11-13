@@ -25,7 +25,16 @@ public class ExpoJuceModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ExpoJuce")
 
+    OnCreate {
+      // MIDI input batches (on the input's background queue) go to JS while anything listens.
+      ExpoJuceBridge.setMidiInputHandler { [weak self] batch in
+        guard let self = self, self.hasListeners else { return }
+        self.sendEvent("onMidiInput", batch)
+      }
+    }
+
     OnDestroy {
+      ExpoJuceBridge.setMidiInputHandler(nil)
       ExpoJuceBridge.stopBeatTimer()
       ExpoJuceBridge.shutdown()
     }
@@ -34,7 +43,7 @@ public class ExpoJuceModule: Module {
       "PI": Double.pi
     ])
 
-    Events("onChange", "onBeat")
+    Events("onChange", "onBeat", "onMidiInput")
 
     Function("hello") {
       return "Hello world!"
@@ -108,6 +117,41 @@ public class ExpoJuceModule: Module {
 
     Function("allNotesOff") {
       ExpoJuceBridge.allNotesOff()
+    }
+
+    // ── MIDI byte input ────────────────────────────────────────────
+    // Native code feeds bytes through expojuce_midi_input_bytes (ExpoJuceMidiInput.h); JS sets the
+    // map and gets every parsed message back as onMidiInput batches. Any thread, lock-free map.
+
+    Function("hasMidiInput") { () -> Bool in
+      return true
+    }
+
+    // actions / velocity: 128 numbers each (see ExpoJuceAudioEngine.h). false: wrong lengths.
+    Function("setMidiInputMap") { (actions: [Double], velocity: [Double]?) -> Bool in
+      // Out-of-range values pass natively; clamp first so the conversion can never trap.
+      let toNumbers = { (values: [Double]) -> [NSNumber] in
+        values.map { NSNumber(value: $0.isFinite ? Int32(Swift.max(-1.0, Swift.min(1000.0, $0.rounded()))) : -1) }
+      }
+      return ExpoJuceBridge.setMidiInputMap(actions: toNumbers(actions), velocity: velocity.map(toNumbers))
+    }
+
+    Function("setMidiInputEnabled") { (enabled: Bool) in
+      ExpoJuceBridge.setMidiInputEnabled(enabled)
+    }
+
+    Function("releaseMidiInputHolds") { () -> Int in
+      return Int(ExpoJuceBridge.releaseMidiInputHolds())
+    }
+
+    Function("getMidiInputClock") { () -> Double in
+      return ExpoJuceBridge.midiInputClock()
+    }
+
+    // At most 512 bytes; arrival <= 0 (or absent) = now. Messages parsed, -1 for an unknown format.
+    Function("midiInputBytes") { (bytes: [Double], format: Int, arrival: Double?) -> Int in
+      let numbers = bytes.map { NSNumber(value: $0.isFinite ? Int32(Swift.max(0.0, Swift.min(255.0, $0))) : 0) }
+      return Int(ExpoJuceBridge.midiInputBytes(numbers, format: Int32(clamping: format), arrival: arrival ?? 0))
     }
 
     // ── Global Synth Params ────────────────────────────────────────
