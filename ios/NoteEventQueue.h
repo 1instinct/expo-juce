@@ -24,6 +24,7 @@ struct NoteEvent {
     juce::int64 stampTicks; // juce::Time::getHighResolutionTicks() at enqueue
     juce::int64 touchTicks; // originating UITouch.timestamp in high-res ticks (same clock); 0 if not a touch
     NoteEventKind kind = NoteEventKind::Note;
+    juce::int64 entryTicks = 0; // the touch handler's entry (touchesBegan) in high-res ticks; 0 if unknown
 };
 
 // Note input for the synth: note-ons travel in a ring, releases are marks.
@@ -48,7 +49,9 @@ public:
     // ── Producers (any thread) ──
 
     // Returns false if the ring is full (counted in notesDropped).
-    bool pushNoteOn(int note, int velocity, juce::int64 touchTicks = 0) {
+    // touchTicks / entryTicks: the originating UITouch and the touch handler's entry, in
+    // juce::Time high-resolution ticks (0 = not from a touch / unknown); see TouchLatencyStats.
+    bool pushNoteOn(int note, int velocity, juce::int64 touchTicks = 0, juce::int64 entryTicks = 0) {
         note = std::clamp(note, 0, 127);
         SpinGuard guard(producerLock);
         const int wp = writePos.load(std::memory_order_relaxed);
@@ -58,7 +61,7 @@ public:
             return false;
         }
         const uint64_t seq = lastSeq.load(std::memory_order_relaxed) + 1;
-        ring[wp] = { note, velocity, seq, juce::Time::getHighResolutionTicks(), touchTicks, NoteEventKind::Note };
+        ring[wp] = { note, velocity, seq, juce::Time::getHighResolutionTicks(), touchTicks, NoteEventKind::Note, entryTicks };
         lastOnSeq[note].store(seq, std::memory_order_release);
         lastSeq.store(seq, std::memory_order_release);
         // Count before publishing: the release-store below orders this increment ahead of the
@@ -73,7 +76,7 @@ public:
     // touched by the release marks. Returns false for an out-of-range voice (ignored, not counted)
     // or a full ring (counted in drumHitsDropped).
     static constexpr int kMaxDrumVoice = 8;
-    bool pushDrumHit(int voice, int velocity, juce::int64 touchTicks = 0) {
+    bool pushDrumHit(int voice, int velocity, juce::int64 touchTicks = 0, juce::int64 entryTicks = 0) {
         if (voice < 0 || voice > kMaxDrumVoice) return false;
         velocity = std::clamp(velocity, 1, 127);
         SpinGuard guard(producerLock);
@@ -83,7 +86,7 @@ public:
             drumHitsDropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        ring[wp] = { voice, velocity, 0, juce::Time::getHighResolutionTicks(), touchTicks, NoteEventKind::Drum };
+        ring[wp] = { voice, velocity, 0, juce::Time::getHighResolutionTicks(), touchTicks, NoteEventKind::Drum, entryTicks };
         drumHitsQueued.fetch_add(1, std::memory_order_relaxed);
         writePos.store(next, std::memory_order_release);
         return true;

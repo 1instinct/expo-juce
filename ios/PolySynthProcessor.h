@@ -9,6 +9,7 @@
 #include "Arpeggiator.h"
 #include "DrumMachine.h"
 #include "AnalysisRing.h"
+#include "LatencyStats.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -75,11 +76,16 @@ public:
     // Thread-safe, any number of threads: forwarded to the note queue (see NoteEventQueue).
     // touchTicks: originating UITouch timestamp in juce::Time high-resolution ticks
     // (mach_absolute_time on Apple), or 0 when the note did not come from a touch.
-    void noteOn(int note, int velocity, juce::int64 touchTicks = 0) { queue->pushNoteOn(note, velocity, touchTicks); }
+    // entryTicks: the touch handler's entry (touchesBegan), same clock; 0 = unknown.
+    void noteOn(int note, int velocity, juce::int64 touchTicks = 0, juce::int64 entryTicks = 0) {
+        queue->pushNoteOn(note, velocity, touchTicks, entryTicks);
+    }
     void noteOff(int note) { queue->pushNoteOff(note); }
     void allNotesOff() { queue->pushAllNotesOff(); }
     // A drum hit (voice 0–8, velocity 1–127) through the same queue; any thread. Out of range: ignored.
-    void drumHit(int voice, int velocity, juce::int64 touchTicks = 0) { queue->pushDrumHit(voice, velocity, touchTicks); }
+    void drumHit(int voice, int velocity, juce::int64 touchTicks = 0, juce::int64 entryTicks = 0) {
+        queue->pushDrumHit(voice, velocity, touchTicks, entryTicks);
+    }
 
     // The queue this synth reads its notes from: its own by default; the engine passes its
     // process-lifetime queue (before the synth is attached to a device). nullptr = own queue. The
@@ -117,6 +123,9 @@ public:
     void setTransport(TransportEngine* t) { transport = t; }
     // Receives the arpeggiator state every block (AnalysisRing::publishArp). nullptr = none.
     void setAnalysis(AnalysisRing* a) { analysis = a; }
+    // Touch-originated notes and hits record their legs here (audio thread: handler, queueToRender,
+    // touchToRender). The engine passes its process-lifetime stats. nullptr = none.
+    void setTouchLatency(TouchLatencyStats* s) { touchLatency = s; }
     BeatState beatState;
     SynthDiagnostics diag;
 
@@ -133,6 +142,7 @@ private:
     VoiceAllocator allocator;
     TransportEngine* transport = nullptr;
     AnalysisRing* analysis = nullptr;
+    TouchLatencyStats* touchLatency = nullptr;
     Arpeggiator arpeggiator;
     DrumMachine drumMachine;
     ArpEvent arpEvents[kArpEventCapacity]; // this block's arp events (audio thread)

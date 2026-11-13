@@ -47,6 +47,11 @@ class JucePadView: ExpoView {
   private var hitPathBounds: CGRect = .null
 
   private var activeTouches = Set<UITouch>()
+  // The touch path (ancestor recognizers / scroll views) is reported again on the first touch end
+  // after attaching: recognizers some libraries attach after mount are then in place.
+  private var touchPathNeedsRefresh = false
+  // Main thread: when any pad last reported its touch (reportLastTouch is throttled).
+  private static var lastTouchReportTime: CFTimeInterval = 0
   private var soundingNote: Int?
   // The sounding note is a drum hit (nothing to release in the engine).
   private var soundingIsDrum = false
@@ -106,6 +111,9 @@ class JucePadView: ExpoView {
   // MARK: - Touches
 
   override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+    // First thing: the handler's entry time (CACurrentMediaTime and UITouch.timestamp are both
+    // seconds on the mach_absolute_time clock), for the delivery and handler latency legs.
+    let entryTimestamp = CACurrentMediaTime()
     guard enabled else {
       super.touchesBegan(touches, with: event)
       return
@@ -119,8 +127,10 @@ class JucePadView: ExpoView {
           timestamp = touch.timestamp
         }
       }
-      startNote(touchTimestamp: timestamp)
+      startNote(touchTimestamp: timestamp, entryTimestamp: entryTimestamp)
     }
+    // After the note: diagnostics only.
+    reportLastTouch(touches, entryTimestamp: entryTimestamp)
   }
 
   override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -153,12 +163,133 @@ class JucePadView: ExpoView {
     }
   }
 
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    guard window != nil else {
+      return
+    }
+    reportTouchPath()
+    // Again a second later and on the first touch end: recognizers that libraries attach after
+    // mount are in place by then.
+    touchPathNeedsRefresh = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      guard let self = self, self.window != nil else {
+        return
+      }
+      self.reportTouchPath()
+    }
+  }
+
+  // MARK: - Touch path diagnostics (off the note path)
+
+  // Every gesture recognizer and scroll view from this view up to its window (the window's own
+  // recognizers included): anything there with a delay flag can hold touchesBegan back. depth 0 is
+  // this view. Over the engine's cap (30), entries that can delay touchesBegan come first.
+  private func reportTouchPath() {
+    var entries: [[String: Any]] = []
+    var current: UIView? = self
+    var depth = 0
+    while let view = current {
+      if let scrollView = view as? UIScrollView {
+        entries.append([
+          "kind": "scrollView",
+          "class": NSStringFromClass(type(of: scrollView)),
+          "depth": depth,
+          "scrollEnabled": scrollView.isScrollEnabled,
+          "delaysContentTouches": scrollView.delaysContentTouches,
+          "canCancelContentTouches": scrollView.canCancelContentTouches,
+        ])
+      }
+      for recognizer in view.gestureRecognizers ?? [] {
+        var entry = JucePadView.describe(recognizer)
+        entry["depth"] = depth
+        entries.append(entry)
+      }
+      if view is UIWindow {
+        break
+      }
+      current = view.superview
+      depth += 1
+    }
+    let cap = 30
+    if entries.count > cap {
+      // Keep the original order among the kept entries.
+      let ranked = entries.indices.sorted { a, b in
+        let ra = JucePadView.delayRank(entries[a])
+        let rb = JucePadView.delayRank(entries[b])
+        return ra != rb ? ra < rb : a < b
+      }
+      entries = Array(ranked.prefix(cap)).sorted().map { entries[$0] }
+    }
+    ExpoJuceBridge.reportTouchPath(entries)
+  }
+
+  // 0: can delay touchesBegan; 1: another flag on; 2: the rest.
+  private static func delayRank(_ entry: [String: Any]) -> Int {
+    if entry["delaysTouchesBegan"] as? Bool == true {
+      return 0
+    }
+    if entry["kind"] as? String == "scrollView" {
+      let delays = entry["delaysContentTouches"] as? Bool == true && entry["scrollEnabled"] as? Bool == true
+      return delays ? 0 : 1
+    }
+    if entry["delaysTouchesEnded"] as? Bool == true || entry["cancelsTouchesInView"] as? Bool == true {
+      return 1
+    }
+    return 2
+  }
+
+  private static func describe(_ recognizer: UIGestureRecognizer) -> [String: Any] {
+    return [
+      "kind": "recognizer",
+      "class": NSStringFromClass(type(of: recognizer)),
+      "view": recognizer.view.map { NSStringFromClass(type(of: $0)) } ?? "",
+      "enabled": recognizer.isEnabled,
+      "delaysTouchesBegan": recognizer.delaysTouchesBegan,
+      "delaysTouchesEnded": recognizer.delaysTouchesEnded,
+      "cancelsTouchesInView": recognizer.cancelsTouchesInView,
+    ]
+  }
+
+  // The recognizers this touch is delivered to (including ones not on any ancestor, such as the
+  // system's screen-edge gate), how late it arrived and where it landed. At most every 0.5 s.
+  private func reportLastTouch(_ touches: Set<UITouch>, entryTimestamp: CFTimeInterval) {
+    guard entryTimestamp - JucePadView.lastTouchReportTime >= 0.5,
+          let touch = touches.first,
+          let window = window else {
+      return
+    }
+    JucePadView.lastTouchReportTime = entryTimestamp
+    let point = touch.location(in: window)
+    let bounds = window.bounds
+    let recognizers: [[String: Any]] = (touch.gestureRecognizers ?? []).prefix(30).map { JucePadView.describe($0) }
+    // Typed locals keep the dictionary literal below cheap to type-check.
+    let deliveryMs: Double = (entryTimestamp - touch.timestamp) * 1000.0
+    let horizontalEdge: CGFloat = min(point.x - bounds.minX, bounds.maxX - point.x)
+    let verticalEdge: CGFloat = min(point.y - bounds.minY, bounds.maxY - point.y)
+    let edgeDistance: Double = Double(min(horizontalEdge, verticalEdge))
+    let report: [String: Any] = [
+      "deliveryMs": deliveryMs,
+      "x": Double(point.x),
+      "y": Double(point.y),
+      "windowWidth": Double(bounds.width),
+      "windowHeight": Double(bounds.height),
+      "edgeDistance": edgeDistance,
+      "recognizers": recognizers,
+    ]
+    ExpoJuceBridge.reportLastTouch(report)
+  }
+
   // MARK: - Notes
 
   private func endTouches(_ touches: Set<UITouch>) {
     activeTouches.subtract(touches)
     if activeTouches.isEmpty {
       stopNote()
+    }
+    if touchPathNeedsRefresh {
+      touchPathNeedsRefresh = false
+      reportTouchPath()
     }
   }
 
@@ -167,7 +298,7 @@ class JucePadView: ExpoView {
     stopNote()
   }
 
-  private func startNote(touchTimestamp: TimeInterval) {
+  private func startNote(touchTimestamp: TimeInterval, entryTimestamp: CFTimeInterval) {
     // A drums-mode retrigger (another finger while a hit is held) is just another hit: no
     // onNoteOff in between, that fires only when the last touch lifts.
     if !(drumMode && soundingIsDrum) {
@@ -180,11 +311,13 @@ class JucePadView: ExpoView {
     if drumMode {
       ExpoJuceBridge.padDrumHit(Int32(clamping: noteNumber),
                                 velocity: Int32(clamping: noteVelocity),
-                                touchTimestamp: touchTimestamp)
+                                touchTimestamp: touchTimestamp,
+                                entryTimestamp: entryTimestamp)
     } else {
       ExpoJuceBridge.padNoteOn(Int32(clamping: noteNumber),
                                velocity: Int32(clamping: noteVelocity),
-                               touchTimestamp: touchTimestamp)
+                               touchTimestamp: touchTimestamp,
+                               entryTimestamp: entryTimestamp)
     }
     let payload: [String: Any] = [
       "note": noteNumber,

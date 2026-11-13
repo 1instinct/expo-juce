@@ -167,7 +167,9 @@ public:
 };
 
 //==============================================================================
-// Every key of the JS AudioDiagnostics type (src/ExpoJuce.types.ts), required and optional.
+// Every key of the JS AudioDiagnostics type (src/ExpoJuce.types.ts), required and optional,
+// except the iOS-only 0.9.0-rc.1 keys (touchLatency, touchPath, lastTouch, mainThread*,
+// hardwareSampleRate, requested* / granted*, availableBufferSizes, deviceOpens).
 static const char* const kDiagnosticsKeys[] = {
     "isReady", "setupStep", "lastError", "deviceName", "deviceType", "sampleRate", "bufferSize",
     "outputLatencySamples", "callbackCount", "graphProcessCount", "synthProcessCount", "outputPeak",

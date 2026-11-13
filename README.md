@@ -435,6 +435,17 @@ as a pass/fail ladder — see [docs/latency.md](docs/latency.md#5-a-diagnostics-
 `fxNonFiniteResets`, `metronomeClicks`, `backingTrackLoaded` and `backingTrackPositionSec`.
 0.8.0+ adds `drumHits` and `drumPeak`.
 
+0.9.0-rc.1+ (iOS) splits the touch → sound path into legs and reports what the device was asked
+for. `touchLatency` holds `last` / `p50` / `p95` / `max` / `count` over the last 64 pad notes and
+hits for `touchDeliveryMs` (`UITouch.timestamp` → `touchesBegan`: iOS delivering the touch),
+`touchHandlerMs` (`touchesBegan` → note queue), `queueToRenderMs` and `touchToRenderMs`, plus
+`bufferMs` and `outputLatencyMs`. `touchPath` lists the gesture recognizers and scroll views
+between the pad and its window with their delay flags, `lastTouch` the recognizers the last touch
+was delivered to, and `mainThreadMaxGapMs` / `mainThreadStalls50` come from a display-link stall
+probe. `requestedSampleRate` / `grantedSampleRate`, `requestedBufferSize` / `grantedBufferSize`,
+`hardwareSampleRate`, `availableBufferSizes`, `deviceOpens` (the last 8 opens) and `xrunCount`
+show the device format. See [docs/latency.md](docs/latency.md#touch-latency-legs-and-device-format-090-rc1).
+
 ### Beat events
 
 `addBeatListener(fn)` gets `{ beat, bpm, position }` each time the playing transport crosses a

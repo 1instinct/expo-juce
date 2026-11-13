@@ -15,6 +15,8 @@
 #include "Arpeggiator.h"
 #include "SpectrumAnalyser.h"
 #include "DrumMachine.h"
+#include "LatencyStats.h"
+#include "DeviceFormat.h"
 
 #include <atomic>
 #include <chrono>
@@ -3603,6 +3605,399 @@ static bool runDrumDefaultsMatchJs() {
     return pass;
 }
 
+//==============================================================================
+// Touch latency windows (ios/LatencyStats.h): percentiles over the last 64, wrap-around, empty,
+// non-finite input, a writer racing a reader, and the legs PolySynthProcessor records from the
+// queued event's stamps. No allocation in push(), summary() or the render that records.
+static bool runLatencyStats() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; if (detail.size() < 600) detail += "; FAIL " + what; }
+    };
+
+    { // empty
+        LatencyWindow w;
+        const LatencySummary s = w.summary();
+        check(s.count == 0 && s.last == -1.0 && s.p50 == -1.0 && s.p95 == -1.0 && s.max == -1.0, "empty window");
+    }
+    { // fewer than 64: 5, 1, 3 -> last 3, p50 (rank 2) 3, p95 (rank 3) 5, max 5
+        LatencyWindow w;
+        w.push(5.0); w.push(1.0); w.push(3.0);
+        w.push(std::numeric_limits<double>::quiet_NaN());
+        w.push(std::numeric_limits<double>::infinity());
+        const LatencySummary s = w.summary();
+        check(s.count == 3 && s.last == 3.0 && s.p50 == 3.0 && s.p95 == 5.0 && s.max == 5.0,
+              "3 values (NaN / inf ignored): count " + std::to_string(s.count) + " p50 " + std::to_string(s.p50));
+    }
+    { // 1 … 100: the window holds 37 … 100; p50 = rank 32 -> 68, p95 = rank 61 -> 97
+        LatencyWindow w;
+        for (int i = 1; i <= 100; ++i) w.push((double)i);
+        const LatencySummary s = w.summary();
+        check(s.count == 100 && s.last == 100.0 && s.p50 == 68.0 && s.p95 == 97.0 && s.max == 100.0,
+              "1..100 wrapped: p50 " + std::to_string(s.p50) + " p95 " + std::to_string(s.p95));
+        // Descending: the window holds 64 … 1 and the last value is 1.
+        LatencyWindow d;
+        for (int i = 100; i >= 1; --i) d.push((double)i);
+        const LatencySummary t = d.summary();
+        check(t.last == 1.0 && t.p50 == 32.0 && t.p95 == 61.0 && t.max == 64.0, "100..1 wrapped");
+    }
+    { // nearest-rank helper
+        double one[1] = {7.0};
+        check(latencyPercentile(one, 1, 0.5) == 7.0 && latencyPercentile(one, 1, 0.0) == 7.0, "percentile of 1 value");
+        double four[4] = {1.0, 2.0, 3.0, 4.0};
+        check(latencyPercentile(four, 4, 0.5) == 2.0 && latencyPercentile(four, 4, 0.95) == 4.0
+              && latencyPercentile(four, 4, 1.0) == 4.0, "percentile of 4 values");
+    }
+    { // no allocation in push / summary
+        LatencyWindow w;
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        for (int i = 0; i < 1000; ++i) w.push((double)i);
+        const LatencySummary s = w.summary();
+        tCountAllocs = false;
+        check(gRenderAllocs.load() == 0 && gRenderFrees.load() == 0 && s.max == 999.0, "push / summary allocate");
+    }
+    { // one writer, one reader: every snapshot is consistent (count never goes back, p50 <= p95 <= max,
+      // every value one the writer has written)
+        LatencyWindow w;
+        constexpr int kN = 400000;
+        std::atomic<bool> done{false};
+        std::thread writer([&] {
+            for (int i = 0; i < kN; ++i) w.push((double)i);
+            done.store(true);
+        });
+        uint64_t lastCount = 0;
+        int snapshots = 0, bad = 0;
+        while (!done.load() || snapshots < 10) {
+            const LatencySummary s = w.summary();
+            ++snapshots;
+            if (s.count < lastCount) ++bad;
+            lastCount = s.count;
+            if (s.count == 0) continue;
+            if (!(s.p50 <= s.p95 && s.p95 <= s.max)) ++bad;
+            if (s.max < 0.0 || s.max >= (double)kN || !std::isfinite(s.last)) ++bad;
+        }
+        writer.join();
+        const LatencySummary end = w.summary();
+        check(bad == 0 && end.count == (uint64_t)kN && end.last == kN - 1.0 && end.max == kN - 1.0
+              && end.p50 == kN - 33.0, "writer vs reader: " + std::to_string(bad) + " bad of "
+              + std::to_string(snapshots) + " snapshots");
+    }
+    double handlerMs = -1.0, queueMs = -1.0, touchMs = -1.0;
+    { // the synth records handler / queueToRender / touchToRender for touch-stamped events only
+        TouchLatencyStats stats;
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        synth.setTransport(&transport);
+        synth.setTouchLatency(&stats);
+        synth.setRateAndBufferSizeDetails(48000, 128);
+        synth.prepareToPlay(48000, 128);
+        juce::AudioBuffer<float> buf(2, 128);
+        juce::MidiBuffer midi;
+        const juce::int64 now = juce::Time::getHighResolutionTicks();
+        const juce::int64 ms = juce::Time::secondsToHighResolutionTicks(0.001);
+        // Touch 30 ms ago, handler entered 10 ms ago, pushed now.
+        synth.noteOn(60, 100, now - 30 * ms, now - 10 * ms);
+        synth.noteOn(62, 100);                   // not from a touch: not recorded
+        synth.drumHit(0, 100, now - 30 * ms, 0); // a touch without an entry time: no handler value
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        synth.processBlock(buf, midi);
+        tCountAllocs = false;
+        const uint64_t allocs = gRenderAllocs.load() + gRenderFrees.load();
+        const LatencySummary h = stats.handler.summary(), q = stats.queueToRender.summary(),
+                             t = stats.touchToRender.summary(), d = stats.delivery.summary();
+        handlerMs = h.last; queueMs = q.max; touchMs = t.p50;
+        check(h.count == 1 && h.last >= 10.0 && h.last < 15.0, "handler leg " + std::to_string(h.last));
+        check(q.count == 2 && q.max >= 0.0 && q.max < 50.0, "queueToRender leg count " + std::to_string(q.count));
+        check(t.count == 2 && t.p50 >= 30.0 && t.max < 1000.0 && t.p50 > q.max, "touchToRender leg " + std::to_string(t.p50));
+        check(d.count == 0, "delivery is not the synth's");
+        check(std::abs(synth.diag.lastTouchToRenderMs.load() - t.last) < 1e-6, "lastTouchToRenderMs == touchToRender.last");
+        check(allocs == 0, "render allocations " + std::to_string(allocs));
+    }
+    const bool pass = failed == 0;
+    std::printf("lat   touch latency windows: percentiles, wrap, empty, NaN, writer vs reader, synth legs  %-4s"
+                " %d failed checks; synth legs handler %.2f ms, queue->render max %.2f ms, touch->render p50 %.2f ms%s\n",
+                pass ? "PASS" : "FAIL", failed, handlerMs, queueMs, touchMs, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Main-thread stall window (ios/LatencyStats.h StallWindow): longest gap over the last 10 s, slot
+// reuse after 10 s, the > 50 ms count.
+static bool runStallWindow() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; detail += "; FAIL " + what; }
+    };
+    StallWindow w;
+    check(w.maxGapMs(100.0) == 0.0 && w.stallCount() == 0, "empty");
+    w.addGap(100.2, 16.7);
+    w.addGap(100.5, 80.0);
+    w.addGap(100.6, 50.0); // exactly 50: not a stall
+    check(w.maxGapMs(100.9) == 80.0, "80 within the second");
+    check(w.maxGapMs(109.99) == 80.0, "80 still inside 10 s");
+    check(w.maxGapMs(110.0) == 0.0, "80 out of the window at 110 s: " + std::to_string(w.maxGapMs(110.0)));
+    w.addGap(105.0, 30.0);
+    check(w.maxGapMs(110.5) == 30.0, "30 from second 105");
+    w.addGap(110.1, 20.0); // reuses second 100's slot
+    check(w.maxGapMs(110.2) == 30.0 && w.maxGapMs(115.5) == 20.0, "slot reuse");
+    check(w.maxGapMs(99.0) == 0.0, "a gap after `now` is not counted");
+    w.addGap(111.0, -5.0);
+    w.addGap(111.0, std::numeric_limits<double>::quiet_NaN());
+    check(w.stallCount() == 1 && w.tickCount() == 5, "stall count " + std::to_string(w.stallCount()) + " ticks "
+          + std::to_string(w.tickCount()));
+    const bool pass = failed == 0;
+    std::printf("stall main-thread gap window (10 s) and > 50 ms count  %-4s %d failed checks%s\n",
+                pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+//==============================================================================
+// Device format (ios/DeviceFormat.h) against JUCE's real AudioDeviceManager and a fake device
+// that behaves like juce_Audio_ios.cpp: it lists the sizes granted for 64 (then doubling) and
+// 4096 frames, asks the "route" for (size + 1) frames when it opens, and defaults to 256. The
+// route grants a multiple of `grain` frames between `minFrames` and 4096, at one fixed rate.
+struct FakeRoute { double rate; int grain; int minFrames; };
+static FakeRoute gFakeRoute{48000.0, 1, 16};
+
+static int fakeRouteGrant(int frames) {
+    const int g = std::max(1, gFakeRoute.grain);
+    const int rounded = ((frames + g - 1) / g) * g;
+    return std::clamp(rounded, gFakeRoute.minFrames, 4096);
+}
+
+class IosLikeDevice final : public juce::AudioIODevice {
+public:
+    IosLikeDevice() : AudioIODevice("Out", "IosLike") { listSizes(); }
+    // Like juce_Audio_ios.cpp restart() after a route change: lists the new route's sizes, asks
+    // it for the size the device was opened with (+ 1) and restarts the callback in place.
+    void routeChange() {
+        listSizes();
+        current = fakeRouteGrant(target + 1);
+        if (callback) { callback->audioDeviceStopped(); callback->audioDeviceAboutToStart(this); }
+    }
+    // The device changes size without telling anyone (AudioDeviceManager's stored setup goes stale).
+    void resizeSilently(int frames) { current = frames; }
+    int opens = 0;   // open() calls
+    int xruns = 0;   // restarts at 0 on open(), like the iOS device
+    int getXRunCount() const noexcept override { return xruns; }
+    juce::StringArray getOutputChannelNames() override { return {"L", "R"}; }
+    juce::StringArray getInputChannelNames() override { return {}; }
+    juce::Array<double> getAvailableSampleRates() override { return {gFakeRoute.rate}; }
+    juce::Array<int> getAvailableBufferSizes() override { return sizes; }
+    int getDefaultBufferSize() override { return 256; }
+    juce::String open(const juce::BigInteger&, const juce::BigInteger& outputs, double, int buffer) override {
+        target = buffer > 0 ? buffer : 256;
+        current = fakeRouteGrant(target + 1);
+        outs = outputs;
+        opened = true;
+        ++opens;
+        xruns = 0;
+        return {};
+    }
+    void close() override { stop(); opened = false; }
+    bool isOpen() override { return opened; }
+    void start(juce::AudioIODeviceCallback* cb) override { if (cb) { cb->audioDeviceAboutToStart(this); callback = cb; } }
+    void stop() override { if (callback) { auto* cb = callback; callback = nullptr; cb->audioDeviceStopped(); } }
+    bool isPlaying() override { return callback != nullptr; }
+    juce::String getLastError() override { return {}; }
+    int getCurrentBufferSizeSamples() override { return current; }
+    double getCurrentSampleRate() override { return gFakeRoute.rate; }
+    int getCurrentBitDepth() override { return 32; }
+    juce::BigInteger getActiveOutputChannels() const override { return outs; }
+    juce::BigInteger getActiveInputChannels() const override { return {}; }
+    int getOutputLatencyInSamples() override { return 0; }
+    int getInputLatencyInSamples() override { return 0; }
+private:
+    void listSizes() {
+        sizes.clear();
+        int size = fakeRouteGrant(64 + 1);
+        const int longest = fakeRouteGrant(4096 + 1);
+        while (size <= longest) { sizes.add(size); size *= 2; }
+        sizes.addIfNotAlreadyThere(longest);
+    }
+    juce::Array<int> sizes;
+    int current = 0;
+    int target = 256;
+    bool opened = false;
+    juce::BigInteger outs;
+    juce::AudioIODeviceCallback* callback = nullptr;
+};
+
+class IosLikeType final : public juce::AudioIODeviceType {
+public:
+    IosLikeType() : AudioIODeviceType("IosLike") {}
+    void scanForDevices() override {}
+    juce::StringArray getDeviceNames(bool wantInputNames) const override {
+        return wantInputNames ? juce::StringArray() : juce::StringArray("Out");
+    }
+    int getDefaultDeviceIndex(bool) const override { return 0; }
+    int getIndexOfDevice(juce::AudioIODevice* d, bool asInput) const override { return (d && !asInput) ? 0 : -1; }
+    bool hasSeparateInputsAndOutputs() const override { return true; }
+    juce::AudioIODevice* createDevice(const juce::String& out, const juce::String&) override {
+        return out.isEmpty() || out == "Out" ? new IosLikeDevice() : nullptr;
+    }
+};
+
+static bool runDeviceFormat() {
+    int failed = 0;
+    std::string detail, rows;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; detail += "; FAIL " + what; }
+    };
+    using devicefmt::nearestListedBufferSize;
+    check(nearestListedBufferSize({}, 128) == 128, "empty list");
+    check(nearestListedBufferSize({64, 128, 256}, 128) == 128, "listed");
+    check(nearestListedBufferSize({65, 130, 260}, 128) == 130, "65/130/260 -> 130");
+    check(nearestListedBufferSize({96, 192, 384}, 128) == 96, "96/192 -> 96");
+    check(nearestListedBufferSize({96, 160}, 128) == 160, "tie -> larger");
+    check(nearestListedBufferSize({288, 576}, 128) == 288, "route floor");
+    check(devicefmt::chooseDeviceSampleRate(44100.0, 48000.0) == 44100.0, "hardware rate wins over the hint");
+    check(devicefmt::chooseDeviceSampleRate(48000.0, 44100.0) == 48000.0, "hardware rate wins (2)");
+    check(devicefmt::chooseDeviceSampleRate(0.0, 44100.0) == 44100.0, "hint when the hardware rate is unknown");
+    check(devicefmt::chooseDeviceSampleRate(std::numeric_limits<double>::quiet_NaN(), 0.0) == 48000.0, "default");
+    check(devicefmt::chooseDeviceSampleRate(24000.0, 48000.0) == 48000.0, "a voice rate is not adopted");
+    check(devicefmt::chooseDeviceSampleRate(16000.0, 8000.0) == 48000.0, "nor a voice hint");
+    check(devicefmt::chooseDeviceSampleRate(96000.0, 48000.0) == 96000.0, "96 kHz route");
+    check(std::abs(devicefmt::ioBufferDurationSeconds(128, 44100.0) - 128.0 / 44100.0) < 1e-12
+          && devicefmt::ioBufferDurationSeconds(0, 48000.0) == 0.0 && devicefmt::ioBufferDurationSeconds(128, 0.0) == 0.0,
+          "IO buffer duration");
+
+    struct Scenario { const char* name; FakeRoute route; int wantFirst, wantOldRestart, wantNew; };
+    const Scenario scenarios[] = {
+        // Exact grants at 48 kHz (the built-in speaker of the 2026-10-22 baseline: 256 -> 257).
+        {"48k exact", {48000.0, 1, 16}, 131, 257, 131},
+        // A route with 32-frame steps at 44.1 kHz: JUCE's default 256 + 1 -> 288, as on the device.
+        {"44.1k step 32", {44100.0, 32, 32}, 128, 288, 128},
+        // A route that cannot go below 288 frames: nothing to win, every path lands on the floor
+        // (plus JUCE's extra frame when it asks for 288 itself).
+        {"floor 288", {44100.0, 1, 288}, 288, 289, 288},
+    };
+    for (const Scenario& s : scenarios) {
+        gFakeRoute = s.route;
+        juce::AudioDeviceManager manager;
+        manager.addAudioDeviceType(std::make_unique<IosLikeType>());
+        const juce::String initError = manager.initialise(0, 2, nullptr, true);
+        const devicefmt::OpenResult first = devicefmt::applyPreferredSetup(manager, 128, s.route.rate);
+        auto granted = [&] { auto* d = manager.getCurrentAudioDevice(); return d ? d->getCurrentBufferSizeSamples() : -1; };
+        const int g1 = granted();
+        // The recovery path before this change: close + JUCE's restartLastAudioDevice.
+        manager.closeAudioDevice();
+        manager.restartLastAudioDevice();
+        const int gOld = granted();
+        // The recovery path now.
+        const devicefmt::OpenResult again = devicefmt::reopenWithPreferredSetup(manager, 128, s.route.rate);
+        const int gNew = granted();
+        const double rate = manager.getCurrentAudioDevice() ? manager.getCurrentAudioDevice()->getCurrentSampleRate() : 0.0;
+        check(initError.isEmpty() && first.error.isEmpty() && again.error.isEmpty() && again.reopened,
+              std::string(s.name) + ": errors");
+        check(g1 == s.wantFirst && gOld == s.wantOldRestart && gNew == s.wantNew && rate == s.route.rate,
+              std::string(s.name) + ": got " + std::to_string(g1) + "/" + std::to_string(gOld) + "/" + std::to_string(gNew));
+        rows += std::string("; ") + s.name + ": listed " + std::to_string(first.chosenBufferSize) + " -> " + std::to_string(g1)
+              + ", old restart " + std::to_string(gOld) + ", new " + std::to_string(gNew);
+        manager.closeAudioDevice();
+    }
+    const bool pass = failed == 0;
+    std::printf("bsel  buffer size / rate choice, preferred 128 (first open / old restart / new reopen)  %-4s %d failed checks%s%s\n",
+                pass ? "PASS" : "FAIL", failed, rows.c_str(), detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Route changes (ios/DeviceFormat.h bufferChoiceDrifted / applyPreferredSetup) as the engine's
+// ensurePreferredFormat runs them: speaker -> Bluetooth (1024-frame floor) -> a stale setup ->
+// speaker -> speaker. Checks the device comes back to the preferred size on the speaker, that a
+// no-change request reopens nothing, and that each device's xruns are carried exactly once.
+static bool runDeviceRoutes() {
+    int failed = 0;
+    std::string detail, rows;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; detail += "; FAIL " + what; }
+    };
+    const FakeRoute speaker{48000.0, 1, 16};
+    const FakeRoute bluetooth{48000.0, 1, 1024};
+    gFakeRoute = speaker;
+    juce::AudioDeviceManager manager;
+    manager.addAudioDeviceType(std::make_unique<IosLikeType>());
+    check(manager.initialise(0, 2, nullptr, true).isEmpty(), "initialise");
+    auto dev = [&] { return dynamic_cast<IosLikeDevice*>(manager.getCurrentAudioDevice()); };
+    auto granted = [&] { auto* d = dev(); return d ? d->getCurrentBufferSizeSamples() : -1; };
+    auto opens = [&] { auto* d = dev(); return d ? d->opens : -1; };
+
+    int openedSize = 0;       // ExpoJuceAudioEngine.deviceTargetBufferSize
+    int lastGranted = 0;      // what the 0.9.0-rc.1 draft compared against
+    uint64_t carried = 0;     // sXrunsCarried
+    auto record = [&](const devicefmt::OpenResult& r) {
+        if (r.opened) openedSize = r.targetBufferSize;
+        carried += (uint64_t)r.xrunsBeforeOpen;
+        lastGranted = granted();
+    };
+    // ensurePreferredFormat's buffer half: ask again only when the choice drifted.
+    auto routeCheck = [&](devicefmt::OpenResult& r) {
+        if (!devicefmt::bufferChoiceDrifted(dev()->getAvailableBufferSizes(), 128, openedSize)) return false;
+        r = devicefmt::applyPreferredSetup(manager, 128, 48000.0);
+        record(r);
+        return true;
+    };
+    auto step = [&](const char* name) { rows += std::string("; ") + name + " " + std::to_string(granted()); };
+
+    record(devicefmt::applyPreferredSetup(manager, 128, 48000.0));
+    check(granted() == 131 && openedSize == 130, "speaker: " + std::to_string(granted()));
+    step("speaker");
+
+    // Bluetooth: JUCE's restart in place lands on the route's floor, which is its nearest listed
+    // size. The request equals the stored setup: nothing is reopened, no xruns are carried.
+    gFakeRoute = bluetooth;
+    dev()->routeChange();
+    dev()->xruns = 3;
+    int before = opens();
+    devicefmt::OpenResult r;
+    check(routeCheck(r), "bluetooth: choice drifted from 130");
+    check(!r.opened && r.xrunsBeforeOpen == 0 && opens() == before && dev()->xruns == 3 && granted() == 1024,
+          "bluetooth: no-change request reopened (" + std::to_string(opens() - before) + " opens, "
+          + std::to_string(r.xrunsBeforeOpen) + " xruns)");
+    step("bluetooth");
+
+    // The device changes size behind AudioDeviceManager's back: the same request is stale, so a
+    // new device is opened (at the listed 1024, as a dead-device recovery on Bluetooth would).
+    dev()->resizeSilently(2048);
+    check(routeCheck(r), "stale: choice still drifted");
+    check(r.opened && r.reopened && r.error.isEmpty() && r.xrunsBeforeOpen == 3 && granted() == 1025
+          && openedSize == 1024,
+          "stale: reopened " + std::to_string(r.reopened) + ", xruns " + std::to_string(r.xrunsBeforeOpen) + ", granted "
+          + std::to_string(granted()) + ", opened at " + std::to_string(openedSize));
+    step("stale");
+
+    // Back on the speaker. JUCE restarts in place with the 1024 the device was opened with. The
+    // draft's check (granted > last granted: 1025 > 1025) missed it; the listed choice does not.
+    gFakeRoute = speaker;
+    dev()->routeChange();
+    check(granted() == 1025 && !(granted() > lastGranted), "speaker after bluetooth: JUCE kept 1024 + 1");
+    dev()->xruns = 5;
+    check(routeCheck(r), "speaker after bluetooth: choice drifted from 1024");
+    check(r.opened && !r.reopened && r.xrunsBeforeOpen == 5 && granted() == 131 && openedSize == 130,
+          "speaker after bluetooth: granted " + std::to_string(granted()) + ", xruns " + std::to_string(r.xrunsBeforeOpen));
+    step("speaker again");
+
+    // Another route change on the speaker (e.g. an override): JUCE's restart keeps 130 + 1.
+    dev()->routeChange();
+    before = opens();
+    check(!routeCheck(r) && granted() == 131 && opens() == before, "speaker override: asked again");
+    check(carried == 8, "xruns carried " + std::to_string(carried) + ", want 3 + 5");
+    rows += "; xruns carried " + std::to_string(carried);
+    manager.closeAudioDevice();
+
+    const bool pass = failed == 0;
+    std::printf("broute route changes keep the preferred buffer (granted frames per step)  %-4s %d failed checks%s%s\n",
+                pass ? "PASS" : "FAIL", failed, rows.c_str(), detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the cases named on the command line run (none: every case).
 static std::vector<std::string> gOnlyCases;
 static bool want(const char* id) {
@@ -3701,6 +4096,10 @@ int main(int argc, char** argv) {
     if (want("drb")) unexpected += runDrumBudget() ? 0 : 1;
     if (want("drm")) unexpected += runMidTom() ? 0 : 1;
     if (want("drd")) unexpected += runDrumDefaultsMatchJs() ? 0 : 1;
+    if (want("lat")) unexpected += runLatencyStats() ? 0 : 1;
+    if (want("stall")) unexpected += runStallWindow() ? 0 : 1;
+    if (want("bsel")) unexpected += runDeviceFormat() ? 0 : 1;
+    if (want("broute")) unexpected += runDeviceRoutes() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

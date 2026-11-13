@@ -19,6 +19,12 @@
 + (BOOL)playTestTone:(double)durationMs { return [[ExpoJuceAudioEngine sharedInstance] playTestTone:durationMs]; }
 + (void)startBeatTimer { [[ExpoJuceAudioEngine sharedInstance] startBeatTimer]; }
 + (void)stopBeatTimer { [[ExpoJuceAudioEngine sharedInstance] stopBeatTimer]; }
++ (void)reportTouchPath:(NSArray<NSDictionary<NSString *, id> *> *)entries {
+    [[ExpoJuceAudioEngine sharedInstance] reportTouchPath:entries];
+}
++ (void)reportLastTouch:(NSDictionary<NSString *, id> *)touch {
+    [[ExpoJuceAudioEngine sharedInstance] reportLastTouch:touch];
+}
 
 // ── Synth ──
 + (void)noteOn:(int)note velocity:(int)velocity {
@@ -26,6 +32,9 @@
 }
 + (void)padNoteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
     [[ExpoJuceAudioEngine sharedInstance] noteOn:note velocity:velocity touchTimestamp:touchTimestamp];
+}
++ (void)padNoteOn:(int)note velocity:(int)velocity touchTimestamp:(double)touchTimestamp entryTimestamp:(double)entryTimestamp {
+    [[ExpoJuceAudioEngine sharedInstance] noteOn:note velocity:velocity touchTimestamp:touchTimestamp entryTimestamp:entryTimestamp];
 }
 + (void)noteOff:(int)note {
     [[ExpoJuceAudioEngine sharedInstance] noteOff:note];
@@ -77,6 +86,10 @@
 }
 + (void)padDrumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp {
     [[ExpoJuceAudioEngine sharedInstance] drumHit:voice velocity:velocity touchTimestamp:touchTimestamp];
+}
++ (void)padDrumHit:(int)voice velocity:(int)velocity touchTimestamp:(double)touchTimestamp entryTimestamp:(double)entryTimestamp {
+    [[ExpoJuceAudioEngine sharedInstance] drumHit:voice velocity:velocity touchTimestamp:touchTimestamp
+                                   entryTimestamp:entryTimestamp];
 }
 + (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params {
     return [[ExpoJuceAudioEngine sharedInstance] setDrumVoice:voice params:params];
