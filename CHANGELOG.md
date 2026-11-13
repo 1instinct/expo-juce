@@ -9,7 +9,8 @@
   `preferredFrameRateRange` (80, hz, hz) clamped to the screen's maximum, which keeps a ProMotion
   display at that rate. UIKit delivers touches on display frames, so this is for testing whether
   touch delivery gets shorter at 120 Hz. 0 or 60 removes it. The hint does not need `setup()`,
-  survives engine rebuilds and is cleared when the module that set it goes away. On iPhone the app
+  survives engine rebuilds and is cleared when a module is created (launch, reload) and when the
+  module that set it goes away. On iPhone the app
   must also set `CADisableMinimumFrameDurationOnPhone` in its Info.plist. Returns true when taken;
   false for a non-finite value, on Android (a no-op) and on web.
 - The hint shares the stall probe's display link. That link now runs while the engine is set up

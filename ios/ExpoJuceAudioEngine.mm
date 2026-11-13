@@ -51,6 +51,8 @@ static const int64_t kDeadDeviceCheckMs = 150; // callbackCount must advance wit
 static const int64_t kRebuildRetryDelayMs = 1000;
 static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt + 2 retries, then "failed"
 
+@class ExpoJuceMainDisplayLink;
+
 @interface ExpoJuceAudioEngine ()
 // Absorbs CoreMIDI's one-time XPC initialisation on a background queue so it
 // cannot block the main thread later. See the definition for why.
@@ -85,7 +87,7 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 @property (atomic, copy) NSDictionary<NSString *, id> *lastTouchReport;
 // The main-thread display link (ExpoJuceMainDisplayLink): the stall probe, running while the
 // engine is set up, and the display-rate hint. Created on first use, kept for the process. Main thread.
-@property (nonatomic, strong) id mainDisplayLink;
+@property (nonatomic, strong) ExpoJuceMainDisplayLink *mainDisplayLink;
 // A route-change format check is scheduled (main thread; coalesces bursts of notifications).
 @property (nonatomic, assign) BOOL routeFormatCheckPending;
 // Session safeguard / recovery (main thread only). Counters are cumulative since launch.
@@ -398,14 +400,16 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 - (void)setRateHint:(int)hint;
 @end
 
-// The largest maximumFramesPerSecond of the app's connected screens, 0 when there is none. Main
-// thread. (Through the window scenes: +[UIScreen mainScreen] is deprecated.)
+// The largest maximumFramesPerSecond of the app's connected screens; the main screen's when no
+// window scene is connected yet (early in launch), so a hint is never dropped for want of a
+// scene. Main thread.
 static int mainThreadMaxFramesPerSecond() {
     NSInteger best = 0;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if ([scene isKindOfClass:[UIWindowScene class]])
             best = MAX(best, ((UIWindowScene *)scene).screen.maximumFramesPerSecond);
     }
+    if (best == 0) best = [UIScreen mainScreen].maximumFramesPerSecond; // deprecated in iOS 26, still correct
     return (int)best;
 }
 
@@ -414,6 +418,7 @@ static int mainThreadMaxFramesPerSecond() {
     CFTimeInterval _last;
     BOOL _probing;
     int _hint;
+    displayrate::RateRange _applied; // the range last applied to _link
 }
 
 - (void)setProbing:(BOOL)probing {
@@ -444,6 +449,7 @@ static int mainThreadMaxFramesPerSecond() {
     // The link retains its target until -stopLink invalidates it.
     _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
     _last = 0;
+    _applied = displayrate::RateRange{};
     sDisplayRate.clear();
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self selector:@selector(pause) name:UIApplicationWillResignActiveNotification object:nil];
@@ -462,9 +468,13 @@ static int mainThreadMaxFramesPerSecond() {
     sDisplayLinkTicking.store(false, std::memory_order_relaxed);
 }
 
-// No range (a 60 Hz screen, or its maximum unknown): the link keeps its default.
+// No range (a 60 Hz screen, or its maximum unknown): the link keeps its default. A new range
+// starts the measured rate afresh.
 - (void)applyRange:(displayrate::RateRange)range {
     if (_link == nil || !(range.maximum > 0.0f)) return;
+    if (range.minimum == _applied.minimum && range.maximum == _applied.maximum && range.preferred == _applied.preferred) return;
+    _applied = range;
+    sDisplayRate.clear();
     if (@available(iOS 15.0, *)) {
         _link.preferredFrameRateRange = CAFrameRateRangeMake(range.minimum, range.maximum, range.preferred);
     } else {
@@ -480,6 +490,7 @@ static int mainThreadMaxFramesPerSecond() {
 
 - (void)resume {
     _last = 0;
+    sDisplayRate.clear();
     _link.paused = NO;
     sDisplayLinkTicking.store(_link != nil, std::memory_order_relaxed);
 }
@@ -605,7 +616,7 @@ static int mainThreadMaxFramesPerSecond() {
 // Main thread: the display link, created on first use.
 - (ExpoJuceMainDisplayLink *)ensureMainDisplayLink {
     if (self.mainDisplayLink == nil) self.mainDisplayLink = [[ExpoJuceMainDisplayLink alloc] init];
-    return (ExpoJuceMainDisplayLink *)self.mainDisplayLink;
+    return self.mainDisplayLink;
 }
 
 // Main thread. The stall probe runs from a successful setup until shutdown (rebuilds keep it).
@@ -617,7 +628,7 @@ static int mainThreadMaxFramesPerSecond() {
 // The link stays while the display-rate hint holds the display above 60.
 - (void)stopStallProbe {
     sStallProbeRunning.store(false, std::memory_order_relaxed);
-    [(ExpoJuceMainDisplayLink *)self.mainDisplayLink setProbing:NO];
+    [self.mainDisplayLink setProbing:NO];
 }
 
 // Any thread. The hint is stored now (diagnostics report it) and applied on the main thread,
@@ -1719,14 +1730,21 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
     if (sMidiInputHandlerOwner.isCurrent(token)) sMidiInputListening.store(listening == YES, std::memory_order_release);
 }
 
-- (uint64_t)claimModule { return sModuleOwner.claim(); }
+// A new module (launch or reload) starts without a display-rate hint: an old runtime's hint must
+// not outlive it when the old module's release comes too late to clear it.
+- (uint64_t)claimModule {
+    const uint64_t token = sModuleOwner.claim();
+    [self setDisplayRateHint:0];
+    return token;
+}
 
 - (void)releaseModule:(uint64_t)token {
     if (sModuleOwner.release(token)) {
+        // The display-rate hint belongs to the runtime that set it (cleared first: shutdown can
+        // take a while on the main thread).
+        [self setDisplayRateHint:0];
         [self stopBeatTimer];
         [self shutdown];
-        // The display-rate hint belongs to the runtime that set it.
-        [self setDisplayRateHint:0];
         return;
     }
     // A newer module (a reload) owns the engine and may have set it up already: leave it running

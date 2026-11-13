@@ -528,8 +528,8 @@ frames, so at 120 Hz a touch can reach the app up to about 8 ms sooner than at 6
 `CADisableMinimumFrameDurationOnPhone: true` in its Info.plist, or the display stays at 60.
 
 - Any thread; applied on the main thread. Does not need `setup()`, survives engine rebuilds,
-  pauses while the app is inactive, and is cleared when the module that set it goes away (a
-  reload sets it again from JS).
+  pauses while the app is inactive, and is cleared when a module is created and when the module
+  that set it goes away (after a reload, JS sets it again).
 - With the Info.plist key, every display link in the app (`requestAnimationFrame`, animation
   libraries, GL render loops) may run at the higher rate while the display does. Cap the ones that
   should not (a render loop can draw every other frame).
