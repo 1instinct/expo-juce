@@ -1396,10 +1396,9 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
     entryTimestamp:(double)entryTimestamp {
     const juce::int64 touchTicks = touchTicksFor(touchTimestamp);
     const juce::int64 entryTicks = touchTicksFor(entryTimestamp);
-    // A few stores, counted in the handler leg; the push stays the last step.
+    if (sAcceptingNotes.load(std::memory_order_acquire)) sNoteQueue.pushNoteOn(note, velocity, touchTicks, entryTicks);
+    // After the push, so the handler leg (entry -> push stamp) does not include it.
     recordTouchDelivery(touchTimestamp, entryTimestamp);
-    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
-    sNoteQueue.pushNoteOn(note, velocity, touchTicks, entryTicks);
 }
 
 // Main thread (JucePadView). See the header.
@@ -1682,9 +1681,8 @@ static NSString *backingTrackPath(NSString *uri) {
     entryTimestamp:(double)entryTimestamp {
     const juce::int64 touchTicks = touchTicksFor(touchTimestamp);
     const juce::int64 entryTicks = touchTicksFor(entryTimestamp);
-    recordTouchDelivery(touchTimestamp, entryTimestamp);
-    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
-    sNoteQueue.pushDrumHit(voice, velocity, touchTicks, entryTicks);
+    if (sAcceptingNotes.load(std::memory_order_acquire)) sNoteQueue.pushDrumHit(voice, velocity, touchTicks, entryTicks);
+    recordTouchDelivery(touchTimestamp, entryTimestamp); // after the push (see noteOn)
 }
 
 - (BOOL)setDrumVoice:(int)voice params:(NSDictionary<NSString *, id> *)params {
