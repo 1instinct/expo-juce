@@ -221,6 +221,28 @@ The leg starts at the caller's stamp. A caller that stamps after some processing
 Bluetooth library that has already copied and re-encoded the value before handing it over) reads
 slightly low by that processing; stamp as early as the caller can.
 
+### Display rate and stall cadence (0.9.0-rc.4)
+
+A capture on rc.3 (a ProMotion iPhone, no `CADisableMinimumFrameDurationOnPhone`) put
+`touchDeliveryMs` p50 at 16.6 ms: one 60 Hz frame. UIKit hands touches to the app on display
+frames, so on a display held at 60 Hz a touch waits up to a frame. `setDisplayRateHint(120)`
+(README, "Display-rate hint") keeps the display at 120 Hz through the stall probe's display link,
+which should bring the p50 to about 8 ms. Measure it: capture the legs with the hint on, then
+off, on the same build, and compare `touchDeliveryMs` p50 / p95 and `displayHz`.
+
+- `displayHz` is the link's own rate (median frame duration over 32 ticks). With the hint above
+  60 it shows whether the display really runs at the asked rate. Without a hint the link is held
+  to 60 so that the probe never raises the rate itself; other display links can still run the
+  display faster, so the "off" capture is not a pure 60 Hz control unless nothing else animates.
+- The p95 and max of the delivery leg come from main-thread stalls, not the display rate.
+  `mainThreadStallLog` keeps the last 32 gaps over 50 ms with their start (`atSec`, the
+  `CACurrentMediaTime()` clock; `clockSec` is that clock at the snapshot) and length, and
+  `mainThreadStallIntervalP50Ms` is the median spacing of their starts: a steady spacing (for
+  example about 1000 ms) points at a periodic main-thread job, irregular spacing at work driven by
+  input or rendering. The ring is preallocated; the display-link callback only stores atomics
+  (`ios/LatencyStats.h` `StallLog`, harness case `stlog`; the rate math is `ios/DisplayRate.h`,
+  case `rate`).
+
 ## 6. Slow-motion measurement procedure
 
 Measures finger contact → sound, the only figure that includes the digitizer and the speaker.

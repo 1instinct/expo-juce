@@ -55,6 +55,7 @@ Pod::Spec.new do |s|
     "SpectrumAnalyser.h",
     "DrumMachine.h",
     "LatencyStats.h",
+    "DisplayRate.h",
     "DeviceFormat.h",
     "MidiInput.h",
     "ExpoJuceMidiInput.h", # plain C, but its <stdint.h> include trips check:headers; native callers dlsym it

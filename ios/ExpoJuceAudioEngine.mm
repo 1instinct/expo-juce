@@ -20,6 +20,7 @@
 #include "DrumMachine.h"
 #include "SpectrumAnalyser.h"
 #include "LatencyStats.h"
+#include "DisplayRate.h"
 #include "DeviceFormat.h"
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
@@ -82,8 +83,9 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 // reportTouchPath: / reportLastTouch:).
 @property (atomic, copy) NSArray<NSDictionary<NSString *, id> *> *touchPathReport;
 @property (atomic, copy) NSDictionary<NSString *, id> *lastTouchReport;
-// Main-thread stall probe (a display link), running while the engine is set up.
-@property (nonatomic, strong) id stallProbe;
+// The main-thread display link (ExpoJuceMainDisplayLink): the stall probe, running while the
+// engine is set up, and the display-rate hint. Created on first use, kept for the process. Main thread.
+@property (nonatomic, strong) id mainDisplayLink;
 // A route-change format check is scheduled (main thread; coalesces bursts of notifications).
 @property (nonatomic, assign) BOOL routeFormatCheckPending;
 // Session safeguard / recovery (main thread only). Counters are cumulative since launch.
@@ -200,13 +202,19 @@ static ArpSettingsStore sArpOptions;
 // it once per block. Drum hits themselves go through sNoteQueue like note-ons.
 static DrumParamStore sDrumParams;
 
-// ── Touch latency and main-thread stalls ──
-// Process lifetime, atomics only (LatencyStats.h). sTouchLatency: the delivery window is written
-// on the main thread (JucePadView), the others on the audio thread (PolySynthProcessor). sStalls:
-// written by the stall probe's display link on the main thread.
+// ── Touch latency, main-thread stalls and the display rate ──
+// Process lifetime, atomics only (LatencyStats.h, DisplayRate.h). sTouchLatency: the delivery
+// window is written on the main thread (JucePadView), the others on the audio thread
+// (PolySynthProcessor). sStalls, sStallLog and sDisplayRate: written by the main display link's
+// callback on the main thread. Diagnostics read all of them off the main thread.
 static TouchLatencyStats sTouchLatency;
 static StallWindow sStalls;
-static std::atomic<bool> sStallProbeRunning{false}; // diagnostics read it off the main thread
+static StallLog sStallLog;
+static std::atomic<bool> sStallProbeRunning{false};
+static displayrate::RateWindow sDisplayRate;
+static std::atomic<bool> sDisplayLinkTicking{false}; // the link exists and is not paused
+static std::atomic<int> sDisplayRateHint{0};         // the last hint asked for (sanitized)
+static std::atomic<int> sMaxFramesPerSecond{0};      // the screen's maximum; 0 until first read
 
 // Xruns of devices the engine has closed or reopened since the app's last setup (rebuilds keep
 // counting; AudioDeviceManager's count restarts with every open). Written on the main thread
@@ -374,51 +382,117 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     body(sTransport);
 }
 
-// Main-thread stall probe: a CADisplayLink on the main run loop (common modes, so it also ticks
-// while a scroll view tracks). Each tick records the time since the previous one in sStalls; a
-// long gap means the main thread (where touches are delivered) was busy. Paused while the app is
-// inactive, and the gap across a pause is not counted. Main thread only.
-@interface ExpoJuceStallProbe : NSObject
-- (void)start;
-- (void)stop;
+// The main-thread display link: one CADisplayLink on the main run loop (common modes, so it also
+// ticks while a scroll view tracks) with two jobs.
+//  - Stall probe (while `probing`: from a successful setup until shutdown): each tick records the
+//    time since the previous one in sStalls and sStallLog; a long gap means the main thread (where
+//    touches are delivered) was busy.
+//  - Display-rate hint (setDisplayRateHint): above 60 on a screen that goes faster, the link asks
+//    for (80, hint, hint) clamped to the screen's maximum, which keeps the display at that rate;
+//    otherwise it is held to 60, so the probe alone never raises the display rate.
+// The link exists while either job wants it, and every tick measures its rate (sDisplayRate). The
+// callback stores atomics only: no allocation, no lock. Paused while the app is inactive (created
+// paused when it is not active); the gap across a pause is not counted. Main thread only.
+@interface ExpoJuceMainDisplayLink : NSObject
+- (void)setProbing:(BOOL)probing;
+- (void)setRateHint:(int)hint;
 @end
 
-@implementation ExpoJuceStallProbe {
-    CADisplayLink *_link;
-    CFTimeInterval _last;
+// The largest maximumFramesPerSecond of the app's connected screens, 0 when there is none. Main
+// thread. (Through the window scenes: +[UIScreen mainScreen] is deprecated.)
+static int mainThreadMaxFramesPerSecond() {
+    NSInteger best = 0;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]])
+            best = MAX(best, ((UIWindowScene *)scene).screen.maximumFramesPerSecond);
+    }
+    return (int)best;
 }
 
-- (void)start {
-    if (_link != nil) return;
-    // The link retains its target until -stop invalidates it.
-    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-    [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+@implementation ExpoJuceMainDisplayLink {
+    CADisplayLink *_link;
+    CFTimeInterval _last;
+    BOOL _probing;
+    int _hint;
+}
+
+- (void)setProbing:(BOOL)probing {
+    _probing = probing;
     _last = 0;
+    [self update];
+}
+
+- (void)setRateHint:(int)hint {
+    _hint = hint;
+    [self update];
+}
+
+// Starts, retunes or stops the link for the jobs it has now.
+- (void)update {
+    const int maxFps = mainThreadMaxFramesPerSecond();
+    if (maxFps > 0) sMaxFramesPerSecond.store(maxFps, std::memory_order_relaxed);
+    const displayrate::RateRange range = displayrate::rangeFor(_hint, maxFps);
+    if (!_probing && !range.raised) {
+        [self stopLink];
+        return;
+    }
+    if (_link == nil) [self startLink];
+    [self applyRange:range];
+}
+
+- (void)startLink {
+    // The link retains its target until -stopLink invalidates it.
+    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+    _last = 0;
+    sDisplayRate.clear();
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self selector:@selector(pause) name:UIApplicationWillResignActiveNotification object:nil];
     [center addObserver:self selector:@selector(resume) name:UIApplicationDidBecomeActiveNotification object:nil];
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) _link.paused = YES;
+    [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    sDisplayLinkTicking.store(!_link.paused, std::memory_order_relaxed);
 }
 
-- (void)stop {
+- (void)stopLink {
+    if (_link == nil) return;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [_link invalidate];
     _link = nil;
     _last = 0;
+    sDisplayLinkTicking.store(false, std::memory_order_relaxed);
+}
+
+// No range (a 60 Hz screen, or its maximum unknown): the link keeps its default.
+- (void)applyRange:(displayrate::RateRange)range {
+    if (_link == nil || !(range.maximum > 0.0f)) return;
+    if (@available(iOS 15.0, *)) {
+        _link.preferredFrameRateRange = CAFrameRateRangeMake(range.minimum, range.maximum, range.preferred);
+    } else {
+        _link.preferredFramesPerSecond = (NSInteger)std::lround(range.preferred);
+    }
 }
 
 - (void)pause {
     _link.paused = YES;
     _last = 0;
+    sDisplayLinkTicking.store(false, std::memory_order_relaxed);
 }
 
 - (void)resume {
     _last = 0;
     _link.paused = NO;
+    sDisplayLinkTicking.store(_link != nil, std::memory_order_relaxed);
 }
 
 - (void)tick:(CADisplayLink *)link {
+    sDisplayRate.push(link.targetTimestamp - link.timestamp);
+    if (!_probing) return;
     const CFTimeInterval now = CACurrentMediaTime();
-    if (_last > 0) sStalls.addGap(now, (now - _last) * 1000.0);
+    if (_last > 0) {
+        const double gapMs = (now - _last) * 1000.0;
+        sStalls.addGap(now, gapMs);
+        sStallLog.addGap(now, gapMs);
+    }
     _last = now;
 }
 
@@ -528,17 +602,42 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     return ok;
 }
 
+// Main thread: the display link, created on first use.
+- (ExpoJuceMainDisplayLink *)ensureMainDisplayLink {
+    if (self.mainDisplayLink == nil) self.mainDisplayLink = [[ExpoJuceMainDisplayLink alloc] init];
+    return (ExpoJuceMainDisplayLink *)self.mainDisplayLink;
+}
+
 // Main thread. The stall probe runs from a successful setup until shutdown (rebuilds keep it).
 - (void)startStallProbe {
-    if (self.stallProbe == nil) self.stallProbe = [[ExpoJuceStallProbe alloc] init];
-    [(ExpoJuceStallProbe *)self.stallProbe start];
+    [[self ensureMainDisplayLink] setProbing:YES];
     sStallProbeRunning.store(true, std::memory_order_relaxed);
 }
 
+// The link stays while the display-rate hint holds the display above 60.
 - (void)stopStallProbe {
     sStallProbeRunning.store(false, std::memory_order_relaxed);
-    [(ExpoJuceStallProbe *)self.stallProbe stop];
-    self.stallProbe = nil;
+    [(ExpoJuceMainDisplayLink *)self.mainDisplayLink setProbing:NO];
+}
+
+// Any thread. The hint is stored now (diagnostics report it) and applied on the main thread,
+// which reads the latest one, so a burst of calls ends on the last.
+- (BOOL)setDisplayRateHint:(double)hz {
+    if (!std::isfinite(hz)) return NO;
+    sDisplayRateHint.store(displayrate::sanitizeHint(hz), std::memory_order_relaxed);
+    if ([NSThread isMainThread]) {
+        [self applyDisplayRateHint];
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self applyDisplayRateHint];
+        });
+    }
+    return YES;
+}
+
+// Main thread.
+- (void)applyDisplayRateHint {
+    [[self ensureMainDisplayLink] setRateHint:sDisplayRateHint.load(std::memory_order_relaxed)];
 }
 
 // Main thread, caller holds sEngineLock (LifecycleLock). Builds the engine from the requested
@@ -1471,8 +1570,22 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     };
     d[@"touchPath"] = self.touchPathReport ?: @[];
     d[@"lastTouch"] = self.lastTouchReport ?: @{};
-    d[@"mainThreadMaxGapMs"] = @(sStallProbeRunning.load(std::memory_order_relaxed) ? sStalls.maxGapMs(CACurrentMediaTime()) : 0.0);
+    const double clockSec = CACurrentMediaTime();
+    d[@"mainThreadMaxGapMs"] = @(sStallProbeRunning.load(std::memory_order_relaxed) ? sStalls.maxGapMs(clockSec) : 0.0);
     d[@"mainThreadStalls50"] = @((double)sStalls.stallCount());
+    // The last StallLog::kSize stalls (start on the clockSec clock, length) and their cadence.
+    StallRecord stalls[StallLog::kSize];
+    const int stallCount = sStallLog.copy(stalls);
+    NSMutableArray<NSDictionary<NSString *, id> *> *stallLog = [NSMutableArray arrayWithCapacity:(NSUInteger)stallCount];
+    for (int k = 0; k < stallCount; ++k)
+        [stallLog addObject:@{ @"atSec": @(stalls[k].atSec), @"ms": @(stalls[k].ms) }];
+    d[@"mainThreadStallLog"] = stallLog;
+    d[@"mainThreadStallIntervalP50Ms"] = @(StallLog::intervalP50Ms(stalls, stallCount));
+    d[@"clockSec"] = @(clockSec);
+    // Display rate (DisplayRate.h): the main display link's measured rate, 0 while it is not ticking.
+    d[@"displayHz"] = @(sDisplayLinkTicking.load(std::memory_order_relaxed) ? sDisplayRate.medianHz() : 0.0);
+    d[@"maxFramesPerSecond"] = @(sMaxFramesPerSecond.load(std::memory_order_relaxed));
+    d[@"displayRateHint"] = @(sDisplayRateHint.load(std::memory_order_relaxed));
 
     return d;
 }
@@ -1612,6 +1725,8 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
     if (sModuleOwner.release(token)) {
         [self stopBeatTimer];
         [self shutdown];
+        // The display-rate hint belongs to the runtime that set it.
+        [self setDisplayRateHint:0];
         return;
     }
     // A newer module (a reload) owns the engine and may have set it up already: leave it running

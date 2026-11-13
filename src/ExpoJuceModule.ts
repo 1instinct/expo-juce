@@ -29,6 +29,9 @@ export type ExpoJuceNativeModule = {
   getDiagnostics(): AudioDiagnostics;
   playTestTone(durationMs: number): boolean;
 
+  // Display-rate hint (0.9.0-rc.4+; iOS applies it, Android returns false)
+  setDisplayRateHint?(hz: number): boolean;
+
   // Synth
   noteOn(note: number, velocity: number): void;
   noteOff(note: number): void;

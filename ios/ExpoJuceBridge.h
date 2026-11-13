@@ -21,6 +21,8 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (NSDictionary<NSString *, id> *)getDiagnostics NS_SWIFT_NAME(getDiagnostics());
 // Returns NO if not queued (engine not ready / device not playing).
 + (BOOL)playTestTone:(double)durationMs NS_SWIFT_NAME(playTestTone(durationMs:));
+// See ExpoJuceAudioEngine.h. Any thread. Swift: `setDisplayRateHint(_:) -> Bool`.
++ (BOOL)setDisplayRateHint:(double)hz NS_SWIFT_NAME(setDisplayRateHint(_:));
 + (void)startBeatTimer;
 + (void)stopBeatTimer;
 // Touch path diagnostics from JucePadView (main thread): see ExpoJuceAudioEngine.h.

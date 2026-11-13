@@ -112,6 +112,14 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.playTestTone(durationMs: durationMs)
     }
 
+    // ── Display rate ───────────────────────────────────────────────
+    // hz above 60 keeps a ProMotion display at that rate (0 or 60: no hint). Stored now, applied on
+    // the main thread; false only for a non-finite hz.
+
+    Function("setDisplayRateHint") { (hz: Double) -> Bool in
+      return ExpoJuceBridge.setDisplayRateHint(hz)
+    }
+
     // ── Synth (MIDI-style) ─────────────────────────────────────────
     // Thread-safe: PolySynthProcessor uses a lock-free SPSC queue
 

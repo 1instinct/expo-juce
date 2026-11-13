@@ -16,6 +16,7 @@
 #include "SpectrumAnalyser.h"
 #include "DrumMachine.h"
 #include "LatencyStats.h"
+#include "DisplayRate.h"
 #include "DeviceFormat.h"
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
@@ -3760,6 +3761,132 @@ static bool runStallWindow() {
     return pass;
 }
 
+// Main-thread stall log (ios/LatencyStats.h StallLog): only gaps over 50 ms, start = end − gap,
+// the last 32 kept oldest first, the median interval between starts, no allocation in addGap /
+// copy / intervalP50Ms.
+static bool runStallLog() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; if (detail.size() < 600) detail += "; FAIL " + what; }
+    };
+    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
+    StallRecord out[StallLog::kSize];
+    {
+        StallLog log;
+        check(log.copy(out) == 0 && StallLog::intervalP50Ms(out, 0) == 0.0, "empty");
+        log.addGap(10.0, 16.7);
+        log.addGap(10.5, 50.0); // exactly 50: not a stall
+        log.addGap(11.0, 100.0);
+        log.addGap(11.0, std::numeric_limits<double>::quiet_NaN());
+        log.addGap(std::numeric_limits<double>::infinity(), 80.0);
+        const int n = log.copy(out);
+        check(n == 1 && near(out[0].atSec, 10.9) && out[0].ms == 100.0,
+              "one stall at 10.9 s: n " + std::to_string(n) + " at " + std::to_string(n ? out[0].atSec : -1.0));
+        check(StallLog::intervalP50Ms(out, n) == 0.0, "one stall has no interval");
+    }
+    { // a stall every 3 s (one 1 s off): median 3000 ms
+        StallLog log;
+        const double ends[] = {100.0, 103.0, 106.0, 107.0, 110.0, 113.0};
+        for (double e : ends) log.addGap(e, 90.0);
+        const int n = log.copy(out);
+        const double p50 = StallLog::intervalP50Ms(out, n);
+        check(n == 6 && near(p50, 3000.0), "every 3 s: p50 " + std::to_string(p50));
+        check(near(out[0].atSec, 99.91) && near(out[5].atSec, 112.91), "oldest first");
+    }
+    { // wrap-around: 40 stalls 1 s apart keep the last 32 (starts 8 … 39 s, minus the gap)
+        StallLog log;
+        for (int i = 0; i < 40; ++i) log.addGap((double)i + 0.1, 60.0 + i);
+        const int n = log.copy(out);
+        check(n == StallLog::kSize && log.count() == 40, "kept 32 of 40");
+        check(near(out[0].atSec, 8.1 - 0.068) && out[0].ms == 68.0 && out[31].ms == 99.0, "wrap keeps the newest, oldest first");
+        const double p50 = StallLog::intervalP50Ms(out, n);
+        check(std::fabs(p50 - 999.0) < 1e-3, "1 s apart, lengths 1 ms longer each: 999 ms: p50 " + std::to_string(p50));
+    }
+    { // intervals that are not positive (a reader racing the writer) are skipped
+        StallRecord r[3] = {{5.0, 60.0}, {4.0, 60.0}, {7.0, 60.0}};
+        check(near(StallLog::intervalP50Ms(r, 3), 3000.0), "negative interval skipped");
+    }
+    { // no allocation
+        StallLog log;
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        for (int i = 0; i < 1000; ++i) log.addGap((double)i, 51.0 + (i % 7));
+        const int n = log.copy(out);
+        const double p50 = StallLog::intervalP50Ms(out, n);
+        tCountAllocs = false;
+        check(gRenderAllocs.load() == 0 && gRenderFrees.load() == 0 && n == 32 && p50 > 0.0, "addGap / copy / p50 allocate");
+    }
+    const bool pass = failed == 0;
+    std::printf("stlog main-thread stall log (last 32 over 50 ms) and median interval  %-4s %d failed checks%s\n",
+                pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Display rate (ios/DisplayRate.h): the hint's sanitizing, the link's frame-rate range per hint and
+// screen, and the measured rate (median frame duration over the last 32 ticks). No allocation.
+static bool runDisplayRate() {
+    using namespace displayrate;
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) {
+        if (!ok) { ++failed; if (detail.size() < 600) detail += "; FAIL " + what; }
+    };
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    check(sanitizeHint(0) == 0 && sanitizeHint(-5) == 0 && sanitizeHint(nan) == 0 && sanitizeHint(inf) == 0
+          && sanitizeHint(120) == 120 && sanitizeHint(119.6) == 120 && sanitizeHint(1000) == 240 && sanitizeHint(60) == 60,
+          "sanitizeHint");
+    auto same = [](const RateRange& r, bool raised, float mn, float mx, float pf) {
+        return r.raised == raised && r.minimum == mn && r.maximum == mx && r.preferred == pf;
+    };
+    check(same(rangeFor(120, 120), true, 80, 120, 120), "120 on a 120 Hz screen: (80, 120, 120)");
+    check(same(rangeFor(240, 120), true, 80, 120, 120), "240 clamped to the screen");
+    check(same(rangeFor(90, 120), true, 80, 90, 90), "90: (80, 90, 90)");
+    check(same(rangeFor(72, 120), true, 72, 72, 72), "72: minimum not above the target");
+    check(same(rangeFor(0, 120), false, 60, 60, 60), "no hint on ProMotion: held to 60");
+    check(same(rangeFor(60, 120), false, 60, 60, 60), "60 on ProMotion: held to 60");
+    check(same(rangeFor(61, 120), true, 61, 61, 61), "61 raises");
+    check(same(rangeFor(120, 60), false, 0, 0, 0), "60 Hz screen: no range (default)");
+    check(same(rangeFor(120, 0), false, 0, 0, 0), "unknown screen: no range");
+    check(same(rangeFor(0, 60), false, 0, 0, 0), "no hint on 60 Hz: no range");
+    {
+        RateWindow w;
+        check(w.medianHz() == 0.0, "empty: 0 Hz");
+        for (int i = 0; i < 10; ++i) w.push(1.0 / 120.0);
+        check(w.medianHz() == 120.0, "120 Hz: " + std::to_string(w.medianHz()));
+        w.push(nan); w.push(-1.0); w.push(0.0); w.push(2.0); w.push(inf);
+        check(w.medianHz() == 120.0, "invalid durations ignored");
+        for (int i = 0; i < 9; ++i) w.push(1.0 / 60.0); // 10 at 120, 9 at 60: median still 120
+        check(w.medianHz() == 120.0, "10 of 19 at 120: " + std::to_string(w.medianHz()));
+        for (int i = 0; i < 32; ++i) w.push(1.0 / 60.0);
+        check(w.medianHz() == 60.0, "window turned over to 60: " + std::to_string(w.medianHz()));
+        w.clear();
+        check(w.medianHz() == 0.0, "cleared");
+        w.push(1.0 / 120.0); w.push(1.0 / 80.0);
+        check(w.medianHz() == 96.0, "two values: mean of the durations (10.42 ms → 96 Hz): " + std::to_string(w.medianHz()));
+        w.clear();
+        w.push(1.0 / 59.94);
+        check(w.medianHz() == 59.9, "rounded to 0.1 Hz: " + std::to_string(w.medianHz()));
+    }
+    { // no allocation
+        RateWindow w;
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        tCountAllocs = true;
+        for (int i = 0; i < 1000; ++i) w.push(i % 2 ? 1.0 / 120.0 : 1.0 / 60.0);
+        const double hz = w.medianHz();
+        const RateRange r = rangeFor(sanitizeHint(120.0), 120);
+        tCountAllocs = false;
+        check(gRenderAllocs.load() == 0 && gRenderFrees.load() == 0 && hz > 0.0 && r.raised, "push / medianHz allocate");
+    }
+    const bool pass = failed == 0;
+    std::printf("rate  display-rate hint range and measured rate (median of 32)  %-4s %d failed checks%s\n",
+                pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 //==============================================================================
 // Device format (ios/DeviceFormat.h) against JUCE's real AudioDeviceManager and a fake device
 // that behaves like juce_Audio_ios.cpp: it lists the sizes granted for 64 (then doubling) and
@@ -4777,6 +4904,8 @@ int main(int argc, char** argv) {
     if (want("drd")) unexpected += runDrumDefaultsMatchJs() ? 0 : 1;
     if (want("lat")) unexpected += runLatencyStats() ? 0 : 1;
     if (want("stall")) unexpected += runStallWindow() ? 0 : 1;
+    if (want("stlog")) unexpected += runStallLog() ? 0 : 1;
+    if (want("rate")) unexpected += runDisplayRate() ? 0 : 1;
     if (want("bsel")) unexpected += runDeviceFormat() ? 0 : 1;
     if (want("broute")) unexpected += runDeviceRoutes() ? 0 : 1;
     if (want("mip")) unexpected += runMidiParsers() ? 0 : 1;
