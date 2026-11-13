@@ -47,6 +47,25 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 - (void)noteOff:(int)note;
 - (void)allNotesOff;
 
+// MIDI byte input (MidiInput.h; native code calls expojuce_midi_input_bytes, ExpoJuceMidiInput.h).
+// Any thread, before setup and across rebuilds.
+// actions: 128 numbers, per input note: -1 pass to the app, 0–127 play that synth note, 256 + v hit
+// drum voice v (0–8); anything else passes. velocity: 128 numbers, input velocity → played velocity
+// (clamped 1–127), nil = identity. NO (nothing applied) unless both have 128 entries.
+- (BOOL)setMidiInputMapActions:(NSArray<NSNumber *> *)actions velocity:(NSArray<NSNumber *> *)velocity;
+// Off (the default): every note-on passes to the app; note-offs still release the input's holds.
+- (void)setMidiInputEnabled:(BOOL)enabled;
+// Ends every hold the input started (the device went away); returns the new epoch.
+- (int)releaseMidiInputHolds;
+// Now, in seconds on the input's arrival clock (CACurrentMediaTime()).
+- (double)midiInputClock;
+// The C entry point with bytes from JS (at most 512). arrival <= 0 = now. Messages parsed, -1 = bad format.
+- (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds;
+// Receives { events, now, epoch } batches on a background queue (nil = none).
+- (void)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *batch))handler;
+// &expojuce_midi_input_bytes, for native callers that look it up through the Objective-C runtime.
++ (void *)midiInputBytesFunction;
+
 // Global synth params
 - (void)setWaveform:(NSString *)waveform;
 - (void)setFilterCutoff:(double)hz;

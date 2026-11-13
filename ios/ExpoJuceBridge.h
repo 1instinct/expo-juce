@@ -38,6 +38,20 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (void)noteOff:(int)note;
 + (void)allNotesOff;
 
+// ── MIDI byte input ──────────────────────────────────────────────
+// See ExpoJuceAudioEngine.h / ExpoJuceMidiInput.h. Any thread.
++ (BOOL)setMidiInputMapActions:(NSArray<NSNumber *> *)actions velocity:(nullable NSArray<NSNumber *> *)velocity NS_SWIFT_NAME(setMidiInputMap(actions:velocity:));
++ (void)setMidiInputEnabled:(BOOL)enabled NS_SWIFT_NAME(setMidiInputEnabled(_:));
++ (int)releaseMidiInputHolds NS_SWIFT_NAME(releaseMidiInputHolds());
++ (double)midiInputClock NS_SWIFT_NAME(midiInputClock());
++ (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds NS_SWIFT_NAME(midiInputBytes(_:format:arrival:));
+// `handler` runs on a background serial queue with { events, now, epoch }; nil removes it.
++ (void)setMidiInputHandler:(nullable void (^)(NSDictionary<NSString *, id> *batch))handler NS_SWIFT_NAME(setMidiInputHandler(_:));
+// The address of expojuce_midi_input_bytes (ExpoJuceMidiInput.h), for native code that finds it
+// through the Objective-C runtime (NSClassFromString(@"ExpoJuceBridge")) when dlsym cannot, e.g.
+// in an executable whose global symbols were stripped.
++ (void *)midiInputBytesFunction NS_SWIFT_NAME(midiInputBytesFunction());
+
 // ── Global Synth Params ──────────────────────────────────────────
 + (void)setWaveform:(NSString *)waveform;
 + (void)setFilterCutoff:(double)hz;

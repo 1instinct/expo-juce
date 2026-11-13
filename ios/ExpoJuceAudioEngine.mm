@@ -21,6 +21,8 @@
 #include "SpectrumAnalyser.h"
 #include "LatencyStats.h"
 #include "DeviceFormat.h"
+#include "MidiInput.h"
+#include "ExpoJuceMidiInput.h"
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -215,6 +217,92 @@ static void carryXrunsLocked() {
     const int count = sDeviceManager->getXRunCount();
     if (count > 0) sXrunsCarried.fetch_add((uint64_t)count, std::memory_order_relaxed);
 }
+
+// ── MIDI byte input (MidiInput.h, ExpoJuceMidiInput.h) ──
+// Process lifetime like the note queue it feeds: native code may call expojuce_midi_input_bytes
+// from any thread at any time, before setup and across rebuilds (note-ons play only while
+// sAcceptingNotes). Heap-allocated and never freed, so a call during process exit never finds it
+// destroyed. Events for JS are drained on sMidiInputQueue (serial), at most ~4 ms after the first
+// one of a burst, into one onMidiInput batch; the handler is only touched on that queue.
+static midiin::NoteQueueSink sMidiInputSink(sNoteQueue, &sAcceptingNotes);
+static midiin::MidiInput& sMidiInput = *new midiin::MidiInput(sMidiInputSink);
+static LatencyWindow sMidiInputLatency; // arrival -> render, written by the audio thread
+static void (^sMidiInputHandler)(NSDictionary<NSString *, id> *) = nil;
+static const int64_t kMidiInputFlushNs = 4 * (int64_t)NSEC_PER_MSEC;
+
+static dispatch_queue_t midiInputQueue() {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                                             QOS_CLASS_USER_INTERACTIVE, 0);
+        queue = dispatch_queue_create("expo-juce.midi-input", attr);
+    });
+    return queue;
+}
+
+static NSDictionary<NSString *, id> *midiInputEventDictionary(const midiin::Event& e) {
+    NSMutableDictionary<NSString *, id> *d = [NSMutableDictionary dictionaryWithCapacity:12];
+    const midiin::Message& m = e.message;
+    switch (m.type) {
+        case midiin::kNoteOn:
+        case midiin::kNoteOff:
+            d[@"type"] = m.type == midiin::kNoteOn ? @"noteOn" : @"noteOff";
+            d[@"note"] = @(m.data1);
+            d[@"velocity"] = @(m.data2);
+            break;
+        case midiin::kPolyPressure:
+            d[@"type"] = @"polyPressure";
+            d[@"note"] = @(m.data1);
+            d[@"pressure"] = @(m.data2);
+            break;
+        case midiin::kControlChange:
+            d[@"type"] = @"cc";
+            d[@"controller"] = @(m.data1);
+            d[@"value"] = @(m.data2);
+            break;
+        default:
+            d[@"type"] = @"pitchBend";
+            d[@"value"] = @(m.value);
+            break;
+    }
+    d[@"channel"] = @(m.channel);
+    d[@"arrival"] = @(e.arrival);
+    d[@"epoch"] = @(e.epoch);
+    d[@"played"] = @((e.flags & midiin::kEventPlayed) != 0);
+    if (e.out >= 0) {
+        d[@"part"] = (e.flags & midiin::kEventDrum) ? @"drums" : @"synth";
+        d[@"out"] = @(e.out);
+        if (m.type == midiin::kNoteOn) d[@"outVelocity"] = @(e.outVelocity);
+    }
+    if (e.flags & midiin::kEventLast) d[@"last"] = @YES;
+    if (e.flags & midiin::kEventSynthetic) d[@"synthetic"] = @YES;
+    return d;
+}
+
+// sMidiInputQueue: every event recorded so far, as one batch for the handler (dropped if none).
+static void flushMidiInputEvents(void *) {
+    @autoreleasepool {
+        sMidiInput.beginDrain();
+        NSMutableArray<NSDictionary<NSString *, id> *> *events = [NSMutableArray array];
+        sMidiInput.drainEvents([&](const midiin::Event& e) { [events addObject:midiInputEventDictionary(e)]; });
+        void (^handler)(NSDictionary<NSString *, id> *) = sMidiInputHandler;
+        if (events.count == 0 || handler == nil) return;
+        handler(@{
+            @"events": events,
+            @"now": @(midiin::NoteQueueSink::nowSeconds()),
+            @"epoch": @(sMidiInput.epoch()),
+        });
+    }
+}
+
+static void scheduleMidiInputFlush() {
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, kMidiInputFlushNs), midiInputQueue(), nullptr,
+                     flushMidiInputEvents);
+}
+
+// The C entry point (ExpoJuceMidiInput.mm) feeds sMidiInput from static initialisation on.
+__attribute__((unused)) static const bool sMidiInputInstalled = (midiin::installEntryPoint(&sMidiInput, scheduleMidiInputFlush), true);
 
 static dispatch_queue_t backingTrackQueue() {
     static dispatch_queue_t queue;
@@ -565,6 +653,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     sSynth->setNoteQueue(&sNoteQueue);
     sSynth->setAnalysis(&sAnalysis);
     sSynth->setTouchLatency(&sTouchLatency);      // process-lifetime windows, kept across rebuilds
+    sSynth->setInputLatency(&sMidiInputLatency); // same, MIDI input arrival -> render
     sSynth->arp().setSettingsStore(&sArpOptions); // the live options, before and across rebuilds
     sSynth->drums().setParamStore(&sDrumParams);  // same for the drum part
 
@@ -843,7 +932,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     NSLog(@"[ExpoJuceAudioEngine] Shutting down...");
     {
         LifecycleLock lifecycle;
-        sNoteQueue.pushAllNotesOff();
+        sMidiInput.allNotesOff(); // releases the queue; the MIDI input forgets its holds
         [self teardownEngineLocked];
     }
     NSLog(@"[ExpoJuceAudioEngine] Shutdown complete");
@@ -1129,7 +1218,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     BOOL ok = NO;
     {
         LifecycleLock lifecycle;
-        sNoteQueue.pushAllNotesOff();
+        sMidiInput.allNotesOff(); // releases the queue; the MIDI input forgets its holds
         [self teardownEngineLocked];
         ok = [self setupEngineLocked];
         if (ok) {
@@ -1344,7 +1433,25 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
     touchLatency[@"touchToRenderMs"] = leg(sTouchLatency.touchToRender);
     touchLatency[@"bufferMs"] = @(sampleRate > 0.0 ? (double)bufferSize * 1000.0 / sampleRate : 0.0);
     touchLatency[@"outputLatencyMs"] = @(session.outputLatency * 1000.0);
+    touchLatency[@"midiInputToRenderMs"] = leg(sMidiInputLatency);
     d[@"touchLatency"] = touchLatency;
+
+    // MIDI byte input (MidiInput.h): its counters and the arrival -> render leg.
+    const midiin::Stats midi = sMidiInput.stats();
+    d[@"midiInput"] = @{
+        @"enabled": @(sMidiInput.enabled()),
+        @"mapVersion": @(sMidiInput.map().version()),
+        @"packets": @((double)midi.packets),
+        @"messages": @((double)midi.messages),
+        @"played": @((double)midi.played),
+        @"passed": @((double)midi.passed),
+        @"dropped": @((double)midi.dropped),
+        @"rejectedPackets": @((double)midi.rejectedPackets),
+        @"eventsDropped": @((double)midi.eventsDropped),
+        @"held": @(midi.held),
+        @"epoch": @(sMidiInput.epoch()),
+        @"midiInputToRenderMs": leg(sMidiInputLatency),
+    };
     d[@"touchPath"] = self.touchPathReport ?: @[];
     d[@"lastTouch"] = self.lastTouchReport ?: @{};
     d[@"mainThreadMaxGapMs"] = @(sStallProbeRunning.load(std::memory_order_relaxed) ? sStalls.maxGapMs(CACurrentMediaTime()) : 0.0);
@@ -1371,7 +1478,7 @@ static void withTransport(ExpoJuceAudioEngine *engine, void (^body)(TransportEng
 
 - (void)noteOn:(int)note velocity:(int)velocity {
     if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
-    sNoteQueue.pushNoteOn(note, velocity);
+    if (sNoteQueue.pushNoteOn(note, velocity)) sMidiInput.externalNoteOn(std::clamp(note, 0, 127));
 }
 
 // UITouch.timestamp and CACurrentMediaTime() are both seconds on the mach_absolute_time clock
@@ -1396,7 +1503,10 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
     entryTimestamp:(double)entryTimestamp {
     const juce::int64 touchTicks = touchTicksFor(touchTimestamp);
     const juce::int64 entryTicks = touchTicksFor(entryTimestamp);
-    if (sAcceptingNotes.load(std::memory_order_acquire)) sNoteQueue.pushNoteOn(note, velocity, touchTicks, entryTicks);
+    if (sAcceptingNotes.load(std::memory_order_acquire)
+        && sNoteQueue.pushNoteOn(note, velocity, touchTicks, entryTicks)) {
+        sMidiInput.externalNoteOn(std::clamp(note, 0, 127));
+    }
     // After the push, so the handler leg (entry -> push stamp) does not include it.
     recordTouchDelivery(touchTimestamp, entryTimestamp);
 }
@@ -1414,8 +1524,48 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
 
 // Releases are always recorded, ready or not: a release must reach a voice that is still
 // sounding whatever the engine is doing (a mark with nothing to release is harmless).
-- (void)noteOff:(int)note { sNoteQueue.pushNoteOff(note); }
-- (void)allNotesOff { sNoteQueue.pushAllNotesOff(); }
+- (void)noteOff:(int)note {
+    sNoteQueue.pushNoteOff(note);
+    sMidiInput.externalNoteOff(note);
+}
+// The MIDI input forgets its holds under its own lock, so none of its note-ons slips past this.
+- (void)allNotesOff { sMidiInput.allNotesOff(); }
+
+// ── MIDI byte input ──
+// Lock-free for the map (MidiInput.h); the rest takes the input's short spinlock. Any thread,
+// before setup and across rebuilds.
+
+- (BOOL)setMidiInputMapActions:(NSArray<NSNumber *> *)actions velocity:(NSArray<NSNumber *> *)velocity {
+    if (actions.count != 128 || (velocity != nil && velocity.count != 128)) return NO;
+    int a[128], v[128];
+    for (NSUInteger i = 0; i < 128; ++i) {
+        a[i] = [actions[i] isKindOfClass:[NSNumber class]] ? actions[i].intValue : midiin::InputMap::kPass;
+        v[i] = (velocity != nil && [velocity[i] isKindOfClass:[NSNumber class]]) ? velocity[i].intValue : (int)i;
+    }
+    sMidiInput.map().set(a, v);
+    return YES;
+}
+
+- (void)setMidiInputEnabled:(BOOL)enabled { sMidiInput.setEnabled(enabled == YES); }
+
+- (int)releaseMidiInputHolds { return (int)sMidiInput.releaseAll(); }
+
+- (double)midiInputClock { return midiin::NoteQueueSink::nowSeconds(); }
+
+- (int)midiInputBytes:(NSArray<NSNumber *> *)bytes format:(int)format arrival:(double)arrivalSeconds {
+    uint8_t buffer[512];
+    const NSUInteger count = MIN(bytes.count, (NSUInteger)sizeof(buffer));
+    for (NSUInteger i = 0; i < count; ++i)
+        buffer[i] = [bytes[i] isKindOfClass:[NSNumber class]] ? (uint8_t)(bytes[i].intValue & 0xFF) : 0;
+    return expojuce_midi_input_bytes(buffer, (size_t)count, format, arrivalSeconds);
+}
+
+- (void)setMidiInputHandler:(void (^)(NSDictionary<NSString *, id> *))handler {
+    void (^copied)(NSDictionary<NSString *, id> *) = [handler copy];
+    dispatch_async(midiInputQueue(), ^{ sMidiInputHandler = copied; });
+}
+
++ (void *)midiInputBytesFunction { return (void *)&expojuce_midi_input_bytes; }
 
 - (void)setWaveform:(NSString *)waveform {
     Waveform wf = Waveform::Sine;
