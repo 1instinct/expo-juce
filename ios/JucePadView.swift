@@ -262,17 +262,22 @@ class JucePadView: ExpoView {
     JucePadView.lastTouchReportTime = entryTimestamp
     let point = touch.location(in: window)
     let bounds = window.bounds
-    let recognizers = (touch.gestureRecognizers ?? []).prefix(30).map { JucePadView.describe($0) }
-    ExpoJuceBridge.reportLastTouch([
-      "deliveryMs": (entryTimestamp - touch.timestamp) * 1000.0,
+    let recognizers: [[String: Any]] = (touch.gestureRecognizers ?? []).prefix(30).map { JucePadView.describe($0) }
+    // Typed locals keep the dictionary literal below cheap to type-check.
+    let deliveryMs: Double = (entryTimestamp - touch.timestamp) * 1000.0
+    let horizontalEdge: CGFloat = min(point.x - bounds.minX, bounds.maxX - point.x)
+    let verticalEdge: CGFloat = min(point.y - bounds.minY, bounds.maxY - point.y)
+    let edgeDistance: Double = Double(min(horizontalEdge, verticalEdge))
+    let report: [String: Any] = [
+      "deliveryMs": deliveryMs,
       "x": Double(point.x),
       "y": Double(point.y),
       "windowWidth": Double(bounds.width),
       "windowHeight": Double(bounds.height),
-      "edgeDistance": Double(min(point.x - bounds.minX, bounds.maxX - point.x,
-                                 point.y - bounds.minY, bounds.maxY - point.y)),
-      "recognizers": Array(recognizers),
-    ])
+      "edgeDistance": edgeDistance,
+      "recognizers": recognizers,
+    ]
+    ExpoJuceBridge.reportLastTouch(report)
   }
 
   // MARK: - Notes
