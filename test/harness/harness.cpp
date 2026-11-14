@@ -14,6 +14,8 @@
 #include "AnalysisRing.h"
 #include "Arpeggiator.h"
 #include "SpectrumAnalyser.h"
+#include "SourceRing.h"
+#include "SourceAnalysis.h"
 #include "DrumMachine.h"
 #include "LatencyStats.h"
 #include "DisplayRate.h"
@@ -2443,6 +2445,507 @@ static bool runAnalysis() {
                 " scope max err %.2g, peak %.4f (want %.4f), rms %.4f (want %.4f), then %.1f/%.1f, mono rms %.4f,"
                 " transport %d, allocs %llu\n", pass ? "PASS" : "FAIL", maxErr, first.peak, wantPeak, first.rms, wantRms,
                 empty.peak, empty.rms, monoLevels.rms, transportOk, (unsigned long long)gRenderAllocs.load());
+    std::fflush(stdout);
+    return pass;
+}
+
+//==============================================================================
+// Per-source analysis (ios/SourceRing.h, ios/SourceAnalysis.h): the instrument tap at the end of
+// FxChainProcessor, the backing-track tap inside AuxProcessor, and the reader-side analysis.
+
+// The engine's graph (synth → fx → output, aux → output) with or without the source taps.
+struct SourceRig {
+    TransportEngine transport;
+    FxParamStore fxParams;
+    AuxSettingsStore auxSettings;
+    BackingTrack holder;
+    SourceRing instrument, backing;
+    PolySynthProcessor* synth = nullptr;
+    AuxProcessor* aux = nullptr;
+    juce::AudioProcessorGraph* graph = nullptr;
+    double sr;
+    int block;
+    std::vector<float> outL, outR; // everything rendered so far
+
+    SourceRig(bool taps, double rate = 48000.0, int blockSize = 256) : sr(rate), block(blockSize) {
+        graph = new juce::AudioProcessorGraph();
+        graph->setPlayConfigDetails(0, 2, sr, block);
+        auto s = std::make_unique<PolySynthProcessor>();
+        synth = s.get();
+        s->setTransport(&transport);
+        auto sn = graph->addNode(std::move(s));
+        auto f = std::make_unique<FxChainProcessor>();
+        f->setParamStore(&fxParams);
+        f->setTransport(&transport);
+        if (taps) f->setSourceRing(&instrument);
+        auto fn = graph->addNode(std::move(f));
+        auto a = std::make_unique<AuxProcessor>();
+        aux = a.get();
+        a->setSettings(&auxSettings);
+        a->setBackingTrack(&holder);
+        a->setTransport(&transport);
+        if (taps) a->setSourceRing(&backing);
+        auto an = graph->addNode(std::move(a));
+        auto on = graph->addNode(std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
+            juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
+        for (int ch = 0; ch < 2; ++ch) {
+            graph->addConnection({{sn->nodeID, ch}, {fn->nodeID, ch}});
+            graph->addConnection({{fn->nodeID, ch}, {on->nodeID, ch}});
+            graph->addConnection({{an->nodeID, ch}, {on->nodeID, ch}});
+        }
+        graph->prepareToPlay(sr, block);
+    }
+    ~SourceRig() { delete graph; }
+
+    void render(int samples) {
+        juce::AudioBuffer<float> buf(2, block);
+        juce::MidiBuffer midi;
+        for (int done = 0; done < samples; done += block) {
+            buf.clear();
+            tCountAllocs = true;
+            graph->processBlock(buf, midi);
+            tCountAllocs = false;
+            outL.insert(outL.end(), buf.getReadPointer(0), buf.getReadPointer(0) + block);
+            outR.insert(outR.end(), buf.getReadPointer(1), buf.getReadPointer(1) + block);
+        }
+    }
+};
+
+static int sourceBandOf(double hz, double sr) {
+    float edges[SpectrumAnalyser::kBands + 1];
+    SpectrumAnalyser::bandEdges(sr, edges);
+    for (int i = 0; i < SpectrumAnalyser::kBands; ++i)
+        if (hz >= edges[i] && hz < edges[i + 1]) return i;
+    return -1;
+}
+
+static int argmaxOf(const float* v, int n) {
+    int best = 0;
+    for (int i = 1; i < n; ++i) if (v[i] > v[best]) best = i;
+    return best;
+}
+
+static std::string fmt3(double v) { char b[32]; std::snprintf(b, sizeof b, "%.3f", v); return b; }
+
+// srcm: the taps leave the mix bit-identical (graph with taps vs without, synth + effects +
+// metronome + backing track); the aux node's track-then-metronome order gives exactly track +
+// metronome; the backing ring holds the track alone; the instrument ring equals the output when
+// only the synth sounds; no allocation in the render with the taps on.
+static bool runSourceMix() {
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    // 1. Mix with taps == mix without, everything sounding.
+    {
+        SourceRig a(true), b(false);
+        for (SourceRig* r : {&a, &b}) {
+            enableFxNonDefault(r->fxParams, kFxEcho);
+            enableFxNonDefault(r->fxParams, kFxChorus);
+            r->auxSettings.setMetronomeEnabled(true);
+            r->holder.install(sineTrack(2000.0, 48000.0, 0.5, 0.4f), {}, r->holder.beginLoad());
+            r->synth->setWaveform(Waveform::Saw);
+            r->transport.start();
+            r->synth->noteOn(57, 110);
+            r->synth->noteOn(64, 90);
+        }
+        a.render(96000);
+        b.render(96000);
+        int differ = 0;
+        float peak = 0.0f;
+        for (size_t i = 0; i < a.outL.size(); ++i) {
+            differ += (std::memcmp(&a.outL[i], &b.outL[i], sizeof(float)) != 0) + (std::memcmp(&a.outR[i], &b.outR[i], sizeof(float)) != 0);
+            peak = std::max(peak, std::fabs(a.outL[i]));
+        }
+        check(differ == 0 && peak > 0.1f, "taps vs none: " + std::to_string(differ) + " differing samples, peak " + fmt3(peak));
+        detail += " mix differ " + std::to_string(differ) + " (peak " + fmt3(peak) + ")";
+        check(a.instrument.samplesWritten() == 96000 && a.backing.samplesWritten() == 96000, "rings written per sample");
+    }
+    // 2. Aux alone: both == track only + metronome only (bit-exact), backing ring == track only.
+    {
+        auto makeAux = [](AuxProcessor& aux, BackingTrack& h, TransportEngine& t, bool track, bool click, SourceRing* ring) {
+            aux.setBackingTrack(&h);
+            aux.setTransport(&t);
+            aux.auxSettings().setMetronomeEnabled(click);
+            aux.auxSettings().setTrackEnabled(track);
+            aux.auxSettings().setTrackLevel(0.7);
+            if (ring) aux.setSourceRing(ring);
+            aux.setRateAndBufferSizeDetails(48000, 512);
+            aux.prepareToPlay(48000, 512);
+            h.install(sineTrack(1000.0, 48000.0, 0.625, 0.5f), {}, h.beginLoad());
+            t.start();
+        };
+        BackingTrack h1, h2, h3;
+        TransportEngine t1, t2, t3;
+        SourceRing ring;
+        AuxProcessor trackOnly, clickOnly, both;
+        makeAux(trackOnly, h1, t1, true, false, nullptr);
+        makeAux(clickOnly, h2, t2, false, true, nullptr);
+        makeAux(both, h3, t3, true, true, &ring);
+        std::vector<float> l1, r1, l2, r2, l3, r3;
+        const std::vector<int> blocks = {471, 64, 1024, 333};
+        renderAux(trackOnly, t1, 48000, 48000, blocks, l1, &r1);
+        renderAux(clickOnly, t2, 48000, 48000, blocks, l2, &r2);
+        renderAux(both, t3, 48000, 48000, blocks, l3, &r3);
+        int differ = 0;
+        float clickPeak = 0.0f;
+        for (size_t i = 0; i < l3.size(); ++i) {
+            const float sl = l1[i] + l2[i], sr2 = r1[i] + r2[i];
+            differ += (std::memcmp(&sl, &l3[i], sizeof(float)) != 0) + (std::memcmp(&sr2, &r3[i], sizeof(float)) != 0);
+            clickPeak = std::max(clickPeak, std::fabs(l2[i]));
+        }
+        check(differ == 0 && clickPeak > 0.1f, "aux both != track + metronome: " + std::to_string(differ));
+        std::vector<float> tail((size_t)SourceRing::kReadable);
+        ring.readLatest(tail.data(), SourceRing::kReadable);
+        int ringDiffer = 0;
+        const size_t base = l1.size() - (size_t)SourceRing::kReadable;
+        for (int j = 0; j < SourceRing::kReadable; ++j) {
+            const float want = 0.5f * (l1[base + (size_t)j] + r1[base + (size_t)j]);
+            ringDiffer += want != tail[(size_t)j];
+        }
+        check(ringDiffer == 0, "backing ring != track alone: " + std::to_string(ringDiffer));
+        detail += ", aux order differ " + std::to_string(differ) + ", backing ring differ " + std::to_string(ringDiffer);
+    }
+    // 3. Synth only: the instrument ring is the output (mono); the backing ring stays exactly 0.
+    {
+        SourceRig r(true);
+        r.synth->setWaveform(Waveform::Saw);
+        r.synth->noteOn(57, 110);
+        r.render(48000);
+        std::vector<float> tail((size_t)SourceRing::kReadable);
+        r.instrument.readLatest(tail.data(), SourceRing::kReadable);
+        int ringDiffer = 0;
+        const size_t base = r.outL.size() - (size_t)SourceRing::kReadable;
+        for (int j = 0; j < SourceRing::kReadable; ++j) {
+            const float want = 0.5f * (r.outL[base + (size_t)j] + r.outR[base + (size_t)j]);
+            ringDiffer += want != tail[(size_t)j];
+        }
+        const SourceRing::Levels back = r.backing.readLevels();
+        check(ringDiffer == 0 && back.peak == 0.0f, "instrument ring != output: " + std::to_string(ringDiffer)
+              + ", backing peak " + fmt3(back.peak));
+        detail += ", instrument ring differ " + std::to_string(ringDiffer);
+    }
+    check(gRenderAllocs.load() == 0 && gRenderFrees.load() == 0, "render allocs " + std::to_string(gRenderAllocs.load()));
+    const bool pass = failures == 0;
+    std::printf("srcm  source taps: mix bit-identical, aux order exact, rings hold their source  %-4s%s, allocs %llu\n",
+                pass ? "PASS" : "FAIL", detail.c_str(), (unsigned long long)gRenderAllocs.load());
+    std::fflush(stdout);
+    return pass;
+}
+
+// srcb: band energy lands in the right source (synth sine in the instrument, track sine in the
+// backing, the metronome in neither); the backing `active` flag follows play / stop / level /
+// loop-off end; the instrument's follows its level; peak / rms since the last read.
+static bool runSourceBands() {
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    const double sr = 48000.0;
+    SourceAnalyser ia, ba;
+    SourceAnalysisResult ir, br;
+    SourceAnalysisOptions opt;
+    opt.scope = SourceScopeMode::None;
+    {
+        SourceRig r(true);
+        r.auxSettings.setMetronomeEnabled(true);
+        r.auxSettings.setMetronomeLevel(1.0);
+        r.holder.install(sineTrack(3000.0, sr, 0.5, 0.5f), {}, r.holder.beginLoad());
+        r.synth->setWaveform(Waveform::Sine);
+        r.transport.start();
+        r.synth->noteOn(69, 120); // 440 Hz
+        r.render(48000);
+        ia.analyse(r.instrument, true, r.instrument.loudRecently(), 69, opt, ir);
+        ba.analyse(r.backing, true, r.backing.sounding(), 69, opt, br);
+        const int b440 = sourceBandOf(440.0, sr), b3k = sourceBandOf(3000.0, sr);
+        check(argmaxOf(ir.bands, 24) == b440 && ir.bands[b440] > 0.5f && ir.bands[b3k] < 0.2f,
+              "instrument bands: max " + std::to_string(argmaxOf(ir.bands, 24)) + ", 440 " + fmt3(ir.bands[b440]) + ", 3k " + fmt3(ir.bands[b3k]));
+        check(argmaxOf(br.bands, 24) == b3k && br.bands[b3k] > 0.8f && br.bands[b440] < 0.2f,
+              "backing bands: max " + std::to_string(argmaxOf(br.bands, 24)) + ", 3k " + fmt3(br.bands[b3k]) + ", 440 " + fmt3(br.bands[b440]));
+        check(ir.active && br.active, "both active");
+        check(br.peak > 0.39f && br.peak < 0.41f && std::fabs(br.rms - 0.4f / std::sqrt(2.0f)) < 0.01f,
+              "backing peak " + fmt3(br.peak) + " rms " + fmt3(br.rms));
+        detail += " inst 440:" + fmt3(ir.bands[b440]) + "/3k:" + fmt3(ir.bands[b3k]) + ", back 3k:" + fmt3(br.bands[b3k])
+                + "/440:" + fmt3(br.bands[b440]) + ", back peak " + fmt3(br.peak);
+        // Peak / rms are since the previous read.
+        ba.analyse(r.backing, true, r.backing.sounding(), -1, opt, br);
+        check(br.peak == 0.0f && br.rms == 0.0f, "levels reset after a read");
+        // Stop: backing inactive; instrument still sounding.
+        r.transport.stop();
+        r.render(2048);
+        check(!r.backing.sounding(), "backing inactive after stop");
+        r.transport.start();
+        r.render(2048);
+        check(r.backing.sounding(), "backing active again");
+        r.auxSettings.setTrackLevel(0.0);
+        r.render(512);
+        check(!r.backing.sounding(), "backing inactive at level 0");
+        r.auxSettings.setTrackLevel(0.8);
+        r.auxSettings.setTrackEnabled(false);
+        r.render(512);
+        check(!r.backing.sounding(), "backing inactive when disabled");
+        r.auxSettings.setTrackEnabled(true);
+        r.auxSettings.setTrackLoop(false);
+        r.render(48000); // past the 0.5 s track without loop
+        check(!r.backing.sounding(), "backing inactive past its end (loop off)");
+        // Instrument: released, quiet for > 0.1 s → inactive.
+        r.synth->allNotesOff();
+        r.render(96000);
+        check(!r.instrument.loudRecently(), "instrument inactive after release");
+    }
+    // Metronome only: exactly nothing in either ring while the mix clicks.
+    {
+        SourceRig r(true);
+        r.auxSettings.setMetronomeEnabled(true);
+        r.transport.start();
+        r.render(48000);
+        float mixPeak = 0.0f;
+        for (float v : r.outL) mixPeak = std::max(mixPeak, std::fabs(v));
+        ia.analyse(r.instrument, true, r.instrument.loudRecently(), -1, opt, ir);
+        ba.analyse(r.backing, true, r.backing.sounding(), -1, opt, br);
+        float bandSum = 0.0f;
+        for (int i = 0; i < 24; ++i) bandSum += ir.bands[i] + br.bands[i];
+        check(mixPeak > 0.1f && ir.peak == 0.0f && br.peak == 0.0f && bandSum == 0.0f && !ir.active && !br.active,
+              "metronome leaked: mix " + fmt3(mixPeak) + ", inst " + fmt3(ir.peak) + ", back " + fmt3(br.peak));
+        detail += ", metronome only: mix peak " + fmt3(mixPeak) + ", sources " + fmt3(ir.peak) + "/" + fmt3(br.peak);
+    }
+    const bool pass = failures == 0;
+    std::printf("srcb  source bands: right source, metronome in neither, active flags  %-4s%s\n", pass ? "PASS" : "FAIL",
+                detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// srcs: scopes. cycle: a 220 Hz saw from the synth returns P = 218.18 samples at 48 kHz, its peak at
+// point 0 and the same shape on consecutive calls; an explicit cycleHz works without a note; a
+// chord falls back to window; no note falls back to window; a 30 Hz tone fits. window: steady on a
+// steady tone, a 9 kHz tone does not alias into 64 points over 20 ms, a hit sits in the middle.
+// Not running: zeros of the asked shape. analyse() does not allocate.
+static bool runSourceScope() {
+    int failures = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failures; detail += " [" + what + "]"; } };
+    const double sr = 48000.0;
+    SourceAnalyser an;
+    SourceAnalysisResult r1, r2;
+    SourceAnalysisOptions cyc;
+    cyc.bands = false;
+    cyc.scope = SourceScopeMode::Cycle;
+    cyc.scopePoints = 64;
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    auto analyse = [&](SourceRing& ring, int note, const SourceAnalysisOptions& o, SourceAnalysisResult& r) {
+        tCountAllocs = true;
+        an.analyse(ring, true, true, note, o, r);
+        tCountAllocs = false;
+    };
+    auto range = [](const SourceAnalysisResult& r) {
+        float lo = r.scope[0], hi = r.scope[0];
+        for (int i = 0; i < r.scopeCount; ++i) { lo = std::min(lo, r.scope[i]); hi = std::max(hi, r.scope[i]); }
+        return hi - lo;
+    };
+    auto maxDiff = [](const SourceAnalysisResult& a, const SourceAnalysisResult& b) {
+        float d = 0.0f;
+        for (int i = 0; i < a.scopeCount; ++i) d = std::max(d, std::fabs(a.scope[i] - b.scope[i]));
+        return d;
+    };
+    // Cycle on a synth saw.
+    {
+        SourceRig rig(true);
+        rig.synth->setWaveform(Waveform::Saw);
+        rig.synth->noteOn(57, 110); // A3, 220 Hz
+        rig.render(24000);
+        analyse(rig.instrument, 57, cyc, r1);
+        const float pp = range(r1);
+        check(r1.scopeMode == SourceScopeMode::Cycle && std::fabs(r1.scopePeriod - sr / 220.0) < 1e-6,
+              "saw cycle mode " + std::string(sourceScopeModeName(r1.scopeMode)) + " period " + fmt3(r1.scopePeriod));
+        check(r1.scopeCount == 64 && argmaxOf(r1.scope, 64) == 0 && pp > 0.2f,
+              "peak at 0: argmax " + std::to_string(argmaxOf(r1.scope, 64)) + " range " + fmt3(pp));
+        float worst = 0.0f;
+        for (int call = 0; call < 12; ++call) {
+            rig.render(256 * (1 + call % 3)); // 5.3–16 ms later, not a whole number of periods
+            analyse(rig.instrument, 57, cyc, r2);
+            check(r2.scopeMode == SourceScopeMode::Cycle && argmaxOf(r2.scope, 64) == 0, "call " + std::to_string(call) + " not cycle / peak");
+            worst = std::max(worst, maxDiff(r1, r2) / pp);
+            r1 = r2;
+        }
+        check(worst < 0.03f, "consecutive cycle scopes differ by " + fmt3(worst) + " of the range");
+        detail += " saw P " + fmt3(r1.scopePeriod) + ", step diff " + fmt3(worst);
+        // Explicit cycleHz, no note.
+        SourceAnalysisOptions hz = cyc;
+        hz.cycleHz = 220.0;
+        analyse(rig.instrument, -1, hz, r2);
+        check(r2.scopeMode == SourceScopeMode::Cycle && argmaxOf(r2.scope, 64) == 0, "cycleHz without a note");
+        // No note, no cycleHz: window.
+        analyse(rig.instrument, -1, cyc, r2);
+        check(r2.scopeMode == SourceScopeMode::Window && r2.scopePeriod == 0.0 && r2.scopeCount == 64, "no note → window");
+        // A wrong pitch (a fifth up) is not periodic at that period: window.
+        analyse(rig.instrument, 64, cyc, r2);
+        check(r2.scopeMode == SourceScopeMode::Window, "wrong note → window");
+    }
+    // The synth's detune moves every voice: the cycle follows it (an octave up is one cycle of
+    // 440 Hz, not two; +30 cents is still a cycle, at the detuned period).
+    for (const double cents : {1200.0, 30.0}) {
+        SourceRig rig(true);
+        rig.synth->setWaveform(Waveform::Saw);
+        rig.synth->setDetune(cents);
+        rig.synth->noteOn(57, 110); // A3 + detune
+        rig.render(24000);
+        const double detune = rig.synth->noteQueue().synthDetuneCents.load();
+        SourceAnalysisResult rd;
+        tCountAllocs = true;
+        an.analyse(rig.instrument, true, true, 57, cyc, rd, detune);
+        tCountAllocs = false;
+        const double want = sr / (220.0 * std::pow(2.0, cents / 1200.0));
+        check(rd.scopeMode == SourceScopeMode::Cycle && std::fabs(rd.scopePeriod - want) < 1e-3,
+              "detune " + fmt3(cents) + ": mode " + std::string(sourceScopeModeName(rd.scopeMode)) + " period "
+              + fmt3(rd.scopePeriod) + " (want " + fmt3(want) + ")");
+    }
+    // Chord: C4 + E4, last note E4 → window.
+    {
+        SourceRig rig(true);
+        rig.synth->setWaveform(Waveform::Saw);
+        rig.synth->noteOn(60, 110);
+        rig.synth->noteOn(64, 110);
+        rig.render(24000);
+        int windows = 0;
+        for (int call = 0; call < 8; ++call) {
+            analyse(rig.instrument, 64, cyc, r2);
+            windows += r2.scopeMode == SourceScopeMode::Window;
+            rig.render(256 * (1 + call % 3));
+        }
+        check(windows == 8, "chord → window " + std::to_string(windows) + "/8");
+        detail += ", chord window " + std::to_string(windows) + "/8";
+    }
+    // Direct ring writes (block of 256, mono).
+    auto feed = [&](SourceRing& ring, int total, const std::function<float(int64_t)>& f, int64_t& index) {
+        float buf[256];
+        const float* ch[1] = { buf };
+        for (int done = 0; done < total;) {
+            const int n = std::min(256, total - done);
+            for (int i = 0; i < n; ++i) buf[i] = f(index++);
+            ring.write(ch, 1, n);
+            done += n;
+        }
+    };
+    const double twoPi = juce::MathConstants<double>::twoPi;
+    // 30 Hz sine: one cycle of 1600 samples fits.
+    {
+        SourceRing ring;
+        int64_t idx = 0;
+        feed(ring, 16384, [&](int64_t i) { return 0.5f * (float)std::sin(twoPi * 30.0 * (double)i / sr); }, idx);
+        SourceAnalysisOptions o = cyc;
+        o.cycleHz = 30.0;
+        analyse(ring, -1, o, r2);
+        check(r2.scopeMode == SourceScopeMode::Cycle && std::fabs(r2.scopePeriod - 1600.0) < 1e-6
+              && std::fabs(r2.scope[0] - 0.5f) < 0.01f && std::fabs(r2.scope[32] + 0.5f) < 0.01f && std::fabs(r2.scope[16]) < 0.01f,
+              "30 Hz cycle: mode " + std::string(sourceScopeModeName(r2.scopeMode)) + " p0 " + fmt3(r2.scope[0])
+              + " p16 " + fmt3(r2.scope[16]) + " p32 " + fmt3(r2.scope[32]));
+    }
+    // Window: steady on a steady 330 Hz tone; 9 kHz attenuated; a hit in the middle.
+    SourceAnalysisOptions win;
+    win.bands = false;
+    win.scope = SourceScopeMode::Window;
+    win.scopePoints = 64;
+    win.windowMs = 20.0;
+    {
+        SourceRing ring;
+        int64_t idx = 0;
+        auto tone = [&](int64_t i) { return 0.6f * (float)std::sin(twoPi * 330.0 * (double)i / sr); };
+        feed(ring, 16384, tone, idx);
+        analyse(ring, -1, win, r1);
+        float worst = 0.0f;
+        for (int call = 0; call < 10; ++call) {
+            feed(ring, 197 + 61 * call, tone, idx);
+            analyse(ring, -1, win, r2);
+            worst = std::max(worst, maxDiff(r1, r2) / range(r1));
+            r1 = r2;
+        }
+        check(r1.scopeMode == SourceScopeMode::Window && worst < 0.03f, "window steady tone differs by " + fmt3(worst));
+        // The centre (between points 31 and 32) is the positive peak.
+        check(r1.scope[31] > 0.5f && r1.scope[32] > 0.5f, "window centred on the peak " + fmt3(r1.scope[31]) + "/" + fmt3(r1.scope[32]));
+        detail += ", window step diff " + fmt3(worst);
+    }
+    {
+        SourceRing ring;
+        int64_t idx = 0;
+        feed(ring, 16384, [&](int64_t i) { return 0.5f * (float)std::sin(twoPi * 9000.0 * (double)i / sr); }, idx);
+        analyse(ring, -1, win, r2);
+        float filtered = 0.0f;
+        for (int i = 0; i < 64; ++i) filtered = std::max(filtered, std::fabs(r2.scope[i]));
+        // What every-15th-sample picking would show over the same 20 ms.
+        std::vector<float> raw(960);
+        ring.readLatest(raw.data(), 960);
+        float picked = 0.0f;
+        for (int j = 0; j < 64; ++j) picked = std::max(picked, std::fabs(raw[(size_t)(j * 15)]));
+        check(filtered < 0.02f, "9 kHz in a 64-point window: " + fmt3(filtered) + " (picked " + fmt3(picked) + ")");
+        detail += ", 9 kHz " + fmt3(filtered) + " vs picked " + fmt3(picked);
+    }
+    {
+        SourceRing ring;
+        int64_t idx = 0;
+        const int64_t hitAt = 16384 - 1000; // 21 ms before the end (the window must fit before the end)
+        feed(ring, 16384, [&](int64_t i) {
+            if (i < hitAt) return 0.0f;
+            const double t = (double)(i - hitAt) / sr;
+            return 0.9f * (float)(std::exp(-t * 300.0) * std::sin(twoPi * 180.0 * t));
+        }, idx);
+        analyse(ring, -1, win, r2);
+        const int at = argmaxOf(r2.scope, 64);
+        check(at >= 30 && at <= 33, "hit centred: max at point " + std::to_string(at));
+    }
+    // Not running: zeros of the asked shape.
+    {
+        SourceRing ring;
+        int64_t idx = 0;
+        feed(ring, 4096, [&](int64_t i) { return 0.5f * (float)std::sin(0.01 * (double)i); }, idx);
+        SourceAnalysisOptions o;
+        o.scopePoints = 300; // clamped to 128
+        an.analyse(ring, false, true, 60, o, r2);
+        float sum = 0.0f;
+        for (int i = 0; i < 128; ++i) sum += std::fabs(r2.scope[i]);
+        for (int i = 0; i < 24; ++i) sum += r2.bands[i];
+        check(!r2.active && r2.sampleRate == 0.0 && r2.scopeCount == 128 && r2.scopeMode == SourceScopeMode::Window
+              && sum == 0.0f && r2.peak == 0.0f, "inactive shape");
+        o.scope = SourceScopeMode::None;
+        an.analyse(ring, false, true, 60, o, r2);
+        check(r2.scopeCount == 0 && r2.scopeMode == SourceScopeMode::None, "none → no points");
+    }
+    check(gRenderAllocs.load() == 0 && gRenderFrees.load() == 0, "analyse allocs " + std::to_string(gRenderAllocs.load()));
+    // Reader cost: bands + cycle scope, per call.
+    double us = 0.0;
+    {
+        SourceRig rig(true);
+        rig.synth->setWaveform(Waveform::Saw);
+        rig.synth->noteOn(45, 110);
+        rig.render(24000);
+        SourceAnalysisOptions full = cyc;
+        full.bands = true;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 200; ++i) an.analyse(rig.instrument, true, true, 45, full, r2);
+        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 200.0;
+        check(r2.scopeMode == SourceScopeMode::Cycle, "110 Hz cycle");
+    }
+    detail += ", reader " + fmt3(us) + " us/call (bands + cycle)";
+    const bool pass = failures == 0;
+    std::printf("srcs  source scope: cycle (period, peak at 0, stable, fallbacks), window (steady, anti-aliased, hit centred)  %-4s%s\n",
+                pass ? "PASS" : "FAIL", detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// srct: audio-thread cost of the two ring writes (per 256-sample stereo block).
+static bool runSourceTapCost() {
+    SourceRing ring;
+    std::vector<float> l(256), r(256);
+    for (int i = 0; i < 256; ++i) { l[(size_t)i] = 0.3f * (float)std::sin(i * 0.05); r[(size_t)i] = -l[(size_t)i]; }
+    const float* ch[2] = { l.data(), r.data() };
+    const int blocks = 200000;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int b = 0; b < blocks; ++b) { ring.write(ch, 2, 256); ring.publishSounding(true); }
+    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / blocks;
+    // Budget: the two taps must stay far under 1% of a 256-sample block at 48 kHz (5.33 ms).
+    const bool pass = 2.0 * ns < 0.01 * 5.333e6;
+    std::printf("srct  source tap cost  %-4s %.2f us per 256-sample block per tap (%.3f%% of the block for both)\n",
+                pass ? "PASS" : "FAIL", ns / 1000.0, 100.0 * 2.0 * ns / 5.333e6);
     std::fflush(stdout);
     return pass;
 }
@@ -4894,6 +5397,10 @@ int main(int argc, char** argv) {
     if (want("aux0")) unexpected += runAuxSilent() ? 0 : 1;
     if (want("rsa")) unexpected += runAuxRebuildState() ? 0 : 1;
     if (want("an")) unexpected += runAnalysis() ? 0 : 1;
+    if (want("srcm")) unexpected += runSourceMix() ? 0 : 1;
+    if (want("srcb")) unexpected += runSourceBands() ? 0 : 1;
+    if (want("srcs")) unexpected += runSourceScope() ? 0 : 1;
+    if (want("srct")) unexpected += runSourceTapCost() ? 0 : 1;
     if (want("arp")) unexpected += runArp() ? 0 : 1;
     if (want("arpv")) unexpected += runArpVoices() ? 0 : 1;
     if (want("sp")) unexpected += runSpectrum() ? 0 : 1;

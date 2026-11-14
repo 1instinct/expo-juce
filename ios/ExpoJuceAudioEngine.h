@@ -155,6 +155,13 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // lastNote, bpm, beat, playing, arp: { active, step, steps, note } }. Any thread; one 2048-point
 // FFT per call (about 50 µs); zeros when the engine is not running.
 - (NSDictionary<NSString *, id> *)analysis;
+// Per-source analysis (getSourceAnalysis): source "instrument" (synth + drums after the effects)
+// or "backing" (the backing track alone), options { bands, scope: "none" | "window" | "cycle",
+// scopePoints, cycleHz, windowMs }. Returns { active, peak, rms, bands: [24], scope: [n],
+// scopeMode, scopePeriod, sampleRate }; nil for an unknown source. Any thread; at most one FFT and
+// the scope per call, on the calling thread.
+- (NSDictionary<NSString *, id> *)sourceAnalysis:(NSString *)source
+                                         options:(NSDictionary<NSString *, id> *)options;
 
 // Transport
 - (void)startTransport;

@@ -7,6 +7,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
 #include "TransportEngine.h"
+#include "SourceRing.h"
 #include <atomic>
 #include <cstdint>
 
@@ -177,6 +178,10 @@ public:
     // Tempo and beat position for echo sync and pump. Set before the node renders.
     void setTransport(TransportEngine* t) { transport = t; }
 
+    // Instrument tap for getSourceAnalysis: the chain's output (after the limiter) is written into
+    // it at the end of every block (ring writes only). nullptr = none. Set before the node renders.
+    void setSourceRing(SourceRing* r) { sourceRing = r; }
+
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
@@ -235,6 +240,7 @@ private:
     FxParamStore ownStore;
     FxParamStore* store = &ownStore;
     TransportEngine* transport = nullptr;
+    SourceRing* sourceRing = nullptr;
 
     double sr = 48000.0;
     bool prepared = false;

@@ -156,6 +156,16 @@ EXPOJUCE_JNI(void, nativeSetSynthParam)(JNIEnv* env, jclass, jint param, jdouble
     });
 }
 
+EXPOJUCE_JNI(jstring, nativeSourceAnalysisJson)(JNIEnv* env, jclass, jstring source, jboolean bands, jstring scope,
+                                                jdouble scopePoints, jdouble cycleHz, jdouble windowMs) {
+    const std::string sourceValue = toStdString(env, source);
+    const std::string scopeValue = toStdString(env, scope);
+    return guarded<jstring>(env, nullptr, [&] {
+        return toJString(env, expojuce::host::sourceAnalysisJson(sourceValue, bands == JNI_TRUE, scopeValue,
+                                                                  (double)scopePoints, (double)cycleHz, (double)windowMs));
+    });
+}
+
 // 0 effects, 1 arpeggiator, 2 drums, 3 analysis.
 EXPOJUCE_JNI(jstring, nativeStateJson)(JNIEnv* env, jclass, jint which) {
     return guarded<jstring>(env, nullptr, [&] {

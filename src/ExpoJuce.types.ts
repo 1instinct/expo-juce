@@ -283,6 +283,60 @@ export type Analysis = {
   arp: ArpAnalysis;
 };
 
+/**
+ * A source for `getSourceAnalysis()` (0.10.0+): `'instrument'` is the synth and drums after the
+ * effects chain (what is played, as heard); `'backing'` is the backing track alone, at its level.
+ * The metronome is in neither (it is only in `getAnalysis()`, the whole output).
+ */
+export type AnalysisSource = 'instrument' | 'backing';
+
+/**
+ * Scope shape for `getSourceAnalysis()`: `'none'` (no points), `'window'` (a span of recent
+ * samples, anti-alias filtered and centred on the largest positive peak) or `'cycle'` (one period
+ * of the source starting at its peak; falls back to `'window'` when the source is not periodic at
+ * that period: chords, drums, noise, glides, silence).
+ */
+export type ScopeMode = 'none' | 'window' | 'cycle';
+
+/** Options for `getSourceAnalysis()`. Out-of-range numbers are clamped. */
+export type SourceAnalysisOptions = {
+  /** Compute the 24 bands (one 2048-point FFT). Default true; false returns 24 zeros. */
+  bands?: boolean;
+  /** Default `'window'`. */
+  scope?: ScopeMode;
+  /** Scope points, 16–128 (default 64). */
+  scopePoints?: number;
+  /** `'cycle'`: the fundamental in Hz; omitted (or 0) = the last note the synth started, at the synth's detune. */
+  cycleHz?: number;
+  /** `'window'` (and the `'cycle'` fallback): span in ms, 5–42 (default 20). */
+  windowMs?: number;
+};
+
+/** Returned by `getSourceAnalysis()` (0.10.0+). */
+export type SourceAnalysis = {
+  /**
+   * The source is producing sound. Backing: a track is loaded at the device rate, enabled, at a
+   * level above 0, the transport plays and the play position is inside the track (or it loops).
+   * Instrument: its output reached −80 dBFS within the last 100 ms. False while the engine is not
+   * running, and always false for `'backing'` on Android (no backing track there yet).
+   */
+  active: boolean;
+  /** Max |sample| of this source since the previous call for it (peak hold), 0–1+. */
+  peak: number;
+  /** RMS (both channels) of this source since the previous call for it. */
+  rms: number;
+  /** 24 bands, the table and scaling of `Analysis.bands`; zeros when `bands: false`. */
+  bands: number[];
+  /** −1..1 (not normalised), `scopePoints` long; `[]` for `'none'`. `'cycle'`: point 0 is the peak. */
+  scope: number[];
+  /** What `scope` holds (`'cycle'` may come back as `'window'`). */
+  scopeMode: ScopeMode;
+  /** Samples per cycle in `'cycle'` mode (sampleRate / Hz), else 0. */
+  scopePeriod: number;
+  /** Sample rate of the source (0 when the engine is not running / older binaries). */
+  sampleRate: number;
+};
+
 /** Native engine lifecycle state reported in `AudioDiagnostics.engineState`. */
 export type EngineState = 'ready' | 'recovering' | 'failed' | 'uninitialized';
 

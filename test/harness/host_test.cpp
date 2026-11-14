@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -272,6 +273,14 @@ static void testShapesBeforeSetup() {
     check(analysis["scope"].size() == 128 && analysis["bands"].size() == 24 && (int)analysis["lastNote"] == -1
               && (int)analysis["arp"]["steps"] == 16 && (double)analysis["bpm"] == 120.0,
           "getAnalysis: inactive shape (128 scope, 24 bands, arp steps 16)");
+    const juce::var source = parse(host::sourceAnalysisJson("instrument", true, "cycle", std::numeric_limits<double>::quiet_NaN(), 0.0, std::numeric_limits<double>::quiet_NaN()));
+    check(!(bool)source["active"] && source["bands"].size() == 24 && source["scope"].size() == 64
+              && source["scopeMode"].toString() == "window" && (double)source["sampleRate"] == 0.0
+              && (double)source["scopePeriod"] == 0.0,
+          "getSourceAnalysis: inactive shape (24 bands, 64 points, window, sample rate 0)");
+    const juce::var none = parse(host::sourceAnalysisJson("backing", false, "none", 100.0, 0.0, 10.0));
+    check(none["scope"].size() == 0 && none["scopeMode"].toString() == "none", "getSourceAnalysis: scope none → []");
+    check(host::sourceAnalysisJson("mix", true, "window", 64.0, 0.0, 20.0) == "{}", "getSourceAnalysis: unknown source → {}");
 
     // Note input before setup is dropped (note-ons) or harmless (releases).
     host::noteOn(60, 100);
@@ -344,6 +353,25 @@ static void testPlayback(double nativeRate, int expectedBuffer) {
           "held note reaches the device output (peak " + std::to_string(gStats.peak.load()) + ")");
     check((int)d["activeVoices"] >= 1 && (double)d["synthProcessCount"] > 0 && (double)d["fxProcessCount"] > 0,
           "synth and effects chain render");
+    {
+        // Per-source: the held saw (C4, 261.6 Hz) is in the instrument; the backing is inactive.
+        const juce::var inst = parse(host::sourceAnalysisJson("instrument", true, "cycle", 32.0, 0.0, std::numeric_limits<double>::quiet_NaN()));
+        const juce::var back = parse(host::sourceAnalysisJson("backing", true, "window", 32.0, 0.0, std::numeric_limits<double>::quiet_NaN()));
+        double bandMax = 0.0, backMax = 0.0;
+        for (int i = 0; i < 24; ++i) {
+            bandMax = std::max(bandMax, (double)inst["bands"][i]);
+            backMax = std::max(backMax, (double)back["bands"][i]);
+        }
+        check((bool)inst["active"] && (double)inst["peak"] > 0.01 && bandMax > 0.5 && inst["scope"].size() == 32
+                  && (double)inst["sampleRate"] == expectedRate,
+              "getSourceAnalysis instrument: active, peak, bands, 32 points at the device rate (scopeMode "
+                  + inst["scopeMode"].toString().toStdString() + ")");
+        check(inst["scopeMode"].toString() == "cycle" && std::fabs((double)inst["scopePeriod"] - expectedRate / 261.6256) < 0.01,
+              "getSourceAnalysis instrument: one cycle of the last note (period "
+                  + inst["scopePeriod"].toString().toStdString() + ")");
+        check(!(bool)back["active"] && backMax == 0.0 && (double)back["sampleRate"] == expectedRate,
+              "getSourceAnalysis backing: inactive, silent (no backing track on Android)");
+    }
     pump(100);
     check((double)diagnostics()["callbackCount"] > callbacks1, "callbackCount advances");
 

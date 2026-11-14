@@ -95,6 +95,9 @@
 }
 + (void)unloadBackingTrack { [[ExpoJuceAudioEngine sharedInstance] unloadBackingTrack]; }
 + (NSDictionary<NSString *, id> *)getAnalysis { return [[ExpoJuceAudioEngine sharedInstance] analysis]; }
++ (NSDictionary<NSString *, id> *)getSourceAnalysis:(NSString *)source options:(NSDictionary<NSString *, id> *)options {
+    return [[ExpoJuceAudioEngine sharedInstance] sourceAnalysis:source options:options];
+}
 
 // ── Arpeggiator ──
 + (BOOL)setArpeggiator:(NSDictionary<NSString *, id> *)options {

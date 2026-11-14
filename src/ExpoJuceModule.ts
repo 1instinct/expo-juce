@@ -12,6 +12,8 @@ import type {
   DrumVoiceParams,
   EffectsState,
   MetronomeOptions,
+  SourceAnalysis,
+  SourceAnalysisOptions,
 } from './ExpoJuce.types';
 
 // The native module (ios/ExpoJuceModule.swift; android/src/main/java/expo/modules/juce/ExpoJuceModule.kt). Functions added after 0.5.0 are optional,
@@ -58,6 +60,9 @@ export type ExpoJuceNativeModule = {
   loadBackingTrack?(uri: string, gapless: (Partial<BackingTrackGapless> & { sourceBpm?: number }) | null): Promise<BackingTrackInfo>;
   unloadBackingTrack?(): void;
   getAnalysis?(): Analysis;
+  // Per-source analysis (0.10.0+). An empty object for an unknown source.
+  getSourceAnalysis?(source: string, options: SourceAnalysisOptions | null): Partial<SourceAnalysis>;
+  hasSourceAnalysis?(): boolean;
 
   // Arpeggiator (0.7.0+)
   setArpeggiator?(options: Partial<ArpOptions>): boolean;

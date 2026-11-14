@@ -29,6 +29,10 @@ import {
   BackingTrackOptions,
   BackingTrackLoadOptions,
   Analysis,
+  AnalysisSource,
+  ScopeMode,
+  SourceAnalysisOptions,
+  SourceAnalysis,
   ArpMode,
   ArpRate,
   ArpOptions,
@@ -280,6 +284,60 @@ export function getAnalysis(): Analysis {
   return { ...emptyAnalysis(), ...native };
 }
 
+// ── Per-source analysis (0.10.0+) ────────────────────────────────
+// getAnalysis() is the whole output. getSourceAnalysis() splits it: 'instrument' (synth + drums
+// after the effects) and 'backing' (the backing track alone); the metronome is in neither. Each
+// source keeps its own peak / rms since the previous call for that source. Synchronous: at most one
+// 2048-point FFT and the scope per call, on the calling thread (the audio thread only copies samples
+// into a ring). Binaries older than 0.10.0 return the inactive shape below; hasSourceAnalysis()
+// tells them apart from a source that is just silent.
+
+const SCOPE_MODES: readonly ScopeMode[] = ['none', 'window', 'cycle'];
+
+function sourceScopePoints(options?: SourceAnalysisOptions): number {
+  const n = options?.scopePoints;
+  return typeof n === 'number' && Number.isFinite(n) ? Math.min(128, Math.max(16, Math.round(n))) : 64;
+}
+
+const emptySourceAnalysis = (options?: SourceAnalysisOptions): SourceAnalysis => {
+  const none = options?.scope === 'none';
+  return {
+    active: false,
+    peak: 0,
+    rms: 0,
+    bands: new Array(24).fill(0),
+    scope: none ? [] : new Array(sourceScopePoints(options)).fill(0),
+    scopeMode: none ? 'none' : 'window',
+    scopePeriod: 0,
+    sampleRate: 0,
+  };
+};
+
+/** The binary has getSourceAnalysis (0.10.0+; false on web). */
+export function hasSourceAnalysis(): boolean {
+  return typeof ExpoJuceModule?.hasSourceAnalysis === 'function' && ExpoJuceModule.hasSourceAnalysis() === true;
+}
+
+/**
+ * Spectrum, level and scope of one source. An unknown source or scope mode throws a TypeError
+ * (a programming error); otherwise the inactive shape is returned while the engine is not running
+ * or when the binary is older than 0.10.0.
+ */
+export function getSourceAnalysis(source: AnalysisSource, options?: SourceAnalysisOptions): SourceAnalysis {
+  if (source !== 'instrument' && source !== 'backing') {
+    throw new TypeError(`getSourceAnalysis: unknown source "${String(source)}"`);
+  }
+  if (options?.scope !== undefined && !SCOPE_MODES.includes(options.scope)) {
+    throw new TypeError(`getSourceAnalysis: unknown scope "${String(options.scope)}"`);
+  }
+  if (typeof ExpoJuceModule?.getSourceAnalysis !== 'function') return emptySourceAnalysis(options);
+  const native = ExpoJuceModule.getSourceAnalysis(source, options ?? null);
+  if (native && native.bands !== undefined && native.scope !== undefined && native.scopeMode !== undefined) {
+    return native as SourceAnalysis;
+  }
+  return { ...emptySourceAnalysis(options), ...(native ?? {}) };
+}
+
 // ── Arpeggiator (0.7.0+) ─────────────────────────────────────────
 // Between the note queue and the voices: while enabled, held notes (pads, keys, noteOn) are
 // arpeggiated on the transport's grid (sample-accurate; free-running at the tempo while the
@@ -520,6 +578,10 @@ export {
   BackingTrackOptions,
   BackingTrackLoadOptions,
   Analysis,
+  AnalysisSource,
+  ScopeMode,
+  SourceAnalysisOptions,
+  SourceAnalysis,
   ArpMode,
   ArpRate,
   ArpOptions,

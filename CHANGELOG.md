@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.10.0-rc.0
+
+### Added
+
+- **Per-source analysis.** `getSourceAnalysis(source, options?)` with `source` `'instrument'`
+  (the synth and drums after the effects chain) or `'backing'` (the backing track alone, at its
+  level); the metronome is in neither. Returns `{ active, peak, rms, bands, scope, scopeMode,
+  scopePeriod, sampleRate }`: 24 bands on the table and scale of `getAnalysis().bands`, peak / rms
+  since the previous call for that source, and `active` (backing: a track is really sounding:
+  loaded, enabled, level above 0, transport playing, inside the track or looping; instrument: above
+  −80 dBFS within the last 100 ms). `hasSourceAnalysis()` is false on older binaries and on web,
+  which return the inactive shape.
+- **Scope modes** (`scope: 'none' | 'window' | 'cycle'`, `scopePoints` 16–128, `windowMs` 5–42,
+  `cycleHz`): `'window'` is anti-alias filtered (a Hann-weighted average per point instead of
+  picking samples) and centred on the largest positive peak, so a steady tone stands still;
+  `'cycle'` returns one period of the source (at `cycleHz` or the last note the synth started, at the synth's detune)
+  starting at its peak, stable from call to call, and falls back to `'window'` when the source is
+  not periodic at that period (chords, drums, noise) or the period does not fit the history.
+- Taps: `FxChainProcessor` writes its output into the instrument ring at the end of each block;
+  `AuxProcessor` renders the backing track first, writes it into the backing ring, then adds the
+  metronome. Ring writes only on the audio thread (no FFT, allocation or lock); the FFT and the
+  scope run on the calling thread. New pure C++ headers `ios/SourceRing.h` and
+  `ios/SourceAnalysis.h`.
+- Android: `getSourceAnalysis('instrument')` is analysed (the effects chain node exists there);
+  `'backing'` is always inactive (no backing track on Android yet). `getAnalysis()` on Android
+  still returns zeros.
+- Harness cases `srcm` (the mix with the taps is bit-identical to the mix without; the aux node's
+  track-then-metronome order is exactly track + metronome; each ring holds its source alone; no
+  allocation), `srcb` (band energy in the right source, metronome in neither, `active` flags),
+  `srcs` (cycle period (with the synth's detune), peak at point 0, stability across calls, chord / wrong-note / no-note
+  fallbacks, 30 Hz cycle, window stability, anti-aliasing, hit centring, inactive shape, no
+  allocation) and `srct` (tap cost); `host_test` checks the Android shapes and an instrument cycle.
+
+### Compatibility
+
+- `getAnalysis()` is unchanged. The aux node's output is the same bit for bit (its two parts are
+  now added in the other order, which is exact).
+- A native change: apps need a new binary (and a new runtime version for OTA updates) to get
+  `getSourceAnalysis`; JS that calls it on an older binary gets the inactive shape.
+
 ## 0.9.0-rc.4
 
 ### Added (iOS)

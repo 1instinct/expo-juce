@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, srcm, srcb, srcs, srct, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -79,6 +79,23 @@ Exit code non-zero on any failure.
   sample), `rsa` (aux settings and the track survive a rebuild), `an` (the `AnalysisRing` written
   by `GraphPlayer` holds a known sine at the expected scope indices, peak / rms since the
   last read, mono RMS, the transport published by the aux node). The `allocs` / `frees` counters also count `free()` inside render calls.
+- Per-source analysis (0.10.0, `ios/SourceRing.h`, `ios/SourceAnalysis.h`): `srcm` (a graph with the
+  instrument and backing taps renders the same output bit for bit as one without, with the synth, echo +
+  chorus, the metronome and a backing track all sounding; an aux node with track and metronome equals
+  track only + metronome only bit for bit; the backing ring holds the track alone, the instrument ring
+  the output when only the synth sounds; 0 allocations), `srcb` (a 440 Hz synth sine lands in the
+  instrument bands and a 3 kHz track in the backing bands, each under 0.2 in the other's band; the
+  metronome alone leaves both rings at exactly 0; backing `active` follows stop / start / level 0 /
+  disabled / past the end with loop off, the instrument's its level; levels reset per read), `srcs`
+  (cycle on a 220 Hz synth saw: period 218.18, peak at point 0, 12 calls apart by 5–16 ms within 3% of
+  the range; with the synth detuned an octave up one cycle of 440 Hz and at +30 cents the detuned period; `cycleHz` without a note; no note, a wrong note and a C4 + E4 chord fall back to window;
+  a 30 Hz sine fits; window: a steady 330 Hz tone within 3% across calls and centred on its peak, a
+  9 kHz tone under 0.02 in 64 points over 20 ms, a decaying hit centred; not running: zeros of the
+  asked shape; `analyse` does not allocate; reader time per call), `srct` (ring write cost per
+  256-sample block). `host_test` checks the inactive shapes and, with a held note, an active
+  instrument with one cycle of the note and an inactive backing source; its exit then reports the
+  two process-lifetime analysers (FFT objects) as leaked, which is expected (they are never freed,
+  like the iOS spectrum).
 - Arpeggiator (`ios/Arpeggiator.h`, pure C++, driven with a recording sink): `arp` (the six
   pattern vectors of the design spec plus upDown edge cases, random membership and chord; at
   120 bpm / `1/16` / 48 kHz every hit lands exactly on `k × 6000` over the odd `kFxBlocks` sizes,

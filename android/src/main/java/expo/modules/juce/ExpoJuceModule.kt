@@ -144,6 +144,14 @@ class ExpoJuceModule : Module() {
 
     Function("getAnalysis") { ExpoJuceNative.analysis() }
 
+    // Per-source analysis (0.10.0+): the instrument is analysed; "backing" is always inactive
+    // (no backing track on Android yet).
+    Function("getSourceAnalysis") { source: String, options: Map<String, Any?>? ->
+      ExpoJuceNative.sourceAnalysis(source, options)
+    }
+
+    Function("hasSourceAnalysis") { ExpoJuceNative.isLoaded }
+
     // ── Arpeggiator (not on Android yet) ───────────────────────────
 
     Function("setArpeggiator") { _: Map<String, Any?> -> false }

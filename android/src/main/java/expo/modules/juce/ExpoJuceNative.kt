@@ -6,6 +6,7 @@ import android.os.Looper
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.roundToInt
 
 /**
  * The native library (android/CMakeLists.txt: JUCE + Oboe + the engine) and its JNI entry points
@@ -76,6 +77,35 @@ internal object ExpoJuceNative {
     val result = LinkedHashMap(analysisShape)
     result["lastNote"] = if (isLoaded) nativeLastNote() else -1
     return result
+  }
+
+  /**
+   * getSourceAnalysis(source, options): the native result, or the inactive shape (zeros) if the
+   * library is missing or returned nothing usable. Options: bands (default true), scope
+   * ("none" | "window" | "cycle", default "window"), scopePoints (16–128, default 64), cycleHz,
+   * windowMs (5–42, default 20).
+   */
+  fun sourceAnalysis(source: String, options: Map<String, Any?>?): Map<String, Any?> {
+    val bands = options?.get("bands") as? Boolean ?: true
+    val scope = options?.get("scope") as? String ?: "window"
+    val points = (options?.get("scopePoints") as? Number)?.toDouble() ?: Double.NaN
+    val cycleHz = (options?.get("cycleHz") as? Number)?.toDouble() ?: 0.0
+    val windowMs = (options?.get("windowMs") as? Number)?.toDouble() ?: Double.NaN
+    if (isLoaded) {
+      val native = jsonToMap(nativeSourceAnalysisJson(source, bands, scope, points, cycleHz, windowMs))
+      if (native.isNotEmpty()) return native
+    }
+    val count = if (scope == "none") 0 else if (points.isFinite()) points.roundToInt().coerceIn(16, 128) else 64
+    return linkedMapOf(
+      "active" to false,
+      "peak" to 0.0,
+      "rms" to 0.0,
+      "bands" to List(24) { 0.0 },
+      "scope" to List(count) { 0.0 },
+      "scopeMode" to if (scope == "none") "none" else "window",
+      "scopePeriod" to 0.0,
+      "sampleRate" to 0.0,
+    )
   }
 
   // The native shape, or the generated default if the library is missing or its JSON is unusable.
@@ -152,4 +182,7 @@ internal object ExpoJuceNative {
   @JvmStatic external fun nativeSetWaveform(waveform: String)
   @JvmStatic external fun nativeSetSynthParam(param: Int, value: Double)
   @JvmStatic external fun nativeStateJson(which: Int): String?
+  @JvmStatic external fun nativeSourceAnalysisJson(
+    source: String, bands: Boolean, scope: String, scopePoints: Double, cycleHz: Double, windowMs: Double,
+  ): String?
 }
