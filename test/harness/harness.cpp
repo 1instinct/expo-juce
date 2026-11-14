@@ -25,6 +25,7 @@
 #include "SamplerBank.h"
 #include "SequencePlayer.h"
 #include "BackgroundPolicy.h"
+#include "SynthParamSmoother.h"
 
 #include <atomic>
 #include <chrono>
@@ -2455,6 +2456,251 @@ static bool runAnalysis() {
                 empty.peak, empty.rms, monoLevels.rms, transportOk, (unsigned long long)gRenderAllocs.load());
     std::fflush(stdout);
     return pass;
+}
+
+//==============================================================================
+// Synth parameter smoothing (case `psm`). SynthParamSmoother: a cutoff step is a strictly
+// monotone multiplicative ramp of exactly kRampSeconds × sr samples (constant ratio per sample,
+// first sample one ratio away from the old value: no step), that ends exactly on the target;
+// steps arriving every 1/28 s (a controller's rate) give one strictly increasing sweep with no
+// plateau; level is a linear ramp; detune a constant pitch ratio per sample; snap jumps; odd
+// chunk sizes give the same values. PolySynthProcessor: its smoothed cutoff follows the same
+// ramp over 128-sample blocks; a master-level step to 0 fades the output over the ramp (no
+// jump: no sample-to-sample change larger than the steady tone's), then exact silence; a
+// sustain step ramps the held note's level; applySettings jumps; a note released at sustain 0
+// still fades over its release time; 0 allocations in processBlock.
+static bool runSynthSmoothing() {
+    constexpr double sr = 48000.0;
+    const int L = (int)std::floor(SynthParamSmoother::kRampSeconds * sr); // JUCE's step count
+    bool ok = true;
+    std::string why;
+    auto fail = [&](const char* what) { ok = false; if (why.empty()) why = what; };
+
+    // ── SynthParamSmoother ──
+    const SynthParamTargets base { 200.0f, 0.0f, 0.0f, 0.5f, 1.0f };
+    auto collect = [](SynthParamSmoother& s, int total, int chunk, int which) {
+        std::vector<float> out;
+        while ((int)out.size() < total) {
+            const int n = std::min(chunk, total - (int)out.size());
+            s.next(n);
+            const float* a = which == 0 ? s.cutoff : which == 1 ? s.level : which == 2 ? s.ratio : s.reso;
+            out.insert(out.end(), a, a + n);
+        }
+        return out;
+    };
+    double maxRampRelErr = 0.0;
+    int rampLen = -1;
+    {
+        for (int chunk : { SynthParamSmoother::kChunk, 37, 1 }) {
+            SynthParamSmoother s;
+            s.prepare(sr, base);
+            SynthParamTargets t = base; t.cutoffHz = 8000.0f;
+            s.setTargets(t);
+            const std::vector<float> v = collect(s, L + 500, chunk, 0);
+            const double stepLog = std::log(8000.0 / 200.0) / L;
+            int len = -1;
+            float prev = 200.0f;
+            for (int i = 0; i < (int)v.size(); ++i) {
+                if (i < L) {
+                    if (!(v[i] > prev)) fail("cutoff ramp not strictly increasing");
+                    // The last sample lands exactly on the target, absorbing the float drift of
+                    // the 1919 multiplications before it: held to 10 %, every other step to 2 %.
+                    const double err = std::fabs(std::log((double)v[i] / prev) - stepLog) / stepLog;
+                    if (i < L - 1) maxRampRelErr = std::max(maxRampRelErr, err);
+                    else if (err > 0.10) fail("cutoff ramp: last step off");
+                } else if (v[i] != 8000.0f) {
+                    fail("cutoff not exactly on target after the ramp");
+                }
+                if (len < 0 && v[i] == 8000.0f) len = i + 1;
+                prev = v[i];
+            }
+            if (chunk == SynthParamSmoother::kChunk) rampLen = len;
+            if (len != L) fail("cutoff ramp length != kRampSeconds * sr");
+        }
+        if (maxRampRelErr > 0.02) fail("cutoff ramp is not a constant ratio per sample");
+    }
+    int sweepPlateau = 0;
+    {
+        // 10 steps 200 → 8000 Hz (equal ratios), one every 1/28 s: never flat until the last ramp ends.
+        SynthParamSmoother s;
+        s.prepare(sr, base);
+        const int every = (int)(sr / 28.0);
+        std::vector<float> v;
+        for (int k = 1; k <= 10; ++k) {
+            SynthParamTargets t = base;
+            t.cutoffHz = (float)(200.0 * std::pow(40.0, k / 10.0));
+            s.setTargets(t);
+            const std::vector<float> part = collect(s, every, 64, 0);
+            v.insert(v.end(), part.begin(), part.end());
+        }
+        const std::vector<float> rest = collect(s, L, 64, 0);
+        v.insert(v.end(), rest.begin(), rest.end());
+        float prev = 200.0f;
+        for (int i = 0; i < (int)v.size(); ++i) {
+            if (v[i] < prev) fail("28 Hz sweep not monotone");
+            if (v[i] == prev && v[i] != 8000.0f) ++sweepPlateau;
+            prev = v[i];
+        }
+        if (sweepPlateau != 0) fail("28 Hz sweep has flat segments");
+        if (v.back() != 8000.0f) fail("28 Hz sweep did not end on target");
+    }
+    {
+        // master level 0.5 → 0: linear, equal steps, exactly 0 at the end.
+        SynthParamSmoother s;
+        s.prepare(sr, base);
+        SynthParamTargets t = base; t.level = 0.0f;
+        s.setTargets(t);
+        const std::vector<float> v = collect(s, L + 10, 64, 1);
+        const double step = 0.5 / L;
+        float prev = 0.5f;
+        for (int i = 0; i < L - 1; ++i) { // the last sample is set exactly on the target
+            if (std::fabs((prev - v[i]) - step) > 1e-6) { fail("level ramp not linear"); break; }
+            prev = v[i];
+        }
+        if (v[L - 1] != 0.0f || v[L + 9] != 0.0f) fail("level ramp does not end at 0");
+        // detune 0 → +100 cents: constant ratio per sample, ends at 2^(1/12)
+        SynthParamSmoother d;
+        d.prepare(sr, base);
+        t = base; t.detuneCents = 100.0f;
+        d.setTargets(t);
+        const std::vector<float> r = collect(d, L + 1, 64, 2);
+        const double want = std::log(std::exp2(100.0 / 1200.0)) / L;
+        double prevR = 1.0;
+        for (int i = 0; i < L - 1; ++i) {
+            if (std::fabs(std::log(r[i] / prevR) - want) / want > 0.05) { fail("detune ramp not multiplicative"); break; }
+            prevR = r[i];
+        }
+        if (std::fabs(r[L] - std::exp2(100.0f / 1200.0f)) > 1e-6f) fail("detune ramp end");
+        // snap: no ramp
+        t = base; t.cutoffHz = 1234.0f; t.level = 0.3f;
+        d.snap(t);
+        d.next(1);
+        if (d.cutoff[0] != 1234.0f || d.level[0] != 0.3f || d.isSmoothing()) fail("snap ramps");
+    }
+
+    // ── PolySynthProcessor ──
+    constexpr int kBlock = 128;
+    gRenderAllocs.store(0);
+    gRenderFrees.store(0);
+    juce::MidiBuffer midi;
+    auto render = [&](PolySynthProcessor& synth, int samples, std::vector<float>* out) {
+        juce::AudioBuffer<float> buf(2, kBlock);
+        for (int done = 0; done < samples; done += kBlock) {
+            tCountAllocs = true;
+            synth.processBlock(buf, midi);
+            tCountAllocs = false;
+            if (out) out->insert(out->end(), buf.getReadPointer(0), buf.getReadPointer(0) + kBlock);
+        }
+    };
+    auto setup = [&](PolySynthProcessor& synth, TransportEngine& tr) {
+        synth.setTransport(&tr);
+        synth.setRateAndBufferSizeDetails(sr, kBlock);
+        synth.prepareToPlay(sr, kBlock);
+    };
+    auto windowPeak = [](const std::vector<float>& v, int from, int n) {
+        float p = 0.0f;
+        for (int i = from; i < from + n && i < (int)v.size(); ++i) p = std::max(p, std::fabs(v[i]));
+        return p;
+    };
+    auto maxDelta = [](const std::vector<float>& v, int from, int to) {
+        float d = 0.0f;
+        for (int i = std::max(1, from); i < to && i < (int)v.size(); ++i) d = std::max(d, std::fabs(v[i] - v[i - 1]));
+        return d;
+    };
+    double cutoffErr = 0.0;
+    float levelStepJump = 0.0f, levelSteady = 0.0f, levelAfter = 0.0f;
+    float susBefore = 0.0f, susFirst = 0.0f, susAfter = 0.0f;
+    int relActiveMid = -1, relActiveEnd = -1;
+    float relPeak = 0.0f;
+    {
+        // Cutoff step through the processor: the smoothed value after each 128-sample block.
+        TransportEngine tr; PolySynthProcessor synth; setup(synth, tr);
+        synth.setWaveform(Waveform::Saw);
+        synth.setFilterCutoff(200.0);
+        synth.noteOn(48, 127);
+        render(synth, 4800, nullptr);
+        synth.setFilterCutoff(8000.0);
+        for (int k = 1; k * kBlock <= L + kBlock; ++k) {
+            render(synth, kBlock, nullptr);
+            const int done = std::min(k * kBlock, L);
+            const double want = 200.0 * std::pow(40.0, (double)done / L);
+            cutoffErr = std::max(cutoffErr, std::fabs(synth.smoothedParams().currentCutoff() - want) / want);
+        }
+        if (cutoffErr > 1e-3 || synth.smoothedParams().currentCutoff() != 8000.0f) fail("processor cutoff ramp");
+    }
+    {
+        // Master level 0.5 → 0 on a held sine: a fade over the ramp, then exact zeros.
+        TransportEngine tr; PolySynthProcessor synth; setup(synth, tr);
+        synth.noteOn(69, 127);
+        std::vector<float> v;
+        render(synth, 9600, &v);
+        const int at = (int)v.size();
+        synth.setMasterLevel(0.0);
+        render(synth, L + 4800, &v);
+        levelSteady = maxDelta(v, at - 4800, at);
+        levelStepJump = maxDelta(v, at - 4800, at + L + 10);
+        levelAfter = windowPeak(v, at + L, 4800);
+        float prevPeak = 1.0f;
+        for (int w = 0; w + 240 <= L; w += 240) {
+            const float p = windowPeak(v, at + w, 240);
+            if (p > prevPeak + 1e-6f || p <= 0.0f) { fail("level fade not a monotone fade"); break; }
+            prevPeak = p;
+        }
+        if (windowPeak(v, at, 240) < 0.9f * windowPeak(v, at - 240, 240)) fail("level stepped instead of ramping");
+        if (levelStepJump > levelSteady * 1.02f) fail("level step: sample jump larger than the steady tone's");
+        if (levelAfter != 0.0f) fail("level 0 not silent after the ramp");
+    }
+    {
+        // Sustain 1 → 0.2 on a held sine: the note's level ramps, not steps.
+        TransportEngine tr; PolySynthProcessor synth; setup(synth, tr);
+        synth.setAttack(1.0); synth.setDecay(1.0); synth.setSustain(1.0);
+        synth.noteOn(69, 127);
+        std::vector<float> v;
+        render(synth, 9600, &v);
+        const int at = (int)v.size();
+        synth.setSustain(0.2);
+        render(synth, L + 4800, &v);
+        susBefore = windowPeak(v, at - 240, 240);
+        susFirst = windowPeak(v, at, 240);
+        susAfter = windowPeak(v, at + L + 480, 2400);
+        if (susFirst < 0.9f * susBefore) fail("sustain stepped instead of ramping");
+        if (std::fabs(susAfter - 0.2f * susBefore) > 0.01f * susBefore) fail("sustain did not reach 0.2");
+        if (maxDelta(v, at - 4800, at + L + 10) > maxDelta(v, at - 4800, at) * 1.02f) fail("sustain step jump");
+        // applySettings on the running synth: the next block starts at the settings (no ramp).
+        SynthSettings s = synth.getSettings();
+        s.filterCutoff = 1234.0f; s.masterLevel = 0.3f;
+        synth.applySettings(s);
+        render(synth, kBlock, nullptr);
+        if (synth.smoothedParams().currentCutoff() != 1234.0f || synth.smoothedParams().currentLevel() != 0.3f)
+            fail("applySettings ramped");
+    }
+    {
+        // Released during its decay at sustain 0: still fading 50 ms into a 100 ms release.
+        TransportEngine tr; PolySynthProcessor synth; setup(synth, tr);
+        synth.setAttack(1.0); synth.setDecay(1000.0); synth.setSustain(0.0); synth.setRelease(100.0);
+        synth.noteOn(69, 127);
+        render(synth, 2400, nullptr);
+        synth.noteOff(69);
+        std::vector<float> v;
+        render(synth, 2400, &v);
+        relActiveMid = synth.diag.activeVoices.load();
+        relPeak = windowPeak(v, 2400 - 240, 240);
+        render(synth, 4800, nullptr);
+        relActiveEnd = synth.diag.activeVoices.load();
+        if (relActiveMid != 1 || relPeak <= 0.0f || relActiveEnd != 0) fail("release at sustain 0");
+    }
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    if (allocs != 0 || frees != 0) fail("allocations in processBlock");
+
+    std::printf("psm   synth param smoothing (%.0f ms = %d samples @ 48k)  %-4s cutoff ramp %d samples, ratio err %.4f,"
+                " 28 Hz sweep plateaus %d; processor cutoff err %.5f; level step max |dx| %.4f (steady %.4f), after %.1f;"
+                " sustain peak %.3f -> first %.3f -> %.3f; release@sus0 active %d/%d peak %.3f; allocs %llu frees %llu%s%s\n",
+                SynthParamSmoother::kRampSeconds * 1000.0, L, ok ? "PASS" : "FAIL", rampLen, maxRampRelErr, sweepPlateau,
+                cutoffErr, levelStepJump, levelSteady, levelAfter, susBefore, susFirst, susAfter, relActiveMid,
+                relActiveEnd, relPeak, (unsigned long long)allocs, (unsigned long long)frees,
+                ok ? "" : " - ", why.c_str());
+    std::fflush(stdout);
+    return ok;
 }
 
 //==============================================================================
@@ -5399,6 +5645,294 @@ static bool runSequenceVoices() {
     return pass;
 }
 
+// Smoothing with the arpeggiator and the loop sequence (case `psmv`). Their events split a block
+// into segments (PolySynthProcessor renders up to each event offset), so the smoother must still
+// advance by exactly one value per sample: a cutoff step taken while the arp, or the sequence,
+// starts and stops voices at offsets inside 471-sample blocks follows the same ramp as with no
+// events (after every block, within 1e-3 of 200 × 40^(done / L), on 8000 Hz after it), and the
+// output stays finite. A voice the arp or the sequence releases at sustain 0 (during its decay)
+// still fades over its release time and is silent after it, also when the envelope times change
+// during that release. Non-finite setter values change nothing. Stealing with a detune ramp
+// running stays finite, and a voice stolen again before it renders leaves a tail at its own
+// pitch. A sampler pad hit adds the same output with the synth busy and ramping as on an idle
+// synth, from the first sample of its block. 0 allocations in every processBlock.
+static bool runSynthSmoothingVoices() {
+    constexpr double sr = 48000.0;
+    const int L = (int)std::floor(SynthParamSmoother::kRampSeconds * sr);
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failed; detail += " [" + what + "]"; } };
+    struct Rig {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        std::unique_ptr<seqplay::SequenceStore> store = std::make_unique<seqplay::SequenceStore>();
+        explicit Rig(double rate) {
+            synth.setTransport(&transport);
+            synth.setRateAndBufferSizeDetails(rate, 512);
+            synth.prepareToPlay(rate, 512);
+            synth.setWaveform(Waveform::Saw);
+            synth.setMasterLevel(0.5);
+            synth.setSequenceStore(store.get());
+        }
+    };
+    uint64_t allocs = 0;
+    int nonFinite = 0;
+    auto render = [&](Rig& rig, int total, std::vector<float>* out, const std::function<void(int)>& after = {}) {
+        juce::AudioBuffer<float> buf(2, 512);
+        juce::MidiBuffer midi;
+        if (out) out->assign((size_t)total, 0.0f);
+        for (int done = 0; done < total;) {
+            const int n = std::min(471, total - done);
+            buf.setSize(2, n, false, false, true);
+            gRenderAllocs.store(0); gRenderFrees.store(0);
+            tCountAllocs = true;
+            rig.synth.processBlock(buf, midi);
+            tCountAllocs = false;
+            allocs += gRenderAllocs.load() + gRenderFrees.load();
+            for (int i = 0; i < n; ++i) if (!std::isfinite(buf.getReadPointer(0)[i])) ++nonFinite;
+            if (out) std::memcpy(&(*out)[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+            done += n;
+            if (after) after(done);
+        }
+    };
+    // 1. Cutoff ramp 200 → 8000 Hz under each event source: none, the arp (1/16 at 120 bpm, gate
+    //    0.5: an on / off every 3000 samples), the sequence (a note every 1/8 beat, 1/16 long).
+    double worstErr[3] = { 0.0, 0.0, 0.0 };
+    float endCutoff[3] = { 0.0f, 0.0f, 0.0f };
+    const char* names[3] = { "none", "arp", "seq" };
+    for (int source = 0; source < 3; ++source) {
+        Rig rig(sr);
+        rig.synth.setFilterCutoff(200.0);
+        if (source == 1) {
+            ArpSettings s = ArpSettings::defaults();
+            s.enabled = true; s.gate = 0.5f;
+            rig.synth.arp().setSettings(s);
+            rig.synth.noteOn(48, 100);
+            rig.synth.noteOn(55, 100);
+        } else if (source == 2) {
+            std::vector<seqplay::Event> ev;
+            for (int k = 0; k < 32; ++k) ev.push_back(seqNote(k * 0.125, 0.0625, 48 + (k % 5) * 3));
+            rig.store->set(ev.data(), (int)ev.size(), 4.0);
+            rig.transport.start();
+        } else {
+            rig.synth.noteOn(48, 100);
+        }
+        render(rig, 4710, nullptr);
+        rig.synth.setFilterCutoff(8000.0);
+        render(rig, L + 2 * 471, nullptr, [&](int done) {
+            const double want = 200.0 * std::pow(40.0, (double)std::min(done, L) / L);
+            worstErr[source] = std::max(worstErr[source],
+                                        std::fabs(rig.synth.smoothedParams().currentCutoff() - want) / want);
+        });
+        endCutoff[source] = rig.synth.smoothedParams().currentCutoff();
+        check(worstErr[source] <= 1e-3, std::string("cutoff ramp with ") + names[source] + " events");
+        check(endCutoff[source] == 8000.0f, std::string("cutoff end with ") + names[source] + " events");
+        if (source == 1) check(rig.synth.arp().isActive(), "arp running during the ramp");
+        if (source == 2) check(rig.synth.noteQueue().lastNoteStarted.load() >= 48, "sequence started voices");
+    }
+    // 2. Release at sustain 0 during the decay, for an arp voice and a sequence voice: still
+    //    sounding half-way through a 50 ms release, silent once it is over.
+    auto envRig = [&](Rig& rig) {
+        rig.synth.setWaveform(Waveform::Sine);
+        rig.synth.setAttack(1.0); rig.synth.setDecay(1000.0); rig.synth.setSustain(0.0); rig.synth.setRelease(50.0);
+    };
+    auto peakIn = [](const std::vector<float>& v, int from, int to) {
+        float p = 0.0f;
+        for (int i = std::max(0, from); i < to && i < (int)v.size(); ++i) p = std::max(p, std::fabs(v[(size_t)i]));
+        return p;
+    };
+    float arpMid = 0.0f, arpAfter = -1.0f, seqMid = 0.0f, seqAfter = -1.0f;
+    {
+        // Arp: 1/16 at 120 bpm (6000 samples), gate 0.25: off at 1500, 50 ms = 2400 samples.
+        Rig rig(sr);
+        envRig(rig);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.25f;
+        rig.synth.arp().setSettings(s);
+        std::vector<float> out;
+        render(rig, 2400, &out); // the sustain ramp 1 → 0 ends before the note
+        rig.synth.noteOn(69, 127);
+        render(rig, 6000, &out);
+        arpMid = peakIn(out, 1500 + 1100, 1500 + 1300);
+        arpAfter = peakIn(out, 1500 + 2400 + 200, 5990);
+        check(arpMid > 0.01f, "arp voice released at sustain 0 cut instead of fading");
+        check(arpAfter == 0.0f, "arp voice not silent after its release");
+    }
+    {
+        // Sequence: a note at beat 0.1 (2400) for 1/16 beat (1500 samples): released at 3900.
+        Rig rig(sr);
+        envRig(rig);
+        std::vector<seqplay::Event> ev = { seqNote(0.1, 0.0625, 69, 127) };
+        rig.store->set(ev.data(), 1, 4.0);
+        rig.transport.start();
+        std::vector<float> out;
+        render(rig, 12000, &out);
+        seqMid = peakIn(out, 3900 + 1100, 3900 + 1300);
+        seqAfter = peakIn(out, 3900 + 2400 + 200, 12000);
+        check(seqMid > 0.01f, "sequence voice released at sustain 0 cut instead of fading");
+        check(seqAfter == 0.0f, "sequence voice not silent after its release");
+    }
+    // 3. Envelope times changed while a note released at sustain 0 is fading (attack, decay and
+    //    release, which reach every voice each block): the release keeps the rate its noteOff set.
+    float timesMid = 0.0f;
+    {
+        Rig rig(sr);
+        envRig(rig);
+        rig.synth.noteOn(69, 127);
+        std::vector<float> out;
+        render(rig, 2400, &out);
+        rig.synth.noteOff(69);
+        render(rig, 471, &out);
+        rig.synth.setAttack(5.0); rig.synth.setDecay(20.0); rig.synth.setRelease(80.0);
+        render(rig, 2400, &out);
+        timesMid = peakIn(out, 1100 - 471, 1300 - 471);
+        check(timesMid > 0.01f, "release at sustain 0 cut by an envelope time change");
+        check(rig.synth.diag.activeVoices.load() == 0, "release at sustain 0 longer than its 50 ms after a time change");
+    }
+    // 4. Non-finite values are ignored: the settings and the sound stay as they were.
+    {
+        Rig rig(sr);
+        rig.synth.setFilterCutoff(1000.0);
+        rig.synth.noteOn(57, 127);
+        std::vector<float> out;
+        render(rig, 4710, &out);
+        const SynthSettings before = rig.synth.getSettings();
+        const double nan = std::numeric_limits<double>::quiet_NaN(), inf = std::numeric_limits<double>::infinity();
+        rig.synth.setFilterCutoff(nan); rig.synth.setFilterResonance(inf); rig.synth.setDetune(-inf);
+        rig.synth.setMasterLevel(nan); rig.synth.setSustain(inf); rig.synth.setAttack(nan);
+        rig.synth.setDecay(-inf); rig.synth.setRelease(nan);
+        const SynthSettings after = rig.synth.getSettings();
+        render(rig, 4710, &out);
+        const bool same = after.filterCutoff == before.filterCutoff && after.filterResonance == before.filterResonance
+            && after.detuneCents == before.detuneCents && after.masterLevel == before.masterLevel
+            && after.sustainLevel == before.sustainLevel && after.attackMs == before.attackMs
+            && after.decayMs == before.decayMs && after.releaseMs == before.releaseMs;
+        check(same, "a non-finite value changed a setting");
+        check(peakIn(out, 0, 4710) > 0.05f, "silent after non-finite values");
+    }
+    // 5. Stealing: 20 note-ons in one block on 16 voices, then 20 more, with a detune ramp
+    //    running; finite output, 16 voices. A voice started and stolen again before it renders
+    //    leaves its 96-sample tail at its own pitch (note 108 × the detune, about 4.4 kHz: ~18 sign
+    //    changes), not the previous note's (note 60, about 1).
+    int tailCrossings = -1;
+    {
+        Rig rig(sr);
+        rig.synth.setDetune(100.0);
+        render(rig, 471, nullptr);
+        rig.synth.setDetune(-100.0);
+        for (int n = 40; n < 60; ++n) rig.synth.noteOn(n, 100);
+        render(rig, 942, nullptr);
+        for (int n = 60; n < 80; ++n) rig.synth.noteOn(n, 100);
+        render(rig, 4710, nullptr);
+        check(rig.synth.diag.activeVoices.load() == MAX_VOICES, "steal: " + std::to_string(rig.synth.diag.activeVoices.load()) + " voices");
+
+        Voice v;
+        v.prepare(sr, 512);
+        float cut[64], res[64], ratio[64], lvl[64], sus[64], buf[64] = {};
+        const float r = std::exp2(100.0f / 1200.0f);
+        for (int i = 0; i < 64; ++i) { cut[i] = 20000.0f; res[i] = 0.0f; ratio[i] = r; lvl[i] = 1.0f; sus[i] = 1.0f; }
+        v.startNote(60, 127.0f);
+        v.render(buf, 64, Waveform::Sine, cut, res, ratio, lvl, sus);
+        v.captureAndRelease(Waveform::Sine, 20000.0f, 0.0f, 1.0f); // stolen: free again
+        v.startNote(108, 127.0f);                                    // started, then stolen at once
+        v.captureAndRelease(Waveform::Sine, 20000.0f, 0.0f, 1.0f);
+        tailCrossings = 0;
+        int sign = 0;
+        for (int i = 0; i < v.fadeOutTailLength; ++i) {
+            const float x = v.fadeOutTail[i];
+            const int s = x > 0.0f ? 1 : x < 0.0f ? -1 : 0;
+            if (s != 0 && sign != 0 && s != sign) ++tailCrossings;
+            if (s != 0) sign = s;
+        }
+        const double want = 2.0 * FADE_OUT_SAMPLES * 4186.01 * r / sr; // ~17.8
+        check(std::fabs(tailCrossings - want) <= 2.0, "double steal: tail has " + std::to_string(tailCrossings)
+              + " sign changes, want about " + std::to_string((int)std::lround(want)));
+    }
+    // 6. The sampler is not touched by synth smoothing and keeps its own timing: with arp events
+    //    splitting the synth's render and cutoff / level / detune / sustain ramps running, a pad hit
+    //    adds exactly what the same hit renders on a synth with no notes and no parameter changes
+    //    (with - without the hit == the hit alone, both channels, within float rounding), from the
+    //    first sample of the block after the hit.
+    double samplerDiff = -1.0;
+    {
+        std::vector<float> srcL(24000), srcR(24000);
+        for (int i = 0; i < 24000; ++i) {
+            srcL[(size_t)i] = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi * 997.0 * i / sr);
+            srcR[(size_t)i] = 0.25f * (float)std::cos(2.0 * juce::MathConstants<double>::pi * 331.0 * i / sr);
+        }
+        auto run = [&](bool synthBusy, bool hit, std::vector<float>& outL, std::vector<float>& outR) {
+            SamplerBank bank;
+            std::string error;
+            bank.install(3, SamplerBank::fromAudio(srcL.data(), srcR.data(), 24000, sr), bank.beginLoad(3), error);
+            TransportEngine transport;
+            PolySynthProcessor synth;
+            synth.setTransport(&transport);
+            synth.setSamplerSource(&bank);
+            synth.setRateAndBufferSizeDetails(sr, 512);
+            synth.prepareToPlay(sr, 512);
+            synth.sampler().params().setLevel(1.0);
+            SamplerSlotParams p;
+            p.attackMs = 0.0f;
+            synth.sampler().params().setSlot(3, p);
+            if (synthBusy) {
+                ArpSettings s = ArpSettings::defaults();
+                s.enabled = true; s.gate = 0.5f;
+                synth.arp().setSettings(s);
+                synth.noteOn(48, 100);
+                synth.noteOn(55, 100);
+            }
+            juce::AudioBuffer<float> buf(2, 512);
+            juce::MidiBuffer midi;
+            const int total = 471 * 30;
+            outL.assign((size_t)total, 0.0f);
+            outR.assign((size_t)total, 0.0f);
+            for (int done = 0, k = 0; done < total; ++k) {
+                const int n = std::min(471, total - done);
+                if (synthBusy && k == 4) {
+                    synth.setFilterCutoff(300.0); synth.setMasterLevel(0.2); synth.setDetune(-50.0); synth.setSustain(0.3);
+                }
+                if (hit && k == 5) synth.samplerHit(3, 127);
+                buf.setSize(2, n, false, false, true);
+                gRenderAllocs.store(0); gRenderFrees.store(0);
+                tCountAllocs = true;
+                synth.processBlock(buf, midi);
+                tCountAllocs = false;
+                allocs += gRenderAllocs.load() + gRenderFrees.load();
+                std::memcpy(&outL[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+                std::memcpy(&outR[(size_t)done], buf.getReadPointer(1), (size_t)n * sizeof(float));
+                done += n;
+            }
+        };
+        std::vector<float> aL, aR, bL, bR, cL, cR;
+        run(true, true, aL, aR);
+        run(true, false, bL, bR);
+        run(false, true, cL, cR);
+        samplerDiff = 0.0;
+        for (size_t i = 0; i < aL.size(); ++i) {
+            samplerDiff = std::max(samplerDiff, (double)std::fabs((aL[i] - bL[i]) - cL[i]));
+            samplerDiff = std::max(samplerDiff, (double)std::fabs((aR[i] - bR[i]) - cR[i]));
+        }
+        int firstC = -1;
+        for (size_t i = 0; i < cL.size(); ++i) if (cL[i] != 0.0f || cR[i] != 0.0f) { firstC = (int)i; break; }
+        check(firstC == 5 * 471 || firstC == 5 * 471 + 1, "sampler hit starts at " + std::to_string(firstC));
+        check(samplerDiff < 1e-5, "sampler output changed by the synth's smoothing / segments ("
+              + std::to_string(samplerDiff) + ")");
+        float synthPeak = 0.0f;
+        for (float v : bL) synthPeak = std::max(synthPeak, std::fabs(v));
+        check(synthPeak > 0.01f, "synth silent in the sampler comparison");
+    }
+    check(nonFinite == 0, "non-finite output " + std::to_string(nonFinite));
+    check(allocs == 0, "allocations " + std::to_string(allocs));
+    const bool pass = failed == 0;
+    std::printf("psmv  smoothing with arp / sequence events inside blocks  %-4s cutoff ramp err none %.5f arp %.5f seq %.5f;"
+                " release@sus0 mid / after: arp %.3f / %.3f, seq %.3f / %.3f, times changed %.3f;"
+                " double-steal tail sign changes %d; sampler with - without - alone %.2g; %d failed checks%s\n",
+                pass ? "PASS" : "FAIL", worstErr[0], worstErr[1], worstErr[2], arpMid, arpAfter, seqMid, seqAfter,
+                timesMid, tailCrossings, samplerDiff, failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 // The background policy's decisions (ios/BackgroundPolicy.h).
 static bool runBackgroundPolicy() {
     int failed = 0;
@@ -5574,6 +6108,8 @@ int main(int argc, char** argv) {
     if (want("seq")) unexpected += runSequence() ? 0 : 1;
     if (want("seqv")) unexpected += runSequenceVoices() ? 0 : 1;
     if (want("bg")) unexpected += runBackgroundPolicy() ? 0 : 1;
+    if (want("psm")) unexpected += runSynthSmoothing() ? 0 : 1;
+    if (want("psmv")) unexpected += runSynthSmoothingVoices() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

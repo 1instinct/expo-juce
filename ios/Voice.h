@@ -3,7 +3,7 @@
 #include "JuceConfig.h"
 #include <juce_dsp/juce_dsp.h>
 #include <juce_audio_basics/juce_audio_basics.h>
-#include <atomic>
+#include <cstdint>
 
 enum class Waveform { Sine, Square, Saw, Triangle };
 
@@ -16,18 +16,38 @@ enum class VoiceSource : uint8_t { Player = 0, Arp = 1, Sequence = 2 };
 
 inline constexpr int FADE_OUT_SAMPLES = 96;
 
+// Envelope settings as the setters store them (times in ms).
+struct EnvelopeSettings {
+    float attackMs = 2.0f;
+    float decayMs = 1.0f;
+    float sustain = 1.0f;
+    float releaseMs = 200.0f;
+    bool operator==(const EnvelopeSettings& o) const {
+        return attackMs == o.attackMs && decayMs == o.decayMs && sustain == o.sustain && releaseMs == o.releaseMs;
+    }
+    bool operator!=(const EnvelopeSettings& o) const { return !(*this == o); }
+};
+
+// One synth voice. Audio thread only, except prepare() (before rendering starts).
 class Voice {
 public:
     Voice();
 
     void prepare(double sampleRate, int blockSize);
-    void renderBlock(float* buffer, int numSamples,
-                     Waveform waveform, double frequency,
-                     float filterCutoff, float filterResonance,
-                     float masterLevel);
+
+    // Adds n samples of this voice to out. The parameter arrays hold one value per sample (from
+    // SynthParamSmoother): filter cutoff in Hz, resonance 0…1, pitch ratio (detune), output
+    // level, envelope sustain level. A value is applied only on the sample it changes.
+    void render(float* out, int n, Waveform waveform,
+                const float* cutoffHz, const float* resonance, const float* pitchRatio,
+                const float* level, const float* sustain);
 
     void startNote(int note, float velocity);
     void stopNote();
+
+    // Envelope for this voice: applied now unless the voice is in its release stage (whose
+    // rate is fixed when the note is released, see Voice.mm), otherwise on its next note.
+    void setEnvelope(const EnvelopeSettings& e);
 
     // Held: between startNote and stopNote (a voice in its release stage is not held).
     bool isHeld() const { return held && noteNumber >= 0; }
@@ -36,8 +56,9 @@ public:
     uint64_t startSeq = 0;
     VoiceSource source = VoiceSource::Player;
 
-    void captureAndRelease(Waveform waveform, double frequency,
-                           float filterCutoff, float filterResonance,
+    // Renders a short faded tail of the sounding note (with the given current parameters) into
+    // fadeOutTail and frees the voice, so it can be stolen without a click.
+    void captureAndRelease(Waveform waveform, float filterCutoff, float filterResonance,
                            float masterLevel);
 
     bool isActive() const;
@@ -50,13 +71,11 @@ public:
     int fadeOutTailPos = 0;
     bool hasFadeOutTail() const { return fadeOutTailPos < fadeOutTailLength; }
 
-    std::atomic<float> attackMs{2.0f};
-    std::atomic<float> decayMs{1.0f};
-    std::atomic<float> sustainLevel{1.0f};
-    std::atomic<float> releaseMs{200.0f};
-
 private:
-    void updateADSR();
+    void applyEnvelope(bool force = false);
+    void setFrequency(float hz);
+    void setFilter(float cutoffHz, float resonance);
+    float nextOscSample(Waveform waveform);
 
     juce::dsp::Oscillator<float> sineOsc;
     juce::dsp::Oscillator<float> squareOsc;
@@ -65,8 +84,17 @@ private:
     juce::dsp::StateVariableTPTFilter<float> filter;
     juce::ADSR adsr;
 
+    EnvelopeSettings envelope;          // wanted
+    EnvelopeSettings appliedEnvelope;   // what adsr holds (after prepare)
+    // Last values handed to the oscillators / filter (-1 = none yet: set on the next sample).
+    float appliedFreq = -1.0f;
+    float appliedCutoff = -1.0f;
+    float appliedResonance = -1.0f;
+
     int noteNumber = -1;
     bool held = false;
+    float baseFreq = 440.0f;
+    float lastPitchRatio = 1.0f;        // detune ratio of the last pitch rendered
     float velocityGain = 0.0f;
     float currentLevel = 0.0f;
     double cachedSampleRate = 44100.0;

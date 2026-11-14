@@ -49,7 +49,7 @@ foreach(u IN LISTS ENGINE_UNITS)
   list(APPEND ENGINE_CPP "${SNAP}/${u}.cpp")
 endforeach()
 # Header-only engine units (pure C++), e.g. the device callback GraphPlayer.
-set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser DrumMachine LatencyStats DisplayRate DeviceFormat MidiInput OwnerToken SequencePlayer BackgroundPolicy Hermite SamplerEngine)
+set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser DrumMachine LatencyStats DisplayRate DeviceFormat MidiInput OwnerToken SequencePlayer BackgroundPolicy Hermite SamplerEngine SynthParamSmoother)
 foreach(u IN LISTS ENGINE_HEADERS)
   set(out "${SNAP}/${u}.h")
   if(HARNESS_GIT_REF STREQUAL "WORKTREE")

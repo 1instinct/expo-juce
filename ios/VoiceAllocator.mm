@@ -26,8 +26,7 @@ int VoiceAllocator::findVoice(Voice* voices) {
 }
 
 int VoiceAllocator::noteOn(int note, float velocity, Voice* voices,
-                           Waveform waveform, double detuneCents,
-                           float filterCutoff, float filterResonance,
+                           Waveform waveform, float filterCutoff, float filterResonance,
                            float masterLevel, uint64_t seq, VoiceSource source) {
     // Retrigger: the latest voice of this note stops, unless one of the two belongs to the loop
     // sequence and the other does not (see VoiceSource).
@@ -47,13 +46,7 @@ int VoiceAllocator::noteOn(int note, float velocity, Voice* voices,
 
     if (voice.isActive()) {
         int oldNote = voice.getNoteNumber();
-        double oldFreq = 440.0 * std::pow(2.0, (oldNote - 69) / 12.0);
-        if (std::fabs(detuneCents) > 0.01) {
-            oldFreq *= std::pow(2.0, detuneCents / 1200.0);
-        }
-
-        voice.captureAndRelease(waveform, oldFreq,
-                                filterCutoff, filterResonance, masterLevel);
+        voice.captureAndRelease(waveform, filterCutoff, filterResonance, masterLevel);
 
         if (oldNote >= 0 && oldNote < 128) {
             noteMap[oldNote] = -1;

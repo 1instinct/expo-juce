@@ -12,6 +12,7 @@
 #include "AnalysisRing.h"
 #include "LatencyStats.h"
 #include "SequencePlayer.h"
+#include "SynthParamSmoother.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -117,10 +118,19 @@ public:
     void setRelease(double ms);
     void setDetune(double cents);
     void setMasterLevel(double level);
+    // The setters store targets (non-finite values are ignored). Cutoff, resonance, detune,
+    // master level and sustain reach the sound through SynthParamSmoother's per-sample ramps
+    // (SynthParamSmoother::kRampSeconds); attack / decay / release times apply at once (see
+    // Voice::setEnvelope).
 
     // Any thread (atomic loads / stores, same as the setters). Includes the arpeggiator's options.
+    // getSettings returns the targets. applySettings makes the next block jump to the settings
+    // instead of ramping to them (a rebuilt engine restores the previous one's settings).
     SynthSettings getSettings() const;
     void applySettings(const SynthSettings& s);
+
+    // Audio thread / tests: the smoothed values as of the last rendered sample.
+    const SynthParamSmoother& smoothedParams() const { return smoother; }
 
     // The arpeggiator between the note queue and the voices (options any thread, see
     // Arpeggiator::setSettings / setSettingsStore; applySettings writes its store too). Enabled, drained note-ons feed it and it starts / stops voices
@@ -176,9 +186,10 @@ private:
     void startDrumHit(const NoteEvent& event);
     void startSamplerEvent(const NoteEvent& event);
     void recordNoteLatency(const NoteEvent& event);
-    void renderVoices(float* mono, int numSamples, Waveform wf, float detune, float cutoff, float reso, float master);
+    void renderVoices(float* mono, int numSamples, Waveform wf);
     void applyArpEvent(const ArpEvent& event);
     void applySequenceOutput(const seqplay::Output& out);
+    SynthParamTargets loadTargets() const;
 
     Voice voices[MAX_VOICES];
     VoiceAllocator allocator;
@@ -204,6 +215,13 @@ private:
     std::atomic<float> filterResonance{0.0f};
     std::atomic<float> detuneCents{0.0f};
     std::atomic<float> masterLevel{0.5f};
+    std::atomic<float> attackMs{2.0f};
+    std::atomic<float> decayMs{1.0f};
+    std::atomic<float> sustainLevel{1.0f};
+    std::atomic<float> releaseMs{200.0f};
+    std::atomic<bool> snapParams{false}; // set by applySettings, consumed by processBlock
+
+    SynthParamSmoother smoother; // audio thread (and prepareToPlay)
 
     NoteEventQueue ownQueue;
     NoteEventQueue* queue = &ownQueue;
