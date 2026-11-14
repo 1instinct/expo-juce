@@ -19,6 +19,8 @@
 #include "Arpeggiator.h"
 #include "DrumMachine.h"
 #include "SpectrumAnalyser.h"
+#include "SourceRing.h"
+#include "SourceAnalysis.h"
 #include "NoteEventQueue.h"
 #include "GraphPlayer.h"
 
@@ -86,6 +88,10 @@ FxParamStore sFxParams;
 ArpSettingsStore sArpOptions;
 DrumParamStore sDrumParams;
 AnalysisRing sAnalysis;
+// Per-source taps (sourceAnalysisJson): the instrument is written by FxChainProcessor at the end of
+// its block. There is no aux node on Android yet, so the backing ring is never written (inactive).
+SourceRing sInstrumentRing;
+SourceRing sBackingRing;
 
 std::function<std::unique_ptr<juce::AudioIODeviceType>()> sExtraDeviceTypeFactory;
 
@@ -285,6 +291,8 @@ void doSetupLocked() {
     sFx = fxProcessor.get();
     sFx->setParamStore(&sFxParams);
     sFx->setTransport(sTransport);
+    sFx->setSourceRing(&sInstrumentRing);
+    sBackingRing.setSampleRate(sr);
     auto fxNode = sGraph->addNode(std::move(fxProcessor));
 
     setStep(8, "addNode (output)");
@@ -657,6 +665,45 @@ std::string drumStateJson() {
     juce::var result(d);
     d->setProperty("kit", kitVar);
     d->setProperty("voices", juce::var(voices));
+    return toJson(result);
+}
+
+// Created on first use (FFT + scratch), never freed: nothing JUCE is destroyed by static destruction.
+SourceAnalyser& sourceAnalyser(bool instrument) {
+    static SourceAnalyser* const instrumentAnalyser = new SourceAnalyser();
+    static SourceAnalyser* const backingAnalyser = new SourceAnalyser();
+    return instrument ? *instrumentAnalyser : *backingAnalyser;
+}
+
+std::string sourceAnalysisJson(const std::string& source, bool bands, const std::string& scope, double scopePoints,
+                               double cycleHz, double windowMs) {
+    const bool instrument = source == "instrument";
+    if (!instrument && source != "backing") return "{}";
+    SourceAnalysisOptions o;
+    o.bands = bands;
+    o.scope = sourceScopeModeFrom(scope.c_str(), o.scope);
+    o.scopePoints = SourceAnalysisOptions::pointsFrom(scopePoints);
+    o.cycleHz = cycleHz;
+    o.windowMs = windowMs;
+    SourceRing& ring = instrument ? sInstrumentRing : sBackingRing;
+    const bool running = sAnalysis.isActive();
+    // No aux node on Android yet: the backing track never sounds.
+    const bool active = running && instrument && ring.loudRecently();
+    SourceAnalysisResult r;
+    sourceAnalyser(instrument).analyse(ring, running, active, sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed), o, r);
+    juce::Array<juce::var> bandValues, points;
+    for (int i = 0; i < SpectrumAnalyser::kBands; ++i) bandValues.add(forJS(r.bands[i]));
+    for (int i = 0; i < r.scopeCount; ++i) points.add(forJS(r.scope[i]));
+    auto* d = new juce::DynamicObject();
+    juce::var result(d);
+    d->setProperty("active", r.active);
+    d->setProperty("peak", forJS(r.peak));
+    d->setProperty("rms", forJS(r.rms));
+    d->setProperty("bands", juce::var(bandValues));
+    d->setProperty("scope", juce::var(points));
+    d->setProperty("scopeMode", sourceScopeModeName(r.scopeMode));
+    d->setProperty("scopePeriod", finite(r.scopePeriod));
+    d->setProperty("sampleRate", finite(r.sampleRate));
     return toJson(result);
 }
 

@@ -285,6 +285,7 @@ void AuxProcessor::setBackingTrack(BackingTrack* t) {
 
 void AuxProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/) {
     sr = sampleRate > 0.0 ? sampleRate : 48000.0;
+    if (sourceRing != nullptr) sourceRing->setSampleRate(sr);
     renderClicks();
     clickData = nullptr;
     clickLength = clickPos = 0;
@@ -300,6 +301,7 @@ void AuxProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/) {
     wasPlaying = false;
     havePrevBlock = false;
     trackActive = false;
+    trackSounding = false;
     tailActive = false;
     trackPos = 0;
     lastClickedBeat = 0;
@@ -337,8 +339,14 @@ void AuxProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
     float* left = buffer.getWritePointer(0);
     float* right = buffer.getWritePointer(1);
 
-    renderMetronome(left, right, n, beatStart, beatsPerSample, playing);
+    // Track first, then the metronome: both add into the cleared block (x + y == y + x exactly), so
+    // the backing-track tap can read the track alone in between.
     renderTrack(left, right, n, beatStart, bpm, playing, seeked);
+    if (sourceRing != nullptr) {
+        sourceRing->write(buffer.getArrayOfReadPointers(), 2, n);
+        sourceRing->publishSounding(trackSounding);
+    }
+    renderMetronome(left, right, n, beatStart, beatsPerSample, playing);
 
     const double advanced = playing ? beatsPerSample * n : 0.0;
     prevBeatStart = beatStart;
@@ -479,6 +487,7 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
     // A tail on the current buffer no longer needs the protected previous one.
     if (tailActive && tailBuffer == t && tailProtected) { track->releaseTail(); tailProtected = false; }
 
+    trackSounding = false;
     if (!trackActive && !tailActive) {
         if (tailProtected) { track->releaseTail(); tailProtected = false; }
         diag.trackPositionSec.store(-1.0, r);
@@ -545,6 +554,8 @@ void AuxProcessor::renderTrack(float* left, float* right, int n, double beatStar
     if (!tailActive && tailProtected) { track->releaseTail(); tailProtected = false; }
     if (trackActive) {
         const int64_t len = t->length;
+        // Sounding: some of this block was inside the track (or it loops) at a level above 0.
+        trackSounding = settings->trackLevel.load(r) > 0.0f && (loop || (trackPos > 0 && trackPos - n < len));
         diag.trackPositionSec.store((double)(loop ? ((trackPos % len) + len) % len : trackPos) / sr, r);
     } else {
         diag.trackPositionSec.store(-1.0, r);

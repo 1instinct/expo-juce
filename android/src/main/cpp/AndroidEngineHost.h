@@ -76,6 +76,12 @@ std::string effectsStateJson();
 std::string arpeggiatorStateJson();
 std::string drumStateJson();
 std::string analysisJson();
+// getSourceAnalysis (any thread): "instrument" (the synth after the effects chain) or "backing"
+// (always inactive: no backing track on Android yet); "{}" for another source. scope: "none" |
+// "window" | "cycle"; NaN scopePoints / windowMs and cycleHz 0 take the defaults. The shape iOS
+// returns: { active, peak, rms, bands: [24], scope: [n], scopeMode, scopePeriod, sampleRate }.
+std::string sourceAnalysisJson(const std::string& source, bool bands, const std::string& scope, double scopePoints,
+                               double cycleHz, double windowMs);
 
 // ── Test seam ────────────────────────────────────────────────────
 // When set, every AudioDeviceManager the host creates gets this device type added before it is

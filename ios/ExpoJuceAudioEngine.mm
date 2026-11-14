@@ -19,6 +19,8 @@
 #include "Arpeggiator.h"
 #include "DrumMachine.h"
 #include "SpectrumAnalyser.h"
+#include "SourceRing.h"
+#include "SourceAnalysis.h"
 #include "LatencyStats.h"
 #include "DisplayRate.h"
 #include "DeviceFormat.h"
@@ -190,6 +192,14 @@ static AnalysisRing sAnalysis;        // atomics only
 static SpectrumAnalyser& sSpectrum = *new SpectrumAnalyser();
 static std::atomic_flag sSpectrumBusy = ATOMIC_FLAG_INIT;
 static float sLastBands[SpectrumAnalyser::kBands] = {};
+// Per-source taps (getSourceAnalysis): the instrument (synth + drums after the effects, written by
+// FxChainProcessor) and the backing track alone (written by AuxProcessor before the metronome is
+// added). Process-lifetime like sAnalysis; their analysers (FFT + scratch, allocated once) are
+// heap-allocated and never freed, like sSpectrum.
+static SourceRing sInstrumentRing;      // atomics only
+static SourceRing sBackingRing;         // atomics only
+static SourceAnalyser& sInstrumentAnalyser = *new SourceAnalyser();
+static SourceAnalyser& sBackingAnalyser = *new SourceAnalyser();
 
 // ── Arpeggiator options ──
 // Same pattern as the aux settings: the process-lifetime store every setArpeggiator writes (no
@@ -791,6 +801,7 @@ static int mainThreadMaxFramesPerSecond() {
     sFx = fxProcessor.get();
     sFx->setParamStore(&sFxParams);
     sFx->setTransport(sTransport);
+    sFx->setSourceRing(&sInstrumentRing);
     auto fxNode = sGraph->addNode(std::move(fxProcessor));
     // Aux source (metronome + backing track): straight into the output, not through the effects.
     auto auxProcessor = std::make_unique<AuxProcessor>();
@@ -799,6 +810,7 @@ static int mainThreadMaxFramesPerSecond() {
     sAux->setBackingTrack(&sBackingTrack);
     sAux->setTransport(sTransport);
     sAux->setAnalysis(&sAnalysis);
+    sAux->setSourceRing(&sBackingRing);
     auto auxNode = sGraph->addNode(std::move(auxProcessor));
 
     self.setupStep = 8;
@@ -2104,6 +2116,45 @@ static NSString *backingTrackPath(NSString *uri) {
             @"steps": @(active ? sAnalysis.arpSteps() : sArpOptions.get().patternLength),
             @"note": @(active ? sAnalysis.arpNote() : -1),
         },
+    };
+}
+
+// ── Per-source analysis ──
+// Any thread, no engine lock: the process-lifetime rings and their analysers (each serialises its
+// own callers). Zeros (active NO) while the engine is not running; an unknown source returns nil.
+- (NSDictionary<NSString *, id> *)sourceAnalysis:(NSString *)source
+                                         options:(NSDictionary<NSString *, id> *)options {
+    const bool instrument = [source isEqualToString:@"instrument"];
+    if (!instrument && ![source isEqualToString:@"backing"]) return nil;
+    SourceAnalysisOptions o;
+    if ([options isKindOfClass:[NSDictionary class]]) {
+        id bands = options[@"bands"];
+        if ([bands isKindOfClass:[NSNumber class]]) o.bands = [(NSNumber *)bands boolValue];
+        id scope = options[@"scope"];
+        if ([scope isKindOfClass:[NSString class]]) o.scope = sourceScopeModeFrom(((NSString *)scope).UTF8String, o.scope);
+        if (NSNumber *n = numberFrom(options, @"scopePoints")) o.scopePoints = SourceAnalysisOptions::pointsFrom(n.doubleValue);
+        if (NSNumber *n = numberFrom(options, @"cycleHz")) o.cycleHz = n.doubleValue;
+        if (NSNumber *n = numberFrom(options, @"windowMs")) o.windowMs = n.doubleValue;
+    }
+    SourceRing& ring = instrument ? sInstrumentRing : sBackingRing;
+    const bool running = sAnalysis.isActive();
+    const bool active = running && (instrument ? ring.loudRecently() : ring.sounding());
+    SourceAnalysisResult r;
+    (instrument ? sInstrumentAnalyser : sBackingAnalyser)
+        .analyse(ring, running, active, sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed), o, r);
+    NSMutableArray<NSNumber *> *bandValues = [NSMutableArray arrayWithCapacity:SpectrumAnalyser::kBands];
+    for (int i = 0; i < SpectrumAnalyser::kBands; ++i) [bandValues addObject:@(r.bands[i])];
+    NSMutableArray<NSNumber *> *points = [NSMutableArray arrayWithCapacity:(NSUInteger)r.scopeCount];
+    for (int i = 0; i < r.scopeCount; ++i) [points addObject:@(r.scope[i])];
+    return @{
+        @"active": @(r.active ? YES : NO),
+        @"peak": @(r.peak),
+        @"rms": @(r.rms),
+        @"bands": bandValues,
+        @"scope": points,
+        @"scopeMode": @(sourceScopeModeName(r.scopeMode)),
+        @"scopePeriod": @(r.scopePeriod),
+        @"sampleRate": @(r.sampleRate),
     };
 }
 

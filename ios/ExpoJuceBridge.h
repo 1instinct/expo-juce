@@ -91,6 +91,10 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
     NS_SWIFT_NAME(loadBackingTrack(_:gapless:completion:));
 + (void)unloadBackingTrack;
 + (NSDictionary<NSString *, id> *)getAnalysis NS_SWIFT_NAME(getAnalysis());
+// nil for an unknown source ("instrument" | "backing").
++ (nullable NSDictionary<NSString *, id> *)getSourceAnalysis:(NSString *)source
+                                                     options:(nullable NSDictionary<NSString *, id> *)options
+    NS_SWIFT_NAME(getSourceAnalysis(_:options:));
 
 // ── Arpeggiator (0.7.0+) ─────────────────────────────────────────
 // Lock-free, any thread; remembered before setup and across rebuilds. NO (nothing applied): unknown

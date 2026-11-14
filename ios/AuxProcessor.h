@@ -10,6 +10,7 @@
 #include "TransportEngine.h"
 #include "BackingTrack.h"
 #include "AnalysisRing.h"
+#include "SourceRing.h"
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -149,6 +150,12 @@ public:
     std::vector<float> clickBuffer(int style, bool accent) const;
     // Transport state as of the last rendered block, for getAnalysis (nullptr = none).
     void setAnalysis(AnalysisRing* a) { analysis = a; }
+    // Backing-track tap for getSourceAnalysis (nullptr = none): the block's backing track alone, at
+    // its level, written after the track is rendered and before the metronome is added (both add
+    // into the cleared block, so the node's output is unchanged), plus whether the track is really
+    // sounding (loaded at this rate, enabled, level > 0, transport playing, inside the track or
+    // looping).
+    void setSourceRing(SourceRing* r) { sourceRing = r; }
 
     AuxDiagnostics diag;
 
@@ -167,6 +174,7 @@ private:
     BackingTrack* track = &ownTrack;
     TransportEngine* transport = nullptr;
     AnalysisRing* analysis = nullptr;
+    SourceRing* sourceRing = nullptr;
 
     double sr = 48000.0;
     bool prepared = false;
@@ -185,6 +193,7 @@ private:
     bool havePrevBlock = false;       // prevBeatStart / prevBeatsAdvanced valid
     double prevBeatStart = 0.0, prevBeatsAdvanced = 0.0;
     bool trackActive = false;         // main voice playing
+    bool trackSounding = false;       // trackActive, level > 0 and inside the track (or looping), this block
     int64_t trackPos = 0;             // main voice position (samples at sr, not wrapped); with grains, the incoming head
     bool grainsActive = false;        // following a tempo that is not the track's
     bool grainsOnGrid = false;        // back at the track's tempo: the incoming head is the exact position

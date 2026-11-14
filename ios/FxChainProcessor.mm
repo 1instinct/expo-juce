@@ -174,6 +174,7 @@ void FxChainProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/)
 
     for (int fx = 0; fx < kFxCount; ++fx) resetEffect(fx);
     pumpFreeBeat = 0.0;
+    if (sourceRing != nullptr) sourceRing->setSampleRate(sr);
     prepared = true;
 }
 
@@ -210,6 +211,9 @@ void FxChainProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Midi
         minGain = std::min(minGain, runLimiter(left + done, right + done, n));
         done += n;
     }
+
+    // Instrument tap: what this chain hands to the output, before the graph sums the aux node in.
+    if (sourceRing != nullptr) sourceRing->write(buffer.getArrayOfReadPointers(), 2, numSamples);
 
     diag.limiterGain.store(minGain, std::memory_order_relaxed);
     diag.processCount.fetch_add(1, std::memory_order_relaxed);

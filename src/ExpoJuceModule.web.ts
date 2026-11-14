@@ -11,6 +11,8 @@ import type {
   DrumVoiceParams,
   EffectsState,
   MetronomeOptions,
+  SourceAnalysis,
+  SourceAnalysisOptions,
 } from './ExpoJuce.types';
 import { defaultEffectsState } from './effectDefaults';
 import { arpDefaults } from './arpDefaults';
@@ -63,6 +65,25 @@ export default {
       beat: 0,
       playing: false,
       arp: { active: false, step: 0, steps: 16, note: -1 },
+    };
+  },
+  // No per-source analysis on web: always inactive, zeros of the asked shape.
+  hasSourceAnalysis(): boolean {
+    return false;
+  },
+  getSourceAnalysis(_source: string, options: SourceAnalysisOptions | null): SourceAnalysis {
+    const none = options?.scope === 'none';
+    const n = options?.scopePoints;
+    const points = typeof n === 'number' && Number.isFinite(n) ? Math.min(128, Math.max(16, Math.round(n))) : 64;
+    return {
+      active: false,
+      peak: 0,
+      rms: 0,
+      bands: new Array(24).fill(0),
+      scope: none ? [] : new Array(points).fill(0),
+      scopeMode: none ? 'none' : 'window',
+      scopePeriod: 0,
+      sampleRate: 0,
     };
   },
   // No arpeggiator on web: nothing applied, defaults reported.

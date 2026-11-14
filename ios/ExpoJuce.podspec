@@ -53,6 +53,8 @@ Pod::Spec.new do |s|
     "NoteEventQueue.h",
     "Arpeggiator.h",
     "SpectrumAnalyser.h",
+    "SourceRing.h",
+    "SourceAnalysis.h",
     "DrumMachine.h",
     "LatencyStats.h",
     "DisplayRate.h",

@@ -37,6 +37,8 @@ implemented yet (see [Android](#android-090)). The web module is a stub.
                             AuxProcessor: clicks rendered at prepare; track buffer swapped in from
                             a process-lifetime BackingTrack holder (decoded on a background queue)
  GraphPlayer also writes the output into an AnalysisRing (getAnalysis: peak / rms / scope)
+ FxChainProcessor and AuxProcessor write the instrument and the backing track into SourceRings
+ (getSourceAnalysis, 0.10.0+)
 ```
 
 ## Roadmap: Full Audio Workstation
@@ -379,6 +381,71 @@ the device rate the bands were computed at. `arp` is the arpeggiator as of the l
 (pattern length), `note` (last note the arp started, -1 if none). Older binaries: 24 zeros,
 `sampleRate` 0, `arp` inactive.
 
+### Per-source analysis (0.10.0+)
+
+`getAnalysis()` is the whole output. `getSourceAnalysis()` splits it into two sources, each with
+its own spectrum, level and scope:
+
+- `'instrument'`: the synth and the drums after the effects chain (what is played, as heard);
+- `'backing'`: the backing track alone, at its level.
+
+The metronome is in neither (it stays in `getAnalysis()`, which is unchanged).
+
+```ts
+if (ExpoJuce.hasSourceAnalysis()) {
+  const backing = ExpoJuce.getSourceAnalysis('backing', { scope: 'none' });
+  const inst = ExpoJuce.getSourceAnalysis('instrument', { scope: 'cycle', scopePoints: 32 });
+  // { active, peak, rms, bands: number[24], scope: number[n], scopeMode, scopePeriod, sampleRate }
+}
+```
+
+Options (all optional; numbers are clamped):
+
+| Option | Default | |
+|---|---|---|
+| `bands` | `true` | 24 bands, the table and scaling of `getAnalysis().bands` (one 2048-point FFT); `false` returns 24 zeros |
+| `scope` | `'window'` | `'none'` (`scope: []`), `'window'` or `'cycle'` |
+| `scopePoints` | 64 | 16–128 |
+| `cycleHz` | the last note the synth started | `'cycle'`: the fundamental |
+| `windowMs` | 20 | 5–42, `'window'` and the `'cycle'` fallback |
+
+- `active`: the source is producing sound. Backing: a track is loaded at the device rate, enabled,
+  at a level above 0, the transport plays and the position is inside the track (or it loops), so
+  a track that ended with `loop: false` or a stopped transport reads `false` by itself.
+  Instrument: its output reached −80 dBFS within the last 100 ms.
+- `peak` / `rms`: since the previous call for that source (each source keeps its own).
+- `scope` (−1..1, not normalised):
+  - `'window'`: the last `windowMs`, each point a Hann-weighted average over its own span (no
+    aliasing: a 9 kHz tone reads under 0.002 of its level in 64 points over 20 ms, where picking
+    samples would show it at full level), centred on the largest positive peak of the last two
+    window lengths, refined between samples. A steady tone stands still from call to call; a hit
+    sits in the middle once it is half a window old.
+  - `'cycle'`: one period P = sampleRate / f, starting at its peak (point 0 is the maximum,
+    placed between samples) and resampled to `scopePoints` with the same anti-alias weighting, so
+    consecutive calls on a steady tone return the same shape (a synth saw moves by under 1% of its
+    range between calls). The period after the latest rising zero crossing must correlate with
+    the one before it (≥ 0.9); otherwise, and for frequencies whose three and a half periods do not
+    fit the 7168-sample history (below about 24 Hz at 48 kHz), the scope comes back as `'window'`
+    (`scopeMode` says which). Chords, drums, noise, glides and silence fall back this way.
+  - `scopePeriod`: P in samples for `'cycle'`, else 0.
+- Zeros, `active: false` and `sampleRate: 0` while the engine is not running. Older binaries
+  (and web): the same inactive shape, and `hasSourceAnalysis()` is `false`.
+
+Cost: on the audio thread, two ring writes per block (per sample one relaxed atomic store, a max
+and a multiply-add; about 0.25 µs per 256-sample block each on a desktop core in the harness), no
+FFT, allocation or lock. On the calling thread, per call: a copy of the source's ring, one FFT
+when `bands` is on (about 50 µs) and the scope (bands + cycle about 40 µs in the harness). Two
+calls per frame at 25–60 Hz are fine on the JS thread. Calls for one source are serialised (a
+reader-side mutex the audio thread never takes).
+
+Taps: the instrument is written at the end of `FxChainProcessor` (after the limiter); the backing
+track inside `AuxProcessor`, which now renders the track first, writes the tap, then adds the
+metronome: both add into the cleared block, so the node's output is the same bit for bit (the
+harness compares a graph with the taps against one without).
+
+Android: `'instrument'` is analysed; `'backing'` is always inactive (no backing track on Android
+yet).
+
 ### `JucePadView` (0.5.2+)
 
 A native view that plays a note on touch from the iOS main thread, without the JS thread,
@@ -560,6 +627,7 @@ without it), output only, so no microphone permission is involved.
 | | Android 0.9.0 |
 |---|---|
 | `setup` / `shutdown`, `noteOn` / `noteOff` / `allNotesOff`, the nine synth setters, `playTestTone`, `getDiagnostics` | implemented |
+| `getSourceAnalysis` (0.10.0+) | `'instrument'` implemented; `'backing'` always inactive |
 | effects, metronome / backing track, analysis, arpeggiator, drums, transport, beat events | present, not implemented: setters return `false` (nothing applied), getters return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` is `false` |
 | `JucePadView` | not available: `isJucePadViewAvailable()` is `false` |
 

@@ -257,6 +257,16 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.getAnalysis()
     }
 
+    // Per-source analysis (0.10.0+): "instrument" or "backing" ({} for an unknown source; the JS
+    // wrapper only passes those two).
+    Function("getSourceAnalysis") { (source: String, options: [String: Any]?) -> [String: Any] in
+      return ExpoJuceBridge.getSourceAnalysis(source, options: options) ?? [:]
+    }
+
+    Function("hasSourceAnalysis") { () -> Bool in
+      return true
+    }
+
     // ── Arpeggiator (0.7.0+) ───────────────────────────────────────
     // Options are lock-free and remembered before setup and across rebuilds. false (nothing
     // applied) for an unknown mode / rate.
