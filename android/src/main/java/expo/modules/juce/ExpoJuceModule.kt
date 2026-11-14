@@ -14,7 +14,8 @@ import expo.modules.kotlin.modules.ModuleDefinition
  * Implemented: lifecycle (setup / shutdown on the main thread), diagnostics, the test tone, notes
  * and the synth parameters. Everything else exists with the iOS "not ready" / defaults shape, so
  * callers written for iOS work unchanged: setters return false (nothing applied), getters return
- * the stored defaults, loadBackingTrack rejects with ERR_UNSUPPORTED, hasDrums and hasJucePadView
+ * the stored defaults, loadBackingTrack and loadSamplerSlot reject with ERR_UNSUPPORTED, hasDrums,
+ * hasSampler and hasJucePadView
  * return false (the JS wrapper then falls back to its non-native paths).
  */
 class ExpoJuceModule : Module() {
@@ -161,6 +162,30 @@ class ExpoJuceModule : Module() {
     Function("setDrumKit") { _: Map<String, Any?> -> false }
 
     Function("getDrumState") { ExpoJuceNative.drumState }
+
+    // ── Sampler (not on Android yet: hasSampler is false) ──────────
+
+    Function("hasSampler") { false }
+
+    AsyncFunction("loadSamplerSlot") { _: Double, _: String, _: Map<String, Any?>?, promise: Promise ->
+      promise.reject("ERR_UNSUPPORTED", "the sampler is not supported on Android yet", null)
+    }
+
+    Function("unloadSamplerSlot") { _: Double -> false }
+
+    Function("setSamplerSlot") { _: Double, _: Map<String, Any?> -> false }
+
+    Function("setSampler") { _: Map<String, Any?> -> false }
+
+    Function("samplerHit") { _: Double, _: Double -> }
+
+    Function("samplerRelease") { _: Double -> }
+
+    Function("samplerNoteOn") { _: Double, _: Double -> }
+
+    Function("samplerNoteOff") { _: Double -> }
+
+    Function("getSamplerState") { ExpoJuceNative.samplerState }
 
     // ── Transport (not on Android yet: stopped at beat 0, 120 bpm) ──
 

@@ -240,6 +240,8 @@ public:
     virtual const SampleBuffer* acquireSlot(int slot) noexcept = 0;
     // The reader is gone (its processor is being destroyed): it references no buffer any more.
     virtual void releaseReader() noexcept = 0;
+    // The reader's sample rate (prepareToPlay; not the audio thread): later loads may resample to it.
+    virtual void requestRate(double /*sampleRate*/) noexcept {}
 };
 
 // What a voice is doing (tests, diagnostics).

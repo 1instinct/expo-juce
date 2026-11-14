@@ -12,7 +12,15 @@ import type {
   DrumVoiceParams,
   EffectsState,
   MetronomeOptions,
+  SamplerLoadResult,
+  SamplerLoop,
+  SamplerSettings,
+  SamplerSlotParams,
+  SamplerState,
 } from './ExpoJuce.types';
+
+/** A partial slot update as sent to native code (`loop: false` = no loop). */
+export type NativeSamplerSlotParams = Partial<Omit<SamplerSlotParams, 'loop'>> & { loop?: SamplerLoop | false };
 
 // The native module (ios/ExpoJuceModule.swift; android/src/main/java/expo/modules/juce/ExpoJuceModule.kt). Functions added after 0.5.0 are optional,
 // because an older binary does not export them: callers check `typeof fn === 'function'`.
@@ -69,6 +77,19 @@ export type ExpoJuceNativeModule = {
   setDrumVoice?(voice: number, params: Partial<DrumVoiceParams>): boolean;
   setDrumKit?(params: Partial<DrumKitParams>): boolean;
   getDrumState?(): DrumState;
+
+  // Sampler (0.10.0+, iOS). Params as index.ts sends them: finite numbers / booleans only, and
+  // `loop` false (no loop) instead of null.
+  hasSampler?(): boolean;
+  loadSamplerSlot?(slot: number, uri: string, params: NativeSamplerSlotParams | null): Promise<SamplerLoadResult>;
+  unloadSamplerSlot?(slot: number): boolean;
+  setSamplerSlot?(slot: number, params: NativeSamplerSlotParams): boolean;
+  setSampler?(settings: Partial<SamplerSettings>): boolean;
+  samplerHit?(slot: number, velocity: number): void;
+  samplerRelease?(slot: number): void;
+  samplerNoteOn?(note: number, velocity: number): void;
+  samplerNoteOff?(note: number): void;
+  getSamplerState?(): SamplerState;
 
   // MIDI byte input (0.9.0-rc.2+, iOS)
   hasMidiInput?(): boolean;

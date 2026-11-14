@@ -151,6 +151,39 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // { kit: { level, mute, drive }, voices: [9 × { tune, decay, tone, level }] } as stored.
 - (NSDictionary<NSString *, id> *)drumState;
 
+// Sampler (0.10.0+): 16 sample slots (0–15) on 32 voices, mixed before the effects (see
+// SamplerEngine.h, SamplerBank.h). Loaded samples and parameters live for the process: they work
+// before setup and survive rebuilds. samplerHit (pads: the slot at its root) / samplerNoteOn (keys:
+// every loaded slot whose zone holds the note): velocity clamped to 1–127; any thread, lock-free,
+// through the note queue; dropped while the engine is not ready, like noteOn. samplerRelease /
+// samplerNoteOff are always recorded (like noteOff). Out-of-range slot / note: ignored.
+- (void)samplerHit:(int)slot velocity:(int)velocity;
+// samplerHit from a native touch (JucePadView in sampler mode); touchTimestamp as for noteOn.
+- (void)samplerHit:(int)slot velocity:(int)velocity touchTimestamp:(double)touchTimestamp
+    entryTimestamp:(double)entryTimestamp;
+- (void)samplerRelease:(int)slot;
+- (void)samplerNoteOn:(int)note velocity:(int)velocity;
+- (void)samplerNoteOff:(int)note;
+// Partial update of a slot; absent keys, keys of the wrong type and non-finite numbers unchanged,
+// numbers clamped. Keys: rootNote, lowNote, highNote, startMs, endMs, loop ({ startMs, endMs } or
+// NO / NSNull = no loop), oneShot, gainDb, pan, tune, fineCents, attackMs, releaseMs,
+// velocitySens, chokeGroup. NO for a slot outside 0–15 (nothing applied).
+- (BOOL)setSamplerSlot:(int)slot params:(NSDictionary<NSString *, id> *)params;
+// Keys: level (0–1), mute (bool), polyphony (1–32). Always YES.
+- (BOOL)setSampler:(NSDictionary<NSString *, id> *)settings;
+// { level, mute, polyphony, slots: [16 × { loaded, frames, durationMs, ...params }] } as stored.
+- (NSDictionary<NSString *, id> *)samplerState;
+// Decodes `uri` (file:// URL or absolute path) on a background queue at the device rate and swaps
+// it into `slot`. A later load / unload of the slot supersedes it (ERR_SAMPLER_SUPERSEDED).
+// `completion` runs on that background queue: { frames, sampleRate, channels, durationMs } on
+// success, else errorCode (ERR_SAMPLER_SLOT / _FILE / _FORMAT / _TOO_LONG / _MEMORY /
+// _SUPERSEDED) + message.
+- (void)loadSamplerSlot:(int)slot
+                    uri:(NSString *)uri
+             completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode,
+                                  NSString *errorMessage))completion;
+- (BOOL)unloadSamplerSlot:(int)slot; // NO: slot out of range
+
 // Output analysis for HUDs: { peak, rms, scope: [128 numbers], bands: [24 numbers], sampleRate,
 // lastNote, bpm, beat, playing, arp: { active, step, steps, note } }. Any thread; one 2048-point
 // FFT per call (about 50 µs); zeros when the engine is not running.

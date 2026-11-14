@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, sm, smb, sml, sms, smq, smd)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -165,6 +165,22 @@ Exit code non-zero on any failure.
   note-ons never play, and the engine's own note-on marking before its push and restoring the mark
   when the push failed. `own` (`ios/OwnerToken.h`: a module destroyed after its replacement was
   created releases nothing of the new one's; racing claims stay consistent).
+- Sampler (0.10.0, cases in `sampler_cases.inc`): `sm` (`ios/SamplerEngine.h`: a hit at the root
+  plays the buffer sample for sample; +12 semitones halves the length; one-shot ignores note-offs;
+  a gated release ramps linearly to exact 0; a loop seam with no step above the crossfade's bound;
+  a choke group fades the earlier voice; stealing takes the earliest released, then the oldest,
+  with a 64-sample declick; key zones map a note to the right slots; gain, pan, velocity and level;
+  0 allocations), `smb` (`sm_budget_32v`: 32 looped, pitched stereo voices, 48 kHz / 128, 20 s:
+  under 60 µs per block), `sml` (`ios/SamplerBank.h`: a generated WAV and the 124 bpm MP3 fixture
+  decode, a 44.1 kHz sine resampled to 48 kHz within 2e-3 of the ideal, a superseded load returns `ERR_SAMPLER_SUPERSEDED`,
+  over 60 s `_TOO_LONG`, the memory cap `_MEMORY` with the replaced slot not counted, a buffer the
+  reader marks survives `collect` until released), `sms`
+  (`sml_swap_while_playing_no_alloc_on_audio_thread`: 400 installs / unloads from a control thread
+  while the audio thread renders: no allocation or free in the render, no non-finite sample, every
+  retired buffer freed), `smq` (through `PolySynthProcessor` and a `NoteEventQueue`, arp off and on:
+  pad hits and key notes sound in the next block, releases and `allNotesOff` release them, never the
+  arp, counters; 0 allocations), `smd` (`src/samplerDefaults.ts` has the same defaults, slot and
+  voice counts as `SamplerEngine.h`).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

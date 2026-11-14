@@ -4921,6 +4921,8 @@ int main(int argc, char** argv) {
     if (want("smb")) unexpected += runSamplerBudget() ? 0 : 1;
     if (want("sml")) unexpected += runSamplerLoader() ? 0 : 1;
     if (want("sms")) unexpected += runSamplerSwapStress() ? 0 : 1;
+    if (want("smq")) unexpected += runSamplerInSynth() ? 0 : 1;
+    if (want("smd")) unexpected += runSamplerDefaultsMatchJs() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

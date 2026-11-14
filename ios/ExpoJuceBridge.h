@@ -110,6 +110,25 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (BOOL)setDrumKit:(NSDictionary<NSString *, id> *)params NS_SWIFT_NAME(setDrumKit(_:));
 + (NSDictionary<NSString *, id> *)getDrumState NS_SWIFT_NAME(getDrumState());
 
+// ── Sampler (0.10.0+) ────────────────────────────────────────────
+// 16 slots (0–15; others ignored / NO). Hits and key notes: velocity clamped to 1–127, lock-free,
+// any thread. Parameters: lock-free reads, remembered before setup and across rebuilds; unknown
+// keys ignored, values clamped. loadSamplerSlot's completion runs on a background queue.
++ (void)samplerHit:(int)slot velocity:(int)velocity NS_SWIFT_NAME(samplerHit(_:velocity:));
++ (void)padSamplerHit:(int)slot velocity:(int)velocity touchTimestamp:(double)touchTimestamp entryTimestamp:(double)entryTimestamp NS_SWIFT_NAME(padSamplerHit(_:velocity:touchTimestamp:entryTimestamp:));
++ (void)samplerRelease:(int)slot NS_SWIFT_NAME(samplerRelease(_:));
++ (void)samplerNoteOn:(int)note velocity:(int)velocity NS_SWIFT_NAME(samplerNoteOn(_:velocity:));
++ (void)samplerNoteOff:(int)note NS_SWIFT_NAME(samplerNoteOff(_:));
++ (BOOL)setSamplerSlot:(int)slot params:(NSDictionary<NSString *, id> *)params NS_SWIFT_NAME(setSamplerSlot(_:params:));
++ (BOOL)setSampler:(NSDictionary<NSString *, id> *)settings NS_SWIFT_NAME(setSampler(_:));
++ (NSDictionary<NSString *, id> *)getSamplerState NS_SWIFT_NAME(getSamplerState());
++ (void)loadSamplerSlot:(int)slot
+                    uri:(NSString *)uri
+             completion:(void (^)(NSDictionary<NSString *, id> *_Nullable result, NSString *_Nullable errorCode,
+                                  NSString *_Nullable errorMessage))completion
+    NS_SWIFT_NAME(loadSamplerSlot(_:uri:completion:));
++ (BOOL)unloadSamplerSlot:(int)slot NS_SWIFT_NAME(unloadSamplerSlot(_:));
+
 // ── Transport ────────────────────────────────────────────────────
 + (void)startTransport;
 + (void)stopTransport;

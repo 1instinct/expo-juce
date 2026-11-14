@@ -27,6 +27,15 @@ public class ExpoJuceModule: Module {
     return result
   }
 
+  // Sampler slot 0–15 / MIDI note 0–127, as an integral finite number.
+  private static func isSamplerSlot(_ slot: Double) -> Bool {
+    return slot.isFinite && slot.rounded() == slot && slot >= 0 && slot <= 15
+  }
+
+  private static func isMidiNote(_ note: Double) -> Bool {
+    return note.isFinite && note.rounded() == note && note >= 0 && note <= 127
+  }
+
   public func definition() -> ModuleDefinition {
     Name("ExpoJuce")
 
@@ -302,6 +311,72 @@ public class ExpoJuceModule: Module {
       return ExpoJuceBridge.getDrumState()
     }
 
+    // ── Sampler (0.10.0+) ──────────────────────────────────────────
+    // Hits and key notes go through the lock-free note queue (any thread); parameters and loaded
+    // samples are remembered before setup and across rebuilds. Slots 0–15, notes 0–127 (anything
+    // else, including a non-integer, is ignored / false).
+
+    Function("hasSampler") { () -> Bool in
+      return true
+    }
+
+    // Applies `params` (partial) to the slot first, so the sample plays with them from its first hit.
+    AsyncFunction("loadSamplerSlot") { (slot: Double, uri: String, params: [String: Any]?, promise: Promise) in
+      guard ExpoJuceModule.isSamplerSlot(slot) else {
+        promise.reject("ERR_SAMPLER_SLOT", "slot must be an integer 0-15")
+        return
+      }
+      if let params = params {
+        _ = ExpoJuceBridge.setSamplerSlot(Int32(slot), params: params)
+      }
+      ExpoJuceBridge.loadSamplerSlot(Int32(slot), uri: uri) { result, code, message in
+        if let result = result {
+          promise.resolve(result)
+        } else {
+          promise.reject(code ?? "ERR_SAMPLER_FILE", message ?? "sample load failed")
+        }
+      }
+    }
+
+    Function("unloadSamplerSlot") { (slot: Double) -> Bool in
+      guard ExpoJuceModule.isSamplerSlot(slot) else { return false }
+      return ExpoJuceBridge.unloadSamplerSlot(Int32(slot))
+    }
+
+    // Partial update; unknown keys ignored, values clamped. false for a slot outside 0–15.
+    Function("setSamplerSlot") { (slot: Double, params: [String: Any]) -> Bool in
+      guard ExpoJuceModule.isSamplerSlot(slot) else { return false }
+      return ExpoJuceBridge.setSamplerSlot(Int32(slot), params: params)
+    }
+
+    Function("setSampler") { (settings: [String: Any]) -> Bool in
+      return ExpoJuceBridge.setSampler(settings)
+    }
+
+    Function("samplerHit") { (slot: Double, velocity: Double) -> Void in
+      guard ExpoJuceModule.isSamplerSlot(slot), velocity.isFinite else { return }
+      ExpoJuceBridge.samplerHit(Int32(slot), velocity: Int32(min(max(velocity.rounded(), 1), 127)))
+    }
+
+    Function("samplerRelease") { (slot: Double) -> Void in
+      guard ExpoJuceModule.isSamplerSlot(slot) else { return }
+      ExpoJuceBridge.samplerRelease(Int32(slot))
+    }
+
+    Function("samplerNoteOn") { (note: Double, velocity: Double) -> Void in
+      guard ExpoJuceModule.isMidiNote(note), velocity.isFinite else { return }
+      ExpoJuceBridge.samplerNoteOn(Int32(note), velocity: Int32(min(max(velocity.rounded(), 1), 127)))
+    }
+
+    Function("samplerNoteOff") { (note: Double) -> Void in
+      guard ExpoJuceModule.isMidiNote(note) else { return }
+      ExpoJuceBridge.samplerNoteOff(Int32(note))
+    }
+
+    Function("getSamplerState") { () -> [String: Any] in
+      return ExpoJuceBridge.getSamplerState()
+    }
+
     // ── Transport ──────────────────────────────────────────────────
 
     Function("startTransport") {
@@ -354,9 +429,10 @@ public class ExpoJuceModule: Module {
         view.note = note
       }
 
-      // "notes" (default) or "drums": in drums mode a touch hits drum voice `note` (0–8).
+      // "notes" (default), "drums" (a touch hits drum voice `note`, 0–8) or "sampler" (a touch hits
+      // sampler slot `note`, 0–15, and the last touch-up releases it).
       Prop("mode") { (view: JucePadView, mode: String?) in
-        view.drumMode = (mode == "drums")
+        view.padMode = JucePadView.Mode(rawValue: mode ?? "notes") ?? .notes
       }
 
       Prop("velocity") { (view: JucePadView, velocity: Int?) in

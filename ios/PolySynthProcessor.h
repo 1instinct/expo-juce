@@ -8,6 +8,7 @@
 #include "NoteEventQueue.h"
 #include "Arpeggiator.h"
 #include "DrumMachine.h"
+#include "SamplerEngine.h"
 #include "AnalysisRing.h"
 #include "LatencyStats.h"
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <cstdint>
 
 static_assert(NoteEventQueue::kMaxDrumVoice == kDrumVoices - 1, "drum voice range of the note queue");
+static_assert(NoteEventQueue::kMaxSamplerSlot == kSamplerSlots - 1, "sampler slot range of the note queue");
 
 struct BeatState {
     std::atomic<bool> crossed{false};
@@ -52,7 +54,7 @@ struct SynthSettings {
 class PolySynthProcessor : public juce::AudioProcessor {
 public:
     PolySynthProcessor();
-    ~PolySynthProcessor() override = default;
+    ~PolySynthProcessor() override; // releases the sampler source's reader slot
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -86,6 +88,13 @@ public:
     void drumHit(int voice, int velocity, juce::int64 touchTicks = 0, juce::int64 entryTicks = 0) {
         queue->pushDrumHit(voice, velocity, touchTicks, entryTicks);
     }
+    // Sampler (0.10.0+) through the same queue; any thread. Out of range: ignored.
+    void samplerHit(int slot, int velocity, juce::int64 touchTicks = 0, juce::int64 entryTicks = 0) {
+        queue->pushSamplerHit(slot, velocity, touchTicks, entryTicks);
+    }
+    void samplerRelease(int slot) { queue->pushSamplerRelease(slot); }
+    void samplerNoteOn(int note, int velocity) { queue->pushSamplerNoteOn(note, velocity); }
+    void samplerNoteOff(int note) { queue->pushSamplerNoteOff(note); }
 
     // The queue this synth reads its notes from: its own by default; the engine passes its
     // process-lifetime queue (before the synth is attached to a device). nullptr = own queue. The
@@ -120,6 +129,16 @@ public:
     DrumMachine& drums() { return drumMachine; }
     const DrumMachine& drums() const { return drumMachine; }
 
+    // The sampler (0.10.0+): drained sampler events start its voices (never the arpeggiator); it
+    // takes each slot's buffer from its source at the start of every block and adds its stereo
+    // output after the synth and drums (copied to both channels), so it goes through the effects
+    // chain too. Parameters: sampler().setParamStore / params() (any thread). Left out of
+    // diag.peak. setSamplerSource: before the processor renders (nullptr = none); prepareToPlay
+    // passes the device rate to the source and the destructor releases its reader slot.
+    SamplerEngine& sampler() { return samplerEngine; }
+    const SamplerEngine& sampler() const { return samplerEngine; }
+    void setSamplerSource(SamplerBufferSource* source) { samplerEngine.setSource(source); }
+
     void setTransport(TransportEngine* t) { transport = t; }
     // Receives the arpeggiator state every block (AnalysisRing::publishArp). nullptr = none.
     void setAnalysis(AnalysisRing* a) { analysis = a; }
@@ -137,6 +156,7 @@ private:
 
     void startQueuedNote(const NoteEvent& event);
     void startDrumHit(const NoteEvent& event);
+    void startSamplerEvent(const NoteEvent& event);
     void recordNoteLatency(const NoteEvent& event);
     void renderVoices(float* mono, int numSamples, Waveform wf, float detune, float cutoff, float reso, float master);
     void applyArpEvent(const ArpEvent& event);
@@ -149,6 +169,7 @@ private:
     LatencyWindow* inputLatency = nullptr;
     Arpeggiator arpeggiator;
     DrumMachine drumMachine;
+    SamplerEngine samplerEngine;
     ArpEvent arpEvents[kArpEventCapacity]; // this block's arp events (audio thread)
     int arpEventCount = 0;
     uint64_t lastAllReleasedSeen = 0;      // NoteEventQueue::allReleasedMark last applied to the arp

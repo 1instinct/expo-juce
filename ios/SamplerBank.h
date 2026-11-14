@@ -116,7 +116,7 @@ public:
 
     // The reader's rate (PolySynthProcessor::prepareToPlay): later loads resample to it. Lock-free.
     // Samples already loaded keep their rate; the engine plays them at their own speed.
-    void requestRate(double sampleRate) {
+    void requestRate(double sampleRate) noexcept override {
         if (sampleRate > 0.0) wantedRate.store(sampleRate, std::memory_order_relaxed);
     }
     double wantedSampleRate() const { return wantedRate.load(std::memory_order_relaxed); }

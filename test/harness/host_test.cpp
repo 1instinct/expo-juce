@@ -10,6 +10,7 @@
 #include "AndroidEngineHost.h"
 #include "FxChainProcessor.h" // kFxCount
 #include "DrumMachine.h"     // kDrumVoices
+#include "SamplerEngine.h"   // kSamplerSlots, kSamplerVoices
 
 #include <algorithm>
 #include <atomic>
@@ -179,7 +180,8 @@ static const char* const kDiagnosticsKeys[] = {
     "preferredSampleRate", "sessionReassertCount", "interruptionCount", "mediaResetCount",
     "lastRecoveryError", "engineState", "lockBusyDrops", "deadDeviceRestarts", "fxProcessCount",
     "fxLimiterGain", "fxNonFiniteResets", "metronomeClicks", "backingTrackLoaded",
-    "backingTrackPositionSec", "backingTrackTempoRatio", "drumHits", "drumPeak", "sessionCategory",
+    "backingTrackPositionSec", "backingTrackTempoRatio", "drumHits", "drumPeak", "samplerHits",
+    "samplerVoices", "samplerPeak", "samplerBytes", "sessionCategory",
     "sessionSampleRate", "sessionIOBufferMs", "sessionOutputLatencyMs", "otherAudioPlaying",
     "routeOutputs", "platform", "nativeSampleRate", "xrunCount", "backgrounded", "backgroundStops",
     "foregroundRestarts",
@@ -204,6 +206,7 @@ static std::string defaultShapesKotlin() {
         { "ARPEGGIATOR", "getArpeggiatorState()", host::arpeggiatorStateJson() },
         { "DRUMS", "getDrumState()", host::drumStateJson() },
         { "ANALYSIS", "getAnalysis()", host::analysisJson() },
+        { "SAMPLER", "getSamplerState()", host::samplerStateJson() },
         { "DIAGNOSTICS", "getDiagnostics() before setup", host::diagnosticsJson() },
     };
     std::string out =
@@ -268,6 +271,11 @@ static void testShapesBeforeSetup() {
     check(drums["kit"].isObject() && drums["voices"].isArray() && drums["voices"].size() == kDrumVoices
               && drums["voices"][0].hasProperty("tune"),
           "getDrumState: { kit, voices[9] }");
+    const juce::var sampler = parse(host::samplerStateJson());
+    check(sampler["slots"].isArray() && sampler["slots"].size() == kSamplerSlots && (int)sampler["polyphony"] == kSamplerVoices
+              && !(bool)sampler["slots"][0]["loaded"] && (int)sampler["slots"][0]["rootNote"] == 60
+              && sampler["slots"][0]["loop"].isVoid() && (bool)sampler["slots"][0]["oneShot"],
+          "getSamplerState: { level, mute, polyphony 32, slots[16] empty at the defaults }");
     const juce::var analysis = parse(host::analysisJson());
     check(analysis["scope"].size() == 128 && analysis["bands"].size() == 24 && (int)analysis["lastNote"] == -1
               && (int)analysis["arp"]["steps"] == 16 && (double)analysis["bpm"] == 120.0,

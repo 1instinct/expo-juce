@@ -808,3 +808,201 @@ static bool runSamplerSwapStress() {
     std::fflush(stdout);
     return pass;
 }
+
+// ── smq: through PolySynthProcessor and the note queue ───────────────────────────────────────
+// Sampler events pushed from another thread sound in the next block (stereo: a hard-left pan
+// leaves the right channel at 0), outside diag.peak and the note counters, never reach the arp;
+// key note-offs, pad releases and allNotesOff (marks, so they cannot be dropped) end gated voices;
+// out-of-range slots / notes are not queued; discardPending and a full ring count sampler events
+// apart; the synth's prepare passes the device rate to the bank and its destruction releases the
+// bank's reader; 0 allocations in processBlock.
+static bool runSamplerInSynth() {
+    using namespace smtest;
+    const double sr = 48000.0;
+    Checks c;
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    auto block = [&](PolySynthProcessor& synth, juce::AudioBuffer<float>& buf, int n) {
+        juce::MidiBuffer midi;
+        buf.setSize(2, n, false, false, true);
+        tCountAllocs = true;
+        synth.processBlock(buf, midi);
+        tCountAllocs = false;
+        return buf.getMagnitude(0, 0, n);
+    };
+    auto voicesOn = [](PolySynthProcessor& synth, int slot) {
+        int n = 0;
+        for (int v = 0; v < kSamplerVoices; ++v) {
+            const SamplerVoiceInfo info = synth.sampler().voiceInfo(v);
+            n += (info.active && info.slot == slot) ? 1 : 0;
+        }
+        return n;
+    };
+    for (int arpOn = 0; arpOn < 2; ++arpOn) {
+        const std::string tag = arpOn ? " (arp on)" : " (arp off)";
+        SamplerBank bank;
+        std::vector<float> x(48000, 0.5f);
+        std::string error;
+        bank.install(5, SamplerBank::fromAudio(x.data(), x.data(), 48000, sr), bank.beginLoad(5), error);
+        bank.install(6, SamplerBank::fromAudio(x.data(), x.data(), 48000, sr), bank.beginLoad(6), error);
+        {
+            TransportEngine transport;
+            PolySynthProcessor synth;
+            NoteEventQueue queue;
+            synth.setNoteQueue(&queue);
+            synth.setTransport(&transport);
+            synth.setSamplerSource(&bank);
+            synth.setRateAndBufferSizeDetails(sr, 512);
+            synth.prepareToPlay(sr, 512);
+            c(bank.wantedSampleRate() == sr, "prepare passes the rate to the bank" + tag);
+            ArpSettings s = ArpSettings::defaults();
+            s.enabled = arpOn == 1;
+            synth.arp().setSettings(s);
+            SamplerParamStore& store = synth.sampler().params();
+            store.setLevel(1.0);
+            SamplerSlotParams left;
+            left.attackMs = 0.0f;
+            left.pan = -1.0f;
+            store.setSlot(5, left);
+            SamplerSlotParams gated;
+            gated.attackMs = 0.0f;
+            gated.oneShot = false;
+            gated.releaseMs = 1.0f;
+            gated.lowNote = gated.highNote = 60;
+            store.setSlot(6, gated);
+            juce::AudioBuffer<float> buf(2, 512);
+            c(block(synth, buf, 128) == 0.0f, "silent before" + tag);
+            std::thread producer([&] { queue.pushSamplerHit(5, 127); });
+            producer.join();
+            const float p = block(synth, buf, 128);
+            c(p == 0.5f && buf.getSample(0, 0) == 0.5f, "hit sounds from the block's first sample" + tag + " " + std::to_string(p));
+            c(buf.getMagnitude(1, 0, 128) == 0.0f, "pan -1: right channel 0" + tag);
+            c(synth.diag.peak.load() == 0.0f, "sampler not in the synth peak" + tag);
+            c(synth.sampler().diag.peak.load() > 0.4f, "sampler peak diag" + tag);
+            c(queue.samplerEventsQueued.load() == 1 && queue.samplerEventsConsumed.load() == 1, "sampler counters" + tag);
+            c(queue.notesQueued.load() == 0 && queue.drumHitsQueued.load() == 0, "note / drum counters untouched" + tag);
+            c(!synth.arp().isActive(), "the arp never gets sampler events" + tag);
+            c(synth.diag.lastNoteToRenderMs.load() >= 0.0, "latency recorded" + tag);
+            // Keys: note-on, then note-off through the marks.
+            queue.pushSamplerNoteOn(60, 127);
+            block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 1, "key note-on plays the zone's slot" + tag);
+            queue.pushSamplerNoteOff(60);
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 0, "key note-off releases it" + tag);
+            // Pad on a gated slot: hit, then release(slot).
+            synth.samplerHit(6, 100);
+            block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 1, "gated pad hit" + tag);
+            synth.samplerRelease(6);
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 0, "pad release ends it" + tag);
+            // allNotesOff releases gated sampler voices (keys and pads).
+            synth.samplerNoteOn(60, 100);
+            synth.samplerHit(6, 100);
+            block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 2, "two gated voices" + tag);
+            synth.allNotesOff();
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 0, "allNotesOff releases them" + tag);
+            // A release before the event's note-on is drained still applies to it (marks).
+            synth.samplerNoteOn(60, 100);
+            synth.samplerNoteOff(60);
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 0, "a note-off queued right after its note-on ends it" + tag);
+            const uint32_t queued = queue.samplerEventsQueued.load();
+            c(!queue.pushSamplerHit(16, 100) && !queue.pushSamplerHit(-1, 100) && !queue.pushSamplerNoteOn(128, 100)
+              && !queue.pushSamplerNoteOn(-1, 100) && queue.samplerEventsQueued.load() == queued, "out of range not queued" + tag);
+        } // ~PolySynthProcessor releases the bank's reader
+        bank.unloadAll();
+        c(bank.collect() == 0 && SamplerSample::live.load() == 0, "the synth's destruction released the bank's reader" + tag);
+    }
+    {
+        NoteEventQueue queue;
+        queue.pushNoteOn(60, 100);
+        queue.pushSamplerHit(1, 100);
+        queue.pushSamplerNoteOn(61, 100);
+        queue.pushDrumHit(2, 100);
+        queue.discardPending();
+        c(queue.notesDiscarded.load() == 1 && queue.samplerEventsDiscarded.load() == 2 && queue.drumHitsDiscarded.load() == 1,
+          "discardPending counts by kind");
+        int full = 0;
+        for (int i = 0; i < NoteEventQueue::kSize + 5; ++i) full += queue.pushSamplerHit(0, 100) ? 0 : 1;
+        c(full == 6 && queue.samplerEventsDropped.load() == 6, "a full ring drops sampler events (counted) " + std::to_string(full));
+        c(queue.notesDropped.load() == 0 && queue.drumHitsDropped.load() == 0, "drops counted apart");
+    }
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    c(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
+    const bool pass = c.failed == 0;
+    std::printf("smq   sampler through PolySynthProcessor + note queue (arp off / on): hits, keys, releases, allNotesOff, counters"
+                "  %-4s %d failed checks allocs %llu%s\n", pass ? "PASS" : "FAIL", c.failed, (unsigned long long)allocs,
+                c.detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// ── smd: src/samplerDefaults.ts == the C++ defaults ──────────────────────────────────────────
+static bool runSamplerDefaultsMatchJs() {
+    const juce::File file(juce::String(HARNESS_JS_SRC) + "/samplerDefaults.ts");
+    const juce::String text = file.loadFileAsString();
+    auto body = [&](const char* name) {
+        const juce::String from = text.fromFirstOccurrenceOf(juce::String("export const ") + name, false, false);
+        return from.fromFirstOccurrenceOf("({", false, false).upToFirstOccurrenceOf("})", false, false);
+    };
+    auto value = [](const juce::String& b, const char* key, bool& found) {
+        juce::StringArray pairs;
+        pairs.addTokens(b, ",", "");
+        pairs.trim();
+        for (const juce::String& p : pairs)
+            if (p.upToFirstOccurrenceOf(":", false, false).trim() == key) {
+                found = true;
+                return p.fromFirstOccurrenceOf(":", false, false).trim();
+            }
+        found = false;
+        return juce::String();
+    };
+    int mismatches = 0;
+    std::string detail;
+    auto num = [&](const juce::String& b, const char* key, double want) {
+        bool found = false;
+        const juce::String v = value(b, key, found);
+        if (!found || std::fabs(v.getDoubleValue() - want) > 1e-6) { ++mismatches; detail += std::string(" ") + key; }
+    };
+    auto literal = [&](const juce::String& b, const char* key, const char* want) {
+        bool found = false;
+        if (value(b, key, found) != juce::String(want) || !found) { ++mismatches; detail += std::string(" ") + key; }
+    };
+    const SamplerSlotParams p;
+    const juce::String slot = body("SAMPLER_SLOT_DEFAULTS");
+    num(slot, "rootNote", p.rootNote);
+    num(slot, "lowNote", p.lowNote);
+    num(slot, "highNote", p.highNote);
+    num(slot, "startMs", p.startMs);
+    num(slot, "endMs", p.endMs);
+    literal(slot, "loop", p.loop ? "?" : "null");
+    literal(slot, "oneShot", p.oneShot ? "true" : "false");
+    num(slot, "gainDb", p.gainDb);
+    num(slot, "pan", p.pan);
+    num(slot, "tune", p.tuneSemis);
+    num(slot, "fineCents", p.tuneCents);
+    num(slot, "attackMs", p.attackMs);
+    num(slot, "releaseMs", p.releaseMs);
+    num(slot, "velocitySens", p.velocitySens);
+    num(slot, "chokeGroup", p.chokeGroup);
+    const SamplerSettings st;
+    const juce::String eng = body("SAMPLER_DEFAULTS");
+    num(eng, "level", st.level);
+    literal(eng, "mute", st.mute ? "true" : "false");
+    num(eng, "polyphony", st.polyphony);
+    auto constant = [&](const char* name, int want) {
+        const juce::String v = text.fromFirstOccurrenceOf(juce::String("export const ") + name, false, false)
+                                   .fromFirstOccurrenceOf("=", false, false).upToFirstOccurrenceOf(";", false, false).trim();
+        if (v.isEmpty() || v.getIntValue() != want) { ++mismatches; detail += std::string(" ") + name + "(" + v.toStdString() + ")"; }
+    };
+    constant("SAMPLER_SLOT_COUNT", kSamplerSlots);
+    constant("SAMPLER_VOICE_COUNT", kSamplerVoices);
+    const bool pass = file.existsAsFile() && mismatches == 0;
+    std::printf("smd   src/samplerDefaults.ts == SamplerEngine.h defaults, slot and voice counts  %-4s %d mismatches%s\n",
+                pass ? "PASS" : "FAIL", mismatches, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}

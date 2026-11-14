@@ -121,6 +121,33 @@
 }
 + (NSDictionary<NSString *, id> *)getDrumState { return [[ExpoJuceAudioEngine sharedInstance] drumState]; }
 
+// ── Sampler ──
++ (void)samplerHit:(int)slot velocity:(int)velocity {
+    [[ExpoJuceAudioEngine sharedInstance] samplerHit:slot velocity:velocity];
+}
++ (void)padSamplerHit:(int)slot velocity:(int)velocity touchTimestamp:(double)touchTimestamp entryTimestamp:(double)entryTimestamp {
+    [[ExpoJuceAudioEngine sharedInstance] samplerHit:slot velocity:velocity touchTimestamp:touchTimestamp
+                                      entryTimestamp:entryTimestamp];
+}
++ (void)samplerRelease:(int)slot { [[ExpoJuceAudioEngine sharedInstance] samplerRelease:slot]; }
++ (void)samplerNoteOn:(int)note velocity:(int)velocity {
+    [[ExpoJuceAudioEngine sharedInstance] samplerNoteOn:note velocity:velocity];
+}
++ (void)samplerNoteOff:(int)note { [[ExpoJuceAudioEngine sharedInstance] samplerNoteOff:note]; }
++ (BOOL)setSamplerSlot:(int)slot params:(NSDictionary<NSString *, id> *)params {
+    return [[ExpoJuceAudioEngine sharedInstance] setSamplerSlot:slot params:params];
+}
++ (BOOL)setSampler:(NSDictionary<NSString *, id> *)settings {
+    return [[ExpoJuceAudioEngine sharedInstance] setSampler:settings];
+}
++ (NSDictionary<NSString *, id> *)getSamplerState { return [[ExpoJuceAudioEngine sharedInstance] samplerState]; }
++ (void)loadSamplerSlot:(int)slot
+                    uri:(NSString *)uri
+             completion:(void (^)(NSDictionary<NSString *, id> *, NSString *, NSString *))completion {
+    [[ExpoJuceAudioEngine sharedInstance] loadSamplerSlot:slot uri:uri completion:completion];
+}
++ (BOOL)unloadSamplerSlot:(int)slot { return [[ExpoJuceAudioEngine sharedInstance] unloadSamplerSlot:slot]; }
+
 // ── Transport ──
 + (void)startTransport { [[ExpoJuceAudioEngine sharedInstance] startTransport]; }
 + (void)stopTransport { [[ExpoJuceAudioEngine sharedInstance] stopTransport]; }
