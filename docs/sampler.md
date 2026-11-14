@@ -76,11 +76,15 @@ attached to them. The API is in the README ([Sampler](../README.md#sampler-0100-
 - An interruption (a call, Siri) calls `allNotesOff` and then `NoteEventQueue::pushSamplerCut`: the
   same mark with no fade. The device has already stopped, and JUCE restarts it without
   `prepareToPlay`, so the sampler's voices and their declick tails are dropped at once and the
-  first block back is silent: a one-shot does not resume after a call, not even for 5 ms.
+  sampler is silent in the first block back: a one-shot does not resume after a call, not even
+  for 5 ms. (If the device already runs again when the interruption is handled, the sampler fades
+  over 5 ms instead. Synth releases, drum decays and effect tails are not cut.)
 - Events sent while the device is stopped are dropped, not started in a burst on the first block
-  back (`NoteEventQueue::requestDiscard`): those pending when an interruption begins or ends, when
-  the idle stop closes the device, and when a stopped device is reopened. This covers sampler
-  hits, key note-ons, synth notes and drum hits alike (counted in the `*Discarded` counters).
+  back (`NoteEventQueue::requestDiscard`): those pending when an interruption begins (device
+  stopped) or ends, when the idle stop closes the device, and before a stopped or stalled device
+  is reopened. This covers sampler hits, key note-ons, synth notes and drum hits alike (counted in
+  the `*Discarded` counters). A sampler event the silence mark drops is counted as drained
+  (`samplerHits`).
 
 ## Loading and the hand-off
 

@@ -215,7 +215,9 @@ Exit code non-zero on any failure.
   `smrt_discard_on_stop`, a full ring of sampler hits, key notes, synth notes and drum hits then
   `requestDiscard`: no sound, no voice, the arp gets nothing, each counted as discarded by kind,
   events pushed after it play; `discardPending` and `requestDiscard` keep the same count, and 20000
-  pushes against 2000 requests and a draining thread consume or discard every event once; 0
+  pushes against 2000 requests and a slow draining thread consume or discard every event once, in
+  push order, never handing out an event after a request covering it returned (how many the race
+  drops is printed, not checked); 0
   allocations), `smd` (`src/samplerDefaults.ts` has the same defaults, slot and
   voice counts as `SamplerEngine.h`).
 - Synth parameter smoothing (`ios/SynthParamSmoother.h`): `psm` (`SynthParamSmoother` turns a

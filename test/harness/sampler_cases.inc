@@ -1281,7 +1281,9 @@ static bool runSamplerRealtime() {
     failedCases += report("smrt_interruption_cut", cut) ? 0 : 1;
 
     // smrt_discard_on_stop (queue): requestDiscard against discardPending's bookkeeping, and from
-    // other threads while a consumer drains (every event either consumed or discarded once).
+    // other threads while a consumer drains (every event consumed or discarded once, in push order,
+    // and none handled after a request covering it returned).
+    std::string raceNote;
     {
         Checks& c = discard;
         {
@@ -1303,33 +1305,73 @@ static bool runSamplerRealtime() {
             c(handled == 1, "a request with nothing pending drops nothing later");
         }
         {
+            // Every event carries its push index (touchTicks, one producer, so index order is ring
+            // order). The requester publishes, after each requestDiscard returns, the last index
+            // pushed before it began; a drain that starts after seeing that value must never hand
+            // out an event at or below it. The consumer drains slowly, so events pile up and the
+            // requests have something to drop.
             NoteEventQueue q;
             std::atomic<bool> stop{false};
-            std::atomic<uint32_t> handled{0};
+            std::atomic<uint32_t> handled{0}, lateHandled{0}, outOfOrder{0};
+            std::atomic<juce::int64> lastPushed{0}, covered{0};
             std::thread consumer([&] {
-                while (!stop.load()) q.drainNoteOns([&](const NoteEvent&) { handled.fetch_add(1); });
-            });
-            std::thread producer([&] {
-                for (int i = 0; i < 20000; ++i) {
-                    if (i % 3 == 0) q.pushSamplerHit(i % 16, 100);
-                    else if (i % 3 == 1) q.pushNoteOn(i % 128, 100);
-                    else q.pushDrumHit(i % 9, 100);
+                juce::int64 prev = 0;
+                auto drain = [&] {
+                    const juce::int64 cov = covered.load(std::memory_order_acquire);
+                    q.drainNoteOns([&](const NoteEvent& e) {
+                        handled.fetch_add(1);
+                        if (e.touchTicks <= cov) lateHandled.fetch_add(1);
+                        if (e.touchTicks <= prev) outOfOrder.fetch_add(1);
+                        prev = e.touchTicks;
+                    });
+                };
+                while (!stop.load()) {
+                    drain();
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
+                drain();
             });
+            // 20000 pushes: the first half races the requests, the second half comes after the last
+            // request (so some events always play) while the consumer still drains.
+            auto pushRange = [&](int from, int to) {
+                for (int i = from; i <= to; ++i) {
+                    bool ok;
+                    if (i % 3 == 0) ok = q.pushSamplerHit(i % 16, 100, i);
+                    else if (i % 3 == 1) ok = q.pushNoteOn(i % 128, 100, i);
+                    else ok = q.pushDrumHit(i % 9, 100, i);
+                    if (ok) lastPushed.store(i, std::memory_order_release);
+                    if (i % 64 == 0) std::this_thread::yield();
+                }
+            };
+            std::thread producer([&] { pushRange(1, 10000); });
             std::thread requester([&] {
-                for (int i = 0; i < 2000; ++i) { q.requestDiscard(); std::this_thread::yield(); }
+                while (lastPushed.load(std::memory_order_acquire) < 100) std::this_thread::yield(); // under way (the first 255 pushes always fit)
+                for (int i = 0; i < 2000; ++i) {
+                    const juce::int64 before = lastPushed.load(std::memory_order_acquire);
+                    q.requestDiscard();
+                    covered.store(std::max(covered.load(std::memory_order_relaxed), before), std::memory_order_release);
+                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
             });
             producer.join();
             requester.join();
+            std::thread producer2([&] { pushRange(10001, 20000); });
+            producer2.join();
             stop.store(true);
             consumer.join();
-            q.drainNoteOns([&](const NoteEvent&) { handled.fetch_add(1); });
             const uint32_t queued = q.notesQueued.load() + q.drumHitsQueued.load() + q.samplerEventsQueued.load();
             const uint32_t consumed = q.notesConsumed.load() + q.drumHitsConsumed.load() + q.samplerEventsConsumed.load();
             const uint32_t dropped = q.notesDiscarded.load() + q.drumHitsDiscarded.load() + q.samplerEventsDiscarded.load();
             c(queued == consumed + dropped && consumed == handled.load(),
               "racing requests: queued " + std::to_string(queued) + " == consumed " + std::to_string(consumed) + " + discarded "
                   + std::to_string(dropped));
+            // Events pushed after the last request always play. How many the racing requests drop
+            // depends on the scheduling (none if the consumer happened to be ahead each time), so
+            // it is only reported; which events a request drops is checked single-threaded above.
+            c(consumed > 0, "events after the last request played: consumed " + std::to_string(consumed));
+            raceNote = "racing requests dropped " + std::to_string(dropped) + " of " + std::to_string(queued);
+            c(lateHandled.load() == 0, std::to_string(lateHandled.load()) + " events handled after a request covering them had returned");
+            c(outOfOrder.load() == 0, "handled in push order");
             q.requestDiscard();
             q.pushSamplerHit(0, 100);
             uint32_t after = 0;
@@ -1337,7 +1379,7 @@ static bool runSamplerRealtime() {
             c(after == 1, "after the race, a new event plays");
         }
     }
-    failedCases += report("smrt_discard_on_stop", discard) ? 0 : 1;
+    failedCases += report("smrt_discard_on_stop", discard, raceNote) ? 0 : 1;
 
     const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
     const bool pass = failedCases == 0 && allocs == 0 && frees == 0;

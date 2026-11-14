@@ -1404,11 +1404,18 @@ static int mainThreadMaxFramesPerSecond() {
     if (self.isReady) {
         [self stopTransport];
         [self allNotesOff];
-        // Sampler voices, one-shots too, stop at once (no fade): the device is already stopped and
-        // JUCE restarts its audio unit without prepareToPlay, so a fade would start the first block
-        // back at the old level. Pending events are dropped, not played when the device restarts.
-        sNoteQueue.pushSamplerCut();
-        sNoteQueue.requestDiscard();
+        // Sampler voices, one-shots too, stop at once (no fade): the device is already stopped (JUCE's
+        // observer stops it before this block runs) and JUCE restarts its audio unit without
+        // prepareToPlay, so a fade would start the first block back at the old level. Pending events
+        // are dropped, not played when the device restarts. If the device already runs again (a
+        // short interruption whose "ended" was handled first), a cut would click and the pending
+        // events are the player's own: fade instead, and keep them.
+        if (![self isDeviceRunning]) {
+            sNoteQueue.pushSamplerCut();
+            sNoteQueue.requestDiscard();
+        } else {
+            sNoteQueue.pushSamplerSilence();
+        }
     }
     emitEngineEvent(@"onAudioInterruption", @{ @"type": @"began", @"playing": @NO, @"wasPlaying": @(wasPlaying) });
     if (wasPlaying) emitEngineEvent(@"onTransportChange", @{ @"playing": @NO, @"reason": @"interruption" });
@@ -1467,6 +1474,10 @@ static int mainThreadMaxFramesPerSecond() {
     if (!restarted) {
         sDeadDeviceRestarts.fetch_add(1, std::memory_order_relaxed);
         NSLog(@"[ExpoJuceAudioEngine] audio callback stalled after %@; reopening device", context);
+        // Nothing has rendered since the check started (e.g. an interruption whose "ended" never
+        // came, then the app became active): what was queued meanwhile is dropped, not started in a
+        // burst by the reopened device.
+        sNoteQueue.requestDiscard();
         {
             LifecycleLock lifecycle;
             [self reopenDeviceWithPreferredFormatLocked:[NSString stringWithFormat:@"dead device (%@)", context]];
