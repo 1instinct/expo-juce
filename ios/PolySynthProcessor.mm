@@ -7,6 +7,7 @@ PolySynthProcessor::PolySynthProcessor()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)) {
     lastAllReleasedSeen = queue->allReleasedMark();
     lastSamplerSilenceSeen = queue->samplerSilenceMark();
+    lastSamplerCutSeen = queue->samplerCutMark();
 }
 
 PolySynthProcessor::~PolySynthProcessor() {
@@ -105,8 +106,14 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
     samplerEngine.releaseHeld([this](bool fromKey, int id, uint64_t seq) { return queue->isSamplerReleased(fromKey, id, seq); });
     {
-        // The engine's interruption / background stop: every sampler voice whose event came before
-        // it ends (one-shots too); events drained above that came after it keep playing.
+        // The engine's interruption (cut, no fade) / background stop (5 ms fade): every sampler voice
+        // whose event came before it ends (one-shots too); events drained above that came after it
+        // keep playing, and those it covers never started (startSamplerEvent).
+        const uint64_t cut = queue->samplerCutMark();
+        if (cut != lastSamplerCutSeen) {
+            lastSamplerCutSeen = cut;
+            samplerEngine.cutUpTo(cut);
+        }
         const uint64_t silence = queue->samplerSilenceMark();
         if (silence != lastSamplerSilenceSeen) {
             lastSamplerSilenceSeen = silence;
@@ -289,7 +296,10 @@ void PolySynthProcessor::startDrumHit(const NoteEvent& event) {
 }
 
 // Audio thread (processBlock): start a queued sampler pad hit or key note-on and record its latency.
+// An event at or below the silence mark never starts: pushed before an interruption / background
+// stop, it may be drained only after the mark was applied to the voices sounding then.
 void PolySynthProcessor::startSamplerEvent(const NoteEvent& event) {
+    if (event.seq != 0 && event.seq <= queue->samplerSilenceMark()) return;
     if (event.kind == NoteEventKind::SamplerHit) samplerEngine.hit(event.note, event.velocity, event.seq);
     else samplerEngine.noteOn(event.note, event.velocity, event.seq);
     recordNoteLatency(event);

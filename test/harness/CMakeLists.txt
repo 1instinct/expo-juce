@@ -119,7 +119,9 @@ target_link_libraries(harness PRIVATE juce_lib)
 target_compile_definitions(harness PRIVATE HARNESS_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
                                            HARNESS_JS_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../../src"
                                            # BackingTrack::acquire() test seam, see harness.cpp
-                                           BACKING_TRACK_ACQUIRE_HOOK=harnessBackingTrackAcquireHook)
+                                           BACKING_TRACK_ACQUIRE_HOOK=harnessBackingTrackAcquireHook
+                                           # NoteEventQueue::drainNoteOns() test seam, see harness.cpp
+                                           NOTE_EVENT_QUEUE_DRAIN_HOOK=harnessNoteQueueDrainHook)
 
 # Android host (android/src/main/cpp/AndroidEngineHost.cpp): its portable part, with JUCE's Android
 # device replaced by a fake device type (host_test.cpp). Same git ref / WORKTREE rule as ios/.

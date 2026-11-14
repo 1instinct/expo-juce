@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.10.0-rc.1
+
+### Fixed (iOS)
+
+- **A sampler one-shot could start after the silence mark.** A hit or key note-on queued while
+  the audio thread drained, with the background stop's silence mark pushed before the thread read
+  it, spent the mark on the voices sounding then and started the event in the next block: a
+  one-shot of up to 60 s in the background, holding off the idle stop. An event at or below the
+  mark now never starts (it still counts in the `samplerHits` diagnostic, which counts events
+  drained), and `pushSamplerSilence` takes the queue's producer lock, so the mark
+  covers whole pushes only.
+- **No sampler tick after an interruption.** JUCE restarts the audio unit without `prepareToPlay`,
+  so the interruption's 5 ms fade started the sampler's first block back at the level the voice
+  stopped at. An interruption now cuts the sampler's voices and their declick tails at once
+  (`NoteEventQueue::pushSamplerCut`): the sampler's first block back is silent and a one-shot does
+  not resume after a call (if the device is already running again when the interruption is
+  handled, it fades over 5 ms instead). Leaving the app with `keepAlive: false` still fades over
+  5 ms. Synth releases, drum decays and effect tails still resume from where they stopped.
+- **No burst of stale events when the device restarts.** The note queue kept accepting notes during
+  an interruption, and neither that nor the idle stop dropped them: up to 255 sampler hits, note-ons
+  or drum hits sent while the device was stopped all started in the first block back. Pending
+  events are now dropped when an interruption begins (device stopped) and ends, when the idle stop
+  closes the device, and before a stopped or stalled device is reopened
+  (`NoteEventQueue::requestDiscard`, safe with the audio thread running; counted in the
+  `*Discarded` counters). The hit that wakes an idle-stopped device is still lost, as before;
+  `drumHit` while idle-stopped still does not wake it.
+- The background idle stop counts sounding voices (synth, drums, sampler) only while the device
+  runs: the counts are the last block's and were stale while it was stopped. With `keepAlive` in
+  the background, a call that interrupts while a voice sounds no longer holds off the idle stop for
+  the whole call, so the engine can idle-stop during it and restart on the foreground or a note.
+
+### Tests
+
+- Harness case `smrt` (`smrt_silence_race`, `smrt_interruption_cut`, `smrt_discard_on_stop`), and
+  the `NOTE_EVENT_QUEUE_DRAIN_HOOK` test seam in `ios/NoteEventQueue.h` (no code in the module).
+
 ## 0.10.0-rc.0
 
 ### Added (iOS)

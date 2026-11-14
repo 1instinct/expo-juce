@@ -1380,6 +1380,11 @@ static int mainThreadMaxFramesPerSecond() {
             [strongSelf handleInterruptionBegan];
         });
     } else if (type == AVAudioSessionInterruptionTypeEnded) {
+        // Right here, not delayed: what JS or a MIDI device sent during the interruption (the queue
+        // keeps accepting notes) is dropped instead of starting in a burst on the first block back.
+        // JUCE's observer may restart the unit just before this runs; its first render callback
+        // almost always comes later. requestDiscard is safe with the audio thread running.
+        sNoteQueue.requestDiscard();
         // The device is made playable again whether or not the system set
         // AVAudioSessionInterruptionOptionShouldResume: this is an instrument; it should be playable
         // as soon as the interruption is over. The transport stays stopped (the app decides).
@@ -1399,7 +1404,18 @@ static int mainThreadMaxFramesPerSecond() {
     if (self.isReady) {
         [self stopTransport];
         [self allNotesOff];
-        sNoteQueue.pushSamplerSilence(); // one-shots too: nothing resumes when the device restarts
+        // Sampler voices, one-shots too, stop at once (no fade): the device is already stopped (JUCE's
+        // observer stops it before this block runs) and JUCE restarts its audio unit without
+        // prepareToPlay, so a fade would start the first block back at the old level. Pending events
+        // are dropped, not played when the device restarts. If the device already runs again (a
+        // short interruption whose "ended" was handled first), a cut would click and the pending
+        // events are the player's own: fade instead, and keep them.
+        if (![self isDeviceRunning]) {
+            sNoteQueue.pushSamplerCut();
+            sNoteQueue.requestDiscard();
+        } else {
+            sNoteQueue.pushSamplerSilence();
+        }
     }
     emitEngineEvent(@"onAudioInterruption", @{ @"type": @"began", @"playing": @NO, @"wasPlaying": @(wasPlaying) });
     if (wasPlaying) emitEngineEvent(@"onTransportChange", @{ @"playing": @NO, @"reason": @"interruption" });
@@ -1458,6 +1474,10 @@ static int mainThreadMaxFramesPerSecond() {
     if (!restarted) {
         sDeadDeviceRestarts.fetch_add(1, std::memory_order_relaxed);
         NSLog(@"[ExpoJuceAudioEngine] audio callback stalled after %@; reopening device", context);
+        // Nothing has rendered since the check started (e.g. an interruption whose "ended" never
+        // came, then the app became active): what was queued meanwhile is dropped, not started in a
+        // burst by the reopened device.
+        sNoteQueue.requestDiscard();
         {
             LifecycleLock lifecycle;
             [self reopenDeviceWithPreferredFormatLocked:[NSString stringWithFormat:@"dead device (%@)", context]];
@@ -1489,6 +1509,9 @@ static int mainThreadMaxFramesPerSecond() {
     if ([self isDeviceRunning]) return;
 
     NSLog(@"[ExpoJuceAudioEngine] device not running after %@; reopening", context);
+    // Whatever was queued while it was stopped (an interruption with no "ended", a note racing the
+    // idle stop) is dropped, not started in a burst on the first block back.
+    sNoteQueue.requestDiscard();
     {
         LifecycleLock lifecycle;
         [self reopenDeviceWithPreferredFormatLocked:[NSString stringWithFormat:@"stopped device (%@)", context]];
@@ -2755,7 +2778,9 @@ static bool applySamplerParams(int slot, NSDictionary<NSString *, id> *params) {
             return;
         }
         activity.transportPlaying = sTransport != nullptr && sTransport->isPlaying();
-        if (sSynth != nullptr) {
+        // The voice counts are the last block's: stale while the device is stopped (an
+        // interruption), when nothing can sound, so they count only while it runs.
+        if (sSynth != nullptr && [self isDeviceRunning]) {
             activity.voicesSounding = sSynth->diag.activeVoices.load(std::memory_order_relaxed)
                 + sSynth->drums().diag.activeVoices.load(std::memory_order_relaxed)
                 + sSynth->sampler().diag.activeVoices.load(std::memory_order_relaxed);
@@ -2771,7 +2796,8 @@ static bool applySamplerParams(int slot, NSDictionary<NSString *, id> *params) {
 
 // Main thread: nothing has played for the policy's seconds in the background. Close the device
 // and deactivate the session so iOS can suspend the app. Note-ons are refused until the restart
-// (none can pile up and play at once afterwards).
+// (none can pile up and play at once afterwards), and what was queued before the stop is dropped
+// (requestDiscard; the restart drops anything that raced the refusal).
 - (void)idleStop {
     [self stopBackgroundCheck];
     if (!self.isReady || self.idleStopped) return;
@@ -2783,6 +2809,7 @@ static bool applySamplerParams(int slot, NSDictionary<NSString *, id> *params) {
         LifecycleLock lifecycle;
         carryXrunsLocked();
         if (sDeviceManager != nullptr) sDeviceManager->closeAudioDevice();
+        sNoteQueue.requestDiscard();
     }
     NSError *error = nil;
     [[AVAudioSession sharedInstance] setActive:NO
