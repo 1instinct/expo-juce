@@ -64,13 +64,23 @@ attached to them. The API is in the README ([Sampler](../README.md#sampler-0100-
   JS (`samplerHit` on the beat) until a sequence event kind for the sampler exists.
 - Background policy: sounding sampler voices count as busy for the idle stop
   (`voicesSounding` = synth + drums + sampler), so the device is not closed under a one-shot.
+  The counts are the last block's, so they count only while the device runs (0.10.0-rc.1).
   A hit or key note-on while idle-stopped wakes the device like `noteOn` (the hit itself is lost).
-- An interruption, and leaving the app with `keepAlive: false`, call `allNotesOff` (releases the
-  gated voices) and then `NoteEventQueue::pushSamplerSilence`: a mark like the releases that ends
-  every sampler voice started before it, one-shots included, over 5 ms, so a long one-shot neither
-  resumes when the device restarts after a call nor holds off the idle stop. A hit pushed after the
-  mark plays even when both are drained in the same block. `allNotesOff` alone still leaves
-  one-shots to play to their end.
+  A `drumHit` while idle-stopped is dropped without waking the device (unchanged).
+- Leaving the app with `keepAlive: false` calls `allNotesOff` (releases the gated voices) and then
+  `NoteEventQueue::pushSamplerSilence`: a mark like the releases that ends every sampler voice
+  started before it, one-shots included, over 5 ms, so a long one-shot does not hold off the idle
+  stop. A hit pushed after the mark plays even when both are drained in the same block. A hit the
+  mark covers never starts, even when the audio thread drains it only after it applied the mark
+  (pushed while it drained). `allNotesOff` alone still leaves one-shots to play to their end.
+- An interruption (a call, Siri) calls `allNotesOff` and then `NoteEventQueue::pushSamplerCut`: the
+  same mark with no fade. The device has already stopped, and JUCE restarts it without
+  `prepareToPlay`, so the sampler's voices and their declick tails are dropped at once and the
+  first block back is silent: a one-shot does not resume after a call, not even for 5 ms.
+- Events sent while the device is stopped are dropped, not started in a burst on the first block
+  back (`NoteEventQueue::requestDiscard`): those pending when an interruption begins or ends, when
+  the idle stop closes the device, and when a stopped device is reopened. This covers sampler
+  hits, key note-ons, synth notes and drum hits alike (counted in the `*Discarded` counters).
 
 ## Loading and the hand-off
 
@@ -125,6 +135,7 @@ Harness cases ([test/harness/README.md](../test/harness/README.md)): `sm` (the v
 one-shot, release, loop seam, choke, steal, zones, gain / pan / velocity / level), `smb` (32-voice
 timing), `sml` (WAV and MP3 loads, supersede, too long, memory cap, hand-off), `sms` (load / unload
 while rendering, no allocation on the audio thread), `smq` (through `PolySynthProcessor` and the
-note queue, arpeggiator off and on, `allNotesOff`, the silence mark, a sequence playing alongside) and `smd` (`src/samplerDefaults.ts` matches the
-native defaults). The Objective-C++ / Swift glue and the pad's sampler mode are compiled first by
+note queue, arpeggiator off and on, `allNotesOff`, the silence mark, a sequence playing alongside), `smrt`
+(the silence mark racing the drain, the interruption cut, discarding what was queued while the
+device was stopped) and `smd` (`src/samplerDefaults.ts` matches the native defaults). The Objective-C++ / Swift glue and the pad's sampler mode are compiled first by
 the iOS build.

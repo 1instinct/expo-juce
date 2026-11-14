@@ -376,10 +376,26 @@ public:
     }
 
     // Ends every voice whose event is at or below `mark` (seq 0 included), one-shots too, with a
-    // linear fade over kSamplerChokeMs (the engine's interruption and background stop).
+    // linear fade over kSamplerChokeMs (the engine's keepAlive-off background stop).
     void silenceUpTo(uint64_t mark) {
         for (Voice& v : voices)
             if (v.active && v.seq <= mark) beginRelease(v, kSamplerChokeMs);
+    }
+
+    // Like silenceUpTo, with no fade: the voices stop at once and every voice's declick tail is
+    // dropped (a tail only ever holds output from before the call). The engine's interruption:
+    // the device has already stopped and the next block is the first after its restart, so
+    // anything left over would start at the level it stopped at.
+    void cutUpTo(uint64_t mark) {
+        for (Voice& v : voices) {
+            if (v.active && v.seq <= mark) {
+                v.active = false;
+                v.releasing = false;
+                v.lastL = v.lastR = 0.0f;
+            }
+            v.tailLeft = 0;
+            v.tailL = v.tailR = 0.0f;
+        }
     }
 
     // Adds the sampler (stereo) into L / R. With nothing sounding the buffers are not touched.

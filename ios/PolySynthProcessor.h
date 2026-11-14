@@ -106,6 +106,7 @@ public:
         lastAllReleasedSeen = queue->allReleasedMark();
         lastAllReleasedSeenBySequence = lastAllReleasedSeen;
         lastSamplerSilenceSeen = queue->samplerSilenceMark();
+        lastSamplerCutSeen = queue->samplerCutMark();
     }
     NoteEventQueue& noteQueue() { return *queue; }
 
@@ -209,6 +210,7 @@ private:
     int seqOutputCount = 0;
     uint64_t lastAllReleasedSeenBySequence = 0; // NoteEventQueue::allReleasedMark last applied to the sequence
     uint64_t lastSamplerSilenceSeen = 0;        // NoteEventQueue::samplerSilenceMark last applied to the sampler
+    uint64_t lastSamplerCutSeen = 0;            // NoteEventQueue::samplerCutMark last applied to the sampler
 
     std::atomic<int> waveform{static_cast<int>(Waveform::Sine)};
     std::atomic<float> filterCutoff{20000.0f};

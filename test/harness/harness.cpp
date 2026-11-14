@@ -100,6 +100,23 @@ void harnessBackingTrackAcquireHook() {
     tCountAllocs = counting;
 }
 
+// NoteEventQueue::drainNoteOns() test seam (CMake defines NOTE_EVENT_QUEUE_DRAIN_HOOK as this
+// name). A test arms gDrainHook; the next drain runs it once, right after the consumer has taken
+// what was in the ring and before the processor reads the marks, i.e. as if another thread pushed
+// right then. What the hook does is not counted as a render allocation.
+static std::function<void()> gDrainHook;
+static int gDrainHookCalls = 0;
+void harnessNoteQueueDrainHook() {
+    if (!gDrainHook) return;
+    const bool counting = tCountAllocs;
+    tCountAllocs = false;
+    auto hook = std::move(gDrainHook);
+    gDrainHook = nullptr;
+    ++gDrainHookCalls;
+    hook();
+    tCountAllocs = counting;
+}
+
 //==============================================================================
 // GraphPlayer — the shipped class, from ios/GraphPlayer.h at the same git ref as the engine.
 #include "GraphPlayer.h"
@@ -6104,6 +6121,7 @@ int main(int argc, char** argv) {
     if (want("sml")) unexpected += runSamplerLoader() ? 0 : 1;
     if (want("sms")) unexpected += runSamplerSwapStress() ? 0 : 1;
     if (want("smq")) unexpected += runSamplerInSynth() ? 0 : 1;
+    if (want("smrt")) unexpected += runSamplerRealtime() ? 0 : 1;
     if (want("smd")) unexpected += runSamplerDefaultsMatchJs() ? 0 : 1;
     if (want("seq")) unexpected += runSequence() ? 0 : 1;
     if (want("seqv")) unexpected += runSequenceVoices() ? 0 : 1;

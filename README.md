@@ -61,7 +61,7 @@ Synth parameter smoothing: cutoff, resonance, detune, master level and sustain r
 One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Also in 0.6.0: an `AuxProcessor` node summed into the output after the effects, with a sample-accurate metronome (5 click styles, bar accent) and a backing track (off-thread decode + resample, gapless MP3 loop regions, lock-free swap, follows transport play / stop / seek; see [Metronome and backing track](#metronome-and-backing-track-060)); `getAnalysis()` (output peak / rms, 128-point scope, last note, transport) for HUDs; a `hitPolygon` touch shape on `JucePadView`. Later: reorderable / per-node effects via modular routing (sub-project 5).
 
 ### Sub-project 3: Sample Playback / Drum Machine
-**Status:** Drum machine in progress (0.8.0-rc.0); sampler in progress (0.10.0-rc.0, iOS) — engine + JS API verified in the offline harness, not yet run on a device
+**Status:** Drum machine in progress (0.8.0-rc.0); sampler in progress (0.10.0-rc.1, iOS) — engine + JS API verified in the offline harness, not yet run on a device
 
 0.8.0 adds a synthesized drum part (kick, snare, closed / open hat, clap, low / mid / high tom, rim; nine voices, the mid tom since 0.8.0-rc.2; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). 0.10.0 adds a sampler in the same synth node: 16 slots of decoded audio files on 32 voices, with key zones, loops, choke groups and a sampler mode on `JucePadView` (see [Sampler](#sampler-0100-ios)). Later: multi-sample velocity layers, transport-sequenced playback, Android.
 
@@ -427,9 +427,11 @@ if (ExpoJuce.hasSampler()) {
   never reach the sampler (a sequence holds synth notes and drum hits only), and stopping the
   transport leaves sampler voices alone; play a sampler part from JS (`samplerHit`) for now.
   With a background policy, sounding sampler voices keep the engine busy (no idle stop while one
-  plays). An interruption, or leaving the app with `keepAlive: false`, ends every sampler voice,
-  one-shots included, over 5 ms. A hit or key note-on while idle-stopped restarts the device (the
-  hit itself is lost, as for `noteOn`).
+  plays). Leaving the app with `keepAlive: false` ends every sampler voice, one-shots included,
+  over 5 ms; an interruption (a call, Siri) ends them at once, so a one-shot does not resume
+  afterwards. Notes, drum hits and sampler events sent while the device is stopped (an
+  interruption, the idle stop) are dropped, not played in a burst when it restarts. A hit or key
+  note-on while idle-stopped restarts the device (the hit itself is lost, as for `noteOn`).
 - Diagnostics: `samplerHits`, `samplerVoices`, `samplerPeak`, `samplerBytes`.
 
 | Slot parameter | Range (default) |
@@ -636,7 +638,9 @@ Juce.addTransportChangeListener(({ playing, reason }) => {});
 - Now Playing needs a session that does not mix with other apps. With it set, the session turns
   non-mixable (other apps' audio pauses) only in the background while the transport plays or after
   a lock-screen pause; Play in the foreground never changes the session.
-- An interruption (a call, Siri) stops the transport and does not resume it.
+- An interruption (a call, Siri) stops the transport and does not resume it. Notes, drum hits and
+  sampler events sent during it are dropped when it ends (0.10.0-rc.1), as are any still queued
+  when the idle stop closes the device.
 
 ### Diagnostics
 

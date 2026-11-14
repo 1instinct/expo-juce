@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, seq, seqv, bg, sm, smb, sml, sms, smq, smd, psm, psmv)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, seq, seqv, bg, sm, smb, sml, sms, smq, smrt, smd, psm, psmv)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -204,7 +204,19 @@ Exit code non-zero on any failure.
   `allNotesOff` release them, the silence mark ends one-shots but not a hit pushed after it, a
   loop sequence playing note 60 and a drum hit never reaches the sampler and its stop leaves a pad
   voice sounding, never the
-  arp, counters; 0 allocations), `smd` (`src/samplerDefaults.ts` has the same defaults, slot and
+  arp, counters; 0 allocations), `smrt` (0.10.0-rc.1, through `PolySynthProcessor` and a
+  `NoteEventQueue`, arp off and on: `smrt_silence_race`, a pad hit and a key note-on pushed right
+  after the audio thread's drain with the silence mark pushed before the processor reads it,
+  through the `NOTE_EVENT_QUEUE_DRAIN_HOOK` seam the CMake file defines: neither ever starts nor
+  counts as a sounding voice, a hit after the mark plays; `smrt_interruption_cut`, a one-shot and a
+  stolen voice's declick tail, then `pushSamplerCut` with no block in between (JUCE restarts the
+  unit without `prepareToPlay`): the first block back is exactly 0 and stays so, a hit before the
+  cut never starts, one after it plays from its first sample, `pushSamplerSilence` still fades;
+  `smrt_discard_on_stop`, a full ring of sampler hits, key notes, synth notes and drum hits then
+  `requestDiscard`: no sound, no voice, the arp gets nothing, each counted as discarded by kind,
+  events pushed after it play; `discardPending` and `requestDiscard` keep the same count, and 20000
+  pushes against 2000 requests and a draining thread consume or discard every event once; 0
+  allocations), `smd` (`src/samplerDefaults.ts` has the same defaults, slot and
   voice counts as `SamplerEngine.h`).
 - Synth parameter smoothing (`ios/SynthParamSmoother.h`): `psm` (`SynthParamSmoother` turns a
   cutoff step into a strictly increasing constant-ratio ramp of exactly 40 ms × sr samples that

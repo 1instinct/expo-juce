@@ -10,6 +10,14 @@
 #include <cstdint>
 #include <thread>
 
+// Test seam: the offline harness defines NOTE_EVENT_QUEUE_DRAIN_HOOK as the name of a function it
+// provides; drainNoteOns() calls it after the drain, so a test can push events and marks at
+// exactly that point (after the consumer's drain, before it reads the marks). Undefined in the
+// module: no code.
+#ifdef NOTE_EVENT_QUEUE_DRAIN_HOOK
+void NOTE_EVENT_QUEUE_DRAIN_HOOK();
+#endif
+
 // What a queued event starts.
 enum class NoteEventKind : uint8_t {
     Note = 0, // a synth note-on (`note` 0–127)
@@ -44,7 +52,8 @@ struct NoteEvent {
 //
 // The engine keeps one queue for the life of the process, outside the objects a rebuild replaces,
 // so note input never needs the engine lock, and a release sent while the device is stopped or
-// being reopened is applied on the first block after it.
+// being reopened is applied on the first block after it. Note-ons sent while it is stopped are
+// dropped when the engine asks (requestDiscard: interruptions, the idle stop, a reopen).
 class NoteEventQueue {
 public:
     static constexpr int kSize = 256;
@@ -72,6 +81,7 @@ public:
         // Count before publishing: the release-store below orders this increment ahead of the
         // consumer's notesConsumed increment for the same event (consumed never exceeds queued).
         notesQueued.fetch_add(1, std::memory_order_relaxed);
+        pushedCount.fetch_add(1, std::memory_order_relaxed); // under the lock, before publishing (requestDiscard)
         writePos.store(next, std::memory_order_release);
         return true;
     }
@@ -94,6 +104,7 @@ public:
         }
         ring[wp] = { voice, velocity, 0, juce::Time::getHighResolutionTicks(), touchTicks, NoteEventKind::Drum, entryTicks, inputTicks };
         drumHitsQueued.fetch_add(1, std::memory_order_relaxed);
+        pushedCount.fetch_add(1, std::memory_order_relaxed); // under the lock, before publishing (requestDiscard)
         writePos.store(next, std::memory_order_release);
         return true;
     }
@@ -129,11 +140,38 @@ public:
     }
 
     // Ends every sampler voice started by an event pushed so far, one-shots included (they ignore
-    // releases and allNotesOff): the engine's interruption and background stop, so a long one-shot
-    // neither resumes after a call nor keeps sounding after the app leaves the screen. A mark like
-    // the releases: a sampler event pushed later is not affected.
+    // releases and allNotesOff), with a 5 ms fade: the engine's keepAlive-off background stop, so a
+    // long one-shot does not keep sounding after the app leaves the screen. A mark like the
+    // releases: a sampler event pushed later is not affected. An event at or below the mark that
+    // the audio thread drains only after it applied the mark (pushed while it drained) never
+    // starts (PolySynthProcessor::startSamplerEvent), so the mark cannot be spent before an event
+    // it covers is in the ring. Taken under the producers' lock, so it covers whole pushes only.
     void pushSamplerSilence() {
-        raise(samplerSilencedUpTo, lastSeq.load(std::memory_order_acquire));
+        SpinGuard guard(producerLock);
+        raise(samplerSilencedUpTo, lastSeq.load(std::memory_order_relaxed));
+    }
+
+    // pushSamplerSilence with no fade (0.10.0-rc.1): the voices it covers stop at once and every
+    // declick tail is dropped. The engine's interruption: the device has already stopped, and JUCE
+    // restarts its audio unit without prepareToPlay, so a 5 ms fade would play the first block back
+    // from the level the voice stopped at (an audible tick) before fading. Raises the silence mark
+    // too, so everything pushSamplerSilence promises holds.
+    void pushSamplerCut() {
+        SpinGuard guard(producerLock);
+        const uint64_t seq = lastSeq.load(std::memory_order_relaxed);
+        raise(samplerSilencedUpTo, seq);
+        raise(samplerCutUpTo, seq);
+    }
+
+    // Discards every event pushed so far (notes, drum hits, sampler events) that the audio thread
+    // has not drained yet: the consumer drops them on its next drain, counted in the *Discarded
+    // counters, and events pushed after this call play as usual. Any thread, and safe whether or
+    // not an audio thread is draining (unlike discardPending). The engine's interruption and idle
+    // stop: what was sent while the device was stopped does not start in a burst on the first block
+    // back. Release marks are not touched.
+    void requestDiscard() {
+        SpinGuard guard(producerLock);
+        raise(discardUpTo, pushedCount.load(std::memory_order_relaxed));
     }
 
     // Releases every note-on of `note` pushed so far.
@@ -153,12 +191,25 @@ public:
     void drainNoteOns(Handler&& onNoteOn) {
         int rp = readPos.load(std::memory_order_relaxed);
         const int wp = writePos.load(std::memory_order_acquire);
+        // requestDiscard: the first discardUpTo events ever pushed are dropped, not handled. The
+        // ring is FIFO, so the event at rp is number drained + 1.
+        const uint64_t discard = discardUpTo.load(std::memory_order_acquire);
+        uint64_t drained = drainedCount.load(std::memory_order_relaxed);
         while (rp != wp) {
-            onNoteOn(ring[rp]);
-            counterFor(ring[rp].kind, drumHitsConsumed, samplerEventsConsumed, notesConsumed).fetch_add(1, std::memory_order_relaxed);
+            if (drained < discard) {
+                counterFor(ring[rp].kind, drumHitsDiscarded, samplerEventsDiscarded, notesDiscarded).fetch_add(1, std::memory_order_relaxed);
+            } else {
+                onNoteOn(ring[rp]);
+                counterFor(ring[rp].kind, drumHitsConsumed, samplerEventsConsumed, notesConsumed).fetch_add(1, std::memory_order_relaxed);
+            }
+            ++drained;
             rp = (rp + 1) % kSize;
         }
+        drainedCount.store(drained, std::memory_order_relaxed);
         readPos.store(rp, std::memory_order_release);
+#ifdef NOTE_EVENT_QUEUE_DRAIN_HOOK
+        NOTE_EVENT_QUEUE_DRAIN_HOOK();
+#endif
     }
 
     // True if the note-on `seq` of `note` has been released (seq 0 = not from this queue).
@@ -190,13 +241,19 @@ public:
     // The pushSamplerSilence mark: sampler voices whose event is at or below it are ended.
     uint64_t samplerSilenceMark() const { return samplerSilencedUpTo.load(std::memory_order_acquire); }
 
+    // The pushSamplerCut mark: sampler voices whose event is at or below it stop with no fade.
+    uint64_t samplerCutMark() const { return samplerCutUpTo.load(std::memory_order_acquire); }
+
     // Drops queued note-ons (counted in notesDiscarded). Consumer side: call only while no audio
-    // thread drains the queue (engine setup, before the device callback is attached).
+    // thread drains the queue (engine setup, before the device callback is attached); from any
+    // other thread or while a device may be running, use requestDiscard.
     void discardPending() {
         int rp = readPos.load(std::memory_order_relaxed);
         const int wp = writePos.load(std::memory_order_acquire);
-        for (; rp != wp; rp = (rp + 1) % kSize)
+        uint64_t drained = drainedCount.load(std::memory_order_relaxed);
+        for (; rp != wp; rp = (rp + 1) % kSize, ++drained)
             counterFor(ring[rp].kind, drumHitsDiscarded, samplerEventsDiscarded, notesDiscarded).fetch_add(1, std::memory_order_relaxed);
+        drainedCount.store(drained, std::memory_order_relaxed);
         readPos.store(wp, std::memory_order_release);
     }
 
@@ -205,7 +262,7 @@ public:
     std::atomic<uint32_t> notesQueued{0};
     std::atomic<uint32_t> notesConsumed{0};
     std::atomic<uint32_t> notesDropped{0};   // note-on rejected: ring full
-    std::atomic<uint32_t> notesDiscarded{0}; // dropped by discardPending (engine setup)
+    std::atomic<uint32_t> notesDiscarded{0}; // dropped by discardPending (engine setup) or requestDiscard
     // Drum hits, counted apart from the notes (same invariants).
     std::atomic<uint32_t> drumHitsQueued{0};
     std::atomic<uint32_t> drumHitsConsumed{0};
@@ -254,6 +311,7 @@ private:
         lastSeqOf.store(seq, std::memory_order_release);
         lastSeq.store(seq, std::memory_order_release);
         samplerEventsQueued.fetch_add(1, std::memory_order_relaxed);
+        pushedCount.fetch_add(1, std::memory_order_relaxed); // under the lock, before publishing (requestDiscard)
         writePos.store(next, std::memory_order_release);
         return true;
     }
@@ -280,4 +338,10 @@ private:
     std::atomic<uint64_t> samplerSlotLastSeq[kMaxSamplerSlot + 1] = {};
     std::atomic<uint64_t> samplerSlotReleasedUpTo[kMaxSamplerSlot + 1] = {};
     std::atomic<uint64_t> samplerSilencedUpTo{0};
+    std::atomic<uint64_t> samplerCutUpTo{0}; // pushSamplerCut (never above samplerSilencedUpTo)
+    // requestDiscard: events ever pushed (producers, under the lock), events taken off the ring
+    // (consumer: drained or discarded), and how many of the first pushed to drop.
+    std::atomic<uint64_t> pushedCount{0};
+    std::atomic<uint64_t> drainedCount{0};
+    std::atomic<uint64_t> discardUpTo{0};
 };

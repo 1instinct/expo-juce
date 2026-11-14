@@ -1103,6 +1103,250 @@ static bool runSamplerInSynth() {
     return pass;
 }
 
+// ── smrt: real-time edges of the engine's stop paths (0.10.0-rc.1) ───────────────────────────
+// Through PolySynthProcessor and a NoteEventQueue, arp off and on, 1 s constant 0.5 samples in
+// slot 5 (one-shot) and 6 (gated):
+//  - smrt_silence_race: a sampler hit / key note-on pushed after the audio thread's drain, with
+//    the silence mark pushed before the processor reads it (the drain hook), so the mark is spent
+//    on voices that do not include the event. The event must never start in a later block (a
+//    one-shot of up to 60 s in the background) nor count as a sounding voice (the idle stop's busy
+//    count). An event pushed after the mark still plays.
+static bool runSamplerRealtime() {
+    using namespace smtest;
+    const double sr = 48000.0;
+    int failedCases = 0;
+    gRenderAllocs.store(0); gRenderFrees.store(0);
+    std::printf("smrt  sampler real-time edges: silence race, interruption cut, discard on stop\n");
+    auto block = [](PolySynthProcessor& synth, juce::AudioBuffer<float>& buf, int n) {
+        juce::MidiBuffer midi;
+        buf.setSize(2, n, false, false, true);
+        tCountAllocs = true;
+        synth.processBlock(buf, midi);
+        tCountAllocs = false;
+        return std::max(buf.getMagnitude(0, 0, n), buf.getMagnitude(1, 0, n));
+    };
+    auto voicesOn = [](PolySynthProcessor& synth, int slot) {
+        int n = 0;
+        for (int v = 0; v < kSamplerVoices; ++v) {
+            const SamplerVoiceInfo info = synth.sampler().voiceInfo(v);
+            n += (info.active && info.slot == slot) ? 1 : 0;
+        }
+        return n;
+    };
+    Checks race, cut, discard;
+    for (int arpOn = 0; arpOn < 2; ++arpOn) {
+        const std::string tag = arpOn ? " (arp on)" : " (arp off)";
+        SamplerBank bank;
+        std::vector<float> x(48000, 0.5f);
+        std::string error;
+        bank.install(5, SamplerBank::fromAudio(x.data(), x.data(), 48000, sr), bank.beginLoad(5), error);
+        bank.install(6, SamplerBank::fromAudio(x.data(), x.data(), 48000, sr), bank.beginLoad(6), error);
+        {
+            TransportEngine transport;
+            PolySynthProcessor synth;
+            NoteEventQueue queue;
+            synth.setNoteQueue(&queue);
+            synth.setTransport(&transport);
+            synth.setSamplerSource(&bank);
+            synth.setRateAndBufferSizeDetails(sr, 512);
+            synth.prepareToPlay(sr, 512);
+            ArpSettings s = ArpSettings::defaults();
+            s.enabled = arpOn == 1;
+            synth.arp().setSettings(s);
+            SamplerParamStore& store = synth.sampler().params();
+            store.setLevel(1.0);
+            SamplerSlotParams oneShot;
+            oneShot.attackMs = 0.0f;
+            store.setSlot(5, oneShot);
+            SamplerSlotParams gated;
+            gated.attackMs = 0.0f;
+            gated.oneShot = false;
+            gated.releaseMs = 1.0f;
+            gated.lowNote = gated.highNote = 60;
+            store.setSlot(6, gated);
+            juce::AudioBuffer<float> buf(2, 512);
+
+            // smrt_silence_race
+            {
+                Checks& c = race;
+                c(block(synth, buf, 128) == 0.0f, "silent before" + tag);
+                gDrainHookCalls = 0;
+                gDrainHook = [&] {
+                    queue.pushSamplerHit(5, 127);
+                    queue.pushSamplerNoteOn(60, 127);
+                    queue.pushSamplerSilence();
+                };
+                const float first = block(synth, buf, 128);
+                c(gDrainHookCalls == 1, "drain hook ran" + tag);
+                c(first == 0.0f, "nothing sounds in the block of the race" + tag);
+                float later = 0.0f;
+                for (int i = 0; i < 8; ++i) later = std::max(later, block(synth, buf, 128));
+                c(later == 0.0f, "a hit / key note the silence mark covers never starts in a later block" + tag + " peak "
+                  + std::to_string(later));
+                c(voicesOn(synth, 5) == 0 && voicesOn(synth, 6) == 0, "no sampler voice" + tag);
+                c(synth.sampler().diag.activeVoices.load() == 0, "busy count 0 (the idle stop is not held off)" + tag);
+                queue.pushSamplerHit(5, 127);
+                const float after = block(synth, buf, 128);
+                c(after == 0.5f && voicesOn(synth, 5) == 1, "a hit pushed after the mark plays" + tag + " " + std::to_string(after));
+                queue.pushSamplerSilence();
+                for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+                c(voicesOn(synth, 5) == 0, "silenced again" + tag);
+            }
+
+            // smrt_interruption_cut
+            {
+                Checks& c = cut;
+                // A one-shot at full level, and with polyphony 1 a second hit stealing its voice in
+                // 32-frame blocks: the stolen voice's 64-sample declick tail is still running.
+                store.setPolyphony(1);
+                queue.pushSamplerHit(5, 127);
+                c(block(synth, buf, 32) == 0.5f, "one-shot sounding" + tag);
+                queue.pushSamplerHit(5, 127);
+                block(synth, buf, 32);
+                c(voicesOn(synth, 5) == 1, "stolen, its tail running" + tag);
+                // The interruption: the device is already stopped, so no block runs until JUCE
+                // restarts the audio unit (no prepareToPlay). The first block back is silent from
+                // its first sample: no fade from the old level, no tail.
+                queue.pushSamplerCut();
+                const float back = block(synth, buf, 32);
+                c(back == 0.0f, "first block after the restart is exactly 0" + tag + " peak " + std::to_string(back));
+                c(voicesOn(synth, 5) == 0 && synth.sampler().diag.activeVoices.load() == 0, "no voice left" + tag);
+                float rest = 0.0f;
+                for (int i = 0; i < 8; ++i) rest = std::max(rest, block(synth, buf, 32));
+                c(rest == 0.0f, "stays silent (the one-shot does not resume)" + tag);
+                store.setPolyphony(kSamplerVoices);
+                // A hit pushed after the cut plays from the first sample of the block it is drained in.
+                queue.pushSamplerHit(5, 127);
+                queue.pushSamplerCut();
+                queue.pushSamplerHit(5, 127);
+                block(synth, buf, 128);
+                c(buf.getSample(0, 0) == 0.5f && voicesOn(synth, 5) == 1,
+                  "the hit before the cut never starts, the hit after it plays at once" + tag);
+                // The cut raises the silence mark too; the keepAlive-off background stop still fades.
+                c(queue.samplerSilenceMark() >= queue.samplerCutMark() && queue.samplerCutMark() > 0, "cut <= silence" + tag);
+                queue.pushSamplerSilence();
+                block(synth, buf, 128);
+                c(buf.getSample(0, 0) > 0.4f && buf.getSample(0, 127) < 0.5f, "background silence still fades" + tag);
+                for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+                c(voicesOn(synth, 5) == 0, "faded out" + tag);
+            }
+
+            // smrt_discard_on_stop
+            {
+                Checks& c = discard;
+                const uint32_t sq0 = queue.samplerEventsQueued.load(), sc0 = queue.samplerEventsConsumed.load();
+                const uint32_t nc0 = queue.notesConsumed.load(), dc0 = queue.drumHitsConsumed.load();
+                const uint32_t sd0 = queue.samplerEventsDiscarded.load(), nd0 = queue.notesDiscarded.load(),
+                               dd0 = queue.drumHitsDiscarded.load();
+                // Sent from JS while the device is stopped (an interruption, an idle stop): a full
+                // ring of sampler hits, key note-ons, synth notes and drum hits.
+                int pushed = 0;
+                for (int i = 0; pushed < NoteEventQueue::kSize - 1; ++i) {
+                    bool ok = false;
+                    switch (i % 4) {
+                        case 0: ok = queue.pushSamplerHit(5, 127); break;
+                        case 1: ok = queue.pushSamplerNoteOn(60, 127); break;
+                        case 2: ok = queue.pushNoteOn(48 + i % 24, 100); break;
+                        default: ok = queue.pushDrumHit(i % 9, 127); break;
+                    }
+                    pushed += ok ? 1 : 0;
+                }
+                queue.requestDiscard(); // the engine, before the device runs again
+                float back = 0.0f;
+                for (int i = 0; i < 4; ++i) back = std::max(back, block(synth, buf, 128));
+                c(back == 0.0f, "no burst on the first blocks back" + tag + " peak " + std::to_string(back));
+                c(voicesOn(synth, 5) == 0 && voicesOn(synth, 6) == 0, "no sampler voice" + tag);
+                c(synth.diag.activeVoices.load() == 0 && synth.drums().diag.activeVoices.load() == 0, "no synth or drum voice" + tag);
+                c(!synth.arp().isActive(), "the arp got nothing" + tag);
+                const uint32_t discarded = (queue.samplerEventsDiscarded.load() - sd0) + (queue.notesDiscarded.load() - nd0)
+                    + (queue.drumHitsDiscarded.load() - dd0);
+                c(discarded == (uint32_t)pushed, "all " + std::to_string(pushed) + " counted as discarded: " + std::to_string(discarded) + tag);
+                c(queue.samplerEventsConsumed.load() == sc0 && queue.notesConsumed.load() == nc0 && queue.drumHitsConsumed.load() == dc0,
+                  "none consumed" + tag);
+                c(queue.samplerEventsQueued.load() - sq0 == (queue.samplerEventsDiscarded.load() - sd0), "queued == discarded (sampler)" + tag);
+                // What is sent after the request plays as usual.
+                queue.pushSamplerHit(5, 127);
+                queue.pushDrumHit(0, 127);
+                block(synth, buf, 128);
+                c(voicesOn(synth, 5) == 1 && queue.samplerEventsConsumed.load() == sc0 + 1 && queue.drumHitsConsumed.load() == dc0 + 1,
+                  "events pushed after the request play" + tag);
+                queue.pushSamplerCut();
+                for (int i = 0; i < 40; ++i) block(synth, buf, 128); // let the kick ring out
+            }
+        }
+        bank.unloadAll();
+        bank.collect();
+    }
+    failedCases += report("smrt_silence_race", race) ? 0 : 1;
+    failedCases += report("smrt_interruption_cut", cut) ? 0 : 1;
+
+    // smrt_discard_on_stop (queue): requestDiscard against discardPending's bookkeeping, and from
+    // other threads while a consumer drains (every event either consumed or discarded once).
+    {
+        Checks& c = discard;
+        {
+            NoteEventQueue q;
+            for (int i = 0; i < 3; ++i) q.pushNoteOn(60, 100);
+            q.discardPending(); // engine setup
+            q.pushSamplerHit(1, 100);
+            q.requestDiscard();
+            q.pushDrumHit(2, 100);
+            int handled = 0, drum = 0;
+            q.drainNoteOns([&](const NoteEvent& e) { ++handled; drum += e.kind == NoteEventKind::Drum ? 1 : 0; });
+            c(handled == 1 && drum == 1, "only the event pushed after the request is handled: " + std::to_string(handled));
+            c(q.notesDiscarded.load() == 3 && q.samplerEventsDiscarded.load() == 1 && q.drumHitsConsumed.load() == 1,
+              "counted by kind after discardPending");
+            q.requestDiscard(); // nothing pending: no effect on later events
+            q.pushNoteOn(61, 100);
+            handled = 0;
+            q.drainNoteOns([&](const NoteEvent&) { ++handled; });
+            c(handled == 1, "a request with nothing pending drops nothing later");
+        }
+        {
+            NoteEventQueue q;
+            std::atomic<bool> stop{false};
+            std::atomic<uint32_t> handled{0};
+            std::thread consumer([&] {
+                while (!stop.load()) q.drainNoteOns([&](const NoteEvent&) { handled.fetch_add(1); });
+            });
+            std::thread producer([&] {
+                for (int i = 0; i < 20000; ++i) {
+                    if (i % 3 == 0) q.pushSamplerHit(i % 16, 100);
+                    else if (i % 3 == 1) q.pushNoteOn(i % 128, 100);
+                    else q.pushDrumHit(i % 9, 100);
+                }
+            });
+            std::thread requester([&] {
+                for (int i = 0; i < 2000; ++i) { q.requestDiscard(); std::this_thread::yield(); }
+            });
+            producer.join();
+            requester.join();
+            stop.store(true);
+            consumer.join();
+            q.drainNoteOns([&](const NoteEvent&) { handled.fetch_add(1); });
+            const uint32_t queued = q.notesQueued.load() + q.drumHitsQueued.load() + q.samplerEventsQueued.load();
+            const uint32_t consumed = q.notesConsumed.load() + q.drumHitsConsumed.load() + q.samplerEventsConsumed.load();
+            const uint32_t dropped = q.notesDiscarded.load() + q.drumHitsDiscarded.load() + q.samplerEventsDiscarded.load();
+            c(queued == consumed + dropped && consumed == handled.load(),
+              "racing requests: queued " + std::to_string(queued) + " == consumed " + std::to_string(consumed) + " + discarded "
+                  + std::to_string(dropped));
+            q.requestDiscard();
+            q.pushSamplerHit(0, 100);
+            uint32_t after = 0;
+            q.drainNoteOns([&](const NoteEvent&) { ++after; });
+            c(after == 1, "after the race, a new event plays");
+        }
+    }
+    failedCases += report("smrt_discard_on_stop", discard) ? 0 : 1;
+
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    const bool pass = failedCases == 0 && allocs == 0 && frees == 0;
+    std::printf("smrt  sampler real-time edges  %-4s %d failed, render allocs %llu frees %llu\n", pass ? "PASS" : "FAIL",
+                failedCases, (unsigned long long)allocs, (unsigned long long)frees);
+    std::fflush(stdout);
+    return pass;
+}
+
 // ── smd: src/samplerDefaults.ts == the C++ defaults ──────────────────────────────────────────
 static bool runSamplerDefaultsMatchJs() {
     const juce::File file(juce::String(HARNESS_JS_SRC) + "/samplerDefaults.ts");

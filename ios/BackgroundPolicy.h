@@ -9,9 +9,10 @@
 //  - Not set (setBackgroundPolicy never called since the app's JS started): nothing changes when
 //    the app goes to the background (the engine's behaviour before 0.9.0-rc.5).
 //  - keepAlive: in the background the engine keeps running while it is busy (the transport plays,
-//    a voice or drum sounds, the sequence or the MIDI input holds a note, the arpeggiator runs).
-//  - keepAlive off: going to the background stops the transport and releases every note (what
-//    plays stops when the app leaves the screen).
+//    a synth, drum or sampler voice sounds, the sequence or the MIDI input holds a note, the
+//    arpeggiator runs).
+//  - keepAlive off: going to the background stops the transport, releases every note and ends
+//    every sampler voice, one-shots included (what plays stops when the app leaves the screen).
 //  - Either way, once it has been idle (not busy) in the background for idleStopSeconds, the
 //    engine stops its audio device and deactivates the session ("idleStopped"), and iOS may
 //    suspend the app. Returning to the foreground restarts the device.
@@ -50,7 +51,7 @@ inline const char* stateName(State s) {
 // What the engine is doing, sampled on each check.
 struct Activity {
     bool transportPlaying = false;
-    int voicesSounding = 0;  // synth voices (any stage) and drum voices
+    int voicesSounding = 0;  // synth voices (any stage), drum and sampler voices (0 while the device is stopped)
     int sequenceNotes = 0;   // notes the sequence player holds
     int inputHolds = 0;      // notes the MIDI byte input holds (a device key held down)
     bool arpRunning = false; // the arpeggiator has notes (held or latched)
