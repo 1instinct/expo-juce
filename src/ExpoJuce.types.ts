@@ -534,6 +534,161 @@ export type AudioDiagnostics = {
   displayRateHint?: number;
   /** MIDI byte input (0.9.0-rc.2+, iOS): counters since launch and the arrival → render leg. */
   midiInput?: MidiInputDiagnostics;
+  /** The native sequence player (0.9.0-rc.5+, iOS). */
+  sequence?: SequenceDiagnostics;
+  /** 0.9.0-rc.5+, iOS. */
+  backgroundState?: BackgroundState;
+  /** When the idle stop is due (clockSec seconds), -1 when none is pending. 0.9.0-rc.5+, iOS. */
+  idleStopAt?: number;
+  backgroundPolicy?: BackgroundPolicyDiagnostics;
+  /** Idle stops since launch. */
+  idleStops?: number;
+  /** clockSec of the last idle stop, -1 = none. */
+  lastIdleStopAt?: number;
+  /** Why the last restart from the background failed (iOS refused the session); empty = none. */
+  backgroundStartError?: string;
+  nowPlaying?: NowPlayingDiagnostics;
+};
+
+// ── Loop sequence (0.9.0-rc.5, iOS) ──────────────────────────────
+
+/** One event of the loop the native sequence player plays (setSequence). */
+export type SequenceEvent = {
+  /** 'note': a synth note (through the arpeggiator when it is on); 'drum': a drum voice hit. */
+  kind: 'note' | 'drum';
+  /** MIDI note 0–127, or the drum voice 0–8. */
+  note: number;
+  /** 1–127. */
+  velocity: number;
+  /** Beats from the loop start, 0 <= start < loopBeats. */
+  start: number;
+  /** Beats (> 0). Ignored for drums (a hit). */
+  length: number;
+  /**
+   * Absolute transport beat before which this event does not fire (it fires from its next
+   * occurrence at or after it). For an event the app already played itself.
+   */
+  skipBefore?: number;
+};
+
+export type SequenceOptions = {
+  /** The loop length in beats: at least 1/64 when there are events (else setSequence returns false). */
+  loopBeats: number;
+  /** At most SEQUENCE_MAX_EVENTS. */
+  events: SequenceEvent[];
+  /** Silences the sequence without replacing it (setSequenceMuted). Default false. */
+  muted?: boolean;
+  /** Absolute transport beat: nothing fires before it (a count-in). Default: no bound. */
+  fromBeat?: number;
+  /** Absolute transport beat: nothing fires at or after it (a single pass). Default: no bound. */
+  endBeat?: number;
+};
+
+/** One note the sequence player started or released (in an onSequenceNotes batch). */
+export type SequenceNote = {
+  note: number;
+  kind: 'note' | 'drum';
+  /** True for the start; drums only report starts. */
+  on: boolean;
+  /** The transport beat it fired at. */
+  atBeat: number;
+};
+
+/** An onSequenceNotes batch, about every 16 ms while the sequence plays and a listener is set. */
+export type SequenceNotesBatch = {
+  notes: SequenceNote[];
+  /** CACurrentMediaTime() seconds at delivery. */
+  now: number;
+};
+
+export type SequenceDiagnostics = {
+  events: number;
+  loopBeats: number;
+  /** The player fires notes now (transport playing, events set, not muted). */
+  playing: boolean;
+  muted: boolean;
+  /** Notes the player holds now. */
+  activeNotes: number;
+  notesFired: number;
+  /** Notes fired more than a block late (a block that started past the note). */
+  lateFires: number;
+  /**
+   * Firings lost since launch (cumulative): starts over a block's limit (512), notes over 256
+   * sounding at once, or loop passes over a block's limit. Never a note-off.
+   */
+  dropped: number;
+  /** Invalid events the last accepted setSequence skipped (bad note, length or start). */
+  invalidEvents: number;
+  version: number;
+  /** onSequenceNotes batches are built (a listener is set). */
+  listening: boolean;
+  /** Notes not reported because the batch ring was full. */
+  notesLost: number;
+};
+
+// ── Background playback, Now Playing, remote commands (0.9.0-rc.5, iOS) ──
+
+export type BackgroundPolicy = {
+  /**
+   * true (default): in the background the engine keeps running while it plays something. false:
+   * leaving the app stops the transport and releases every note.
+   */
+  keepAlive?: boolean;
+  /**
+   * Seconds idle in the background before the engine stops its audio device and lets iOS suspend
+   * the app (default 30, 1–3600). Coming back to the foreground restarts it.
+   */
+  idleStopSeconds?: number;
+};
+
+export type BackgroundState = 'foreground' | 'background' | 'idleStopped';
+
+export type NowPlayingInfo = {
+  title: string;
+  artist?: string;
+  album?: string;
+};
+
+export type RemoteCommand = 'play' | 'pause' | 'togglePlayPause';
+
+export type RemoteCommandEvent = {
+  command: RemoteCommand;
+  /** The transport's state after the command. */
+  playing: boolean;
+  /** A play that could not restart the audio device (see AudioDiagnostics.backgroundStartError). */
+  failed?: boolean;
+};
+
+export type AudioInterruptionEvent = {
+  type: 'began' | 'ended';
+  /** began: the transport is stopped (it does not resume by itself). */
+  playing?: boolean;
+  /** began: the transport was playing when the interruption came. */
+  wasPlaying?: boolean;
+};
+
+/** The native side started or stopped the transport (not a call from JS). */
+export type TransportChangeEvent = {
+  playing: boolean;
+  reason: 'interruption' | 'remoteCommand' | 'background';
+};
+
+export type BackgroundStateEvent = {
+  state: BackgroundState;
+};
+
+export type BackgroundPolicyDiagnostics = {
+  /** setBackgroundPolicy was called since the app's JS started. */
+  set: boolean;
+  keepAlive: boolean;
+  idleStopSeconds: number;
+};
+
+export type NowPlayingDiagnostics = {
+  set: boolean;
+  /** The session does not mix with other apps' audio now (needed for Now Playing). */
+  exclusiveSession: boolean;
+  remoteCommands: RemoteCommand[];
 };
 
 export type MidiInputDiagnostics = {

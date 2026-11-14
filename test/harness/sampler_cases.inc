@@ -1033,6 +1033,45 @@ static bool runSamplerInSynth() {
             synth.samplerNoteOff(60);
             for (int i = 0; i < 3; ++i) block(synth, buf, 128);
             c(voicesOn(synth, 6) == 0, "a note-off queued right after its note-on ends it" + tag);
+            // allNotesOff leaves one-shots playing; the engine's sampler silence (interruption,
+            // keepAlive-off background stop) ends them within kSamplerChokeMs, and spares a hit
+            // pushed after it even when both are drained in the same block.
+            synth.samplerHit(5, 100);
+            block(synth, buf, 128);
+            synth.allNotesOff();
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+            c(voicesOn(synth, 5) >= 1, "allNotesOff leaves a one-shot" + tag);
+            queue.pushSamplerSilence();
+            synth.samplerHit(6, 100);
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128); // 384 samples > 5 ms
+            c(voicesOn(synth, 5) == 0, "sampler silence ends one-shots" + tag);
+            c(voicesOn(synth, 6) == 1, "a hit pushed after the silence keeps playing" + tag);
+            // The loop sequence never reaches the sampler: its note 60 (slot 6's key zone) and its
+            // drum hit play the synth and the drums only, and stopping the transport leaves the
+            // held sampler pad voice alone.
+            {
+                auto seqStore = std::make_unique<seqplay::SequenceStore>(); // before the render (allocates)
+                seqplay::Event ev[2];
+                ev[0].start = 0.0; ev[0].length = 0.5; ev[0].note = 60; ev[0].kind = seqplay::EventKind::Note;
+                ev[1].start = 0.25; ev[1].note = 0; ev[1].kind = seqplay::EventKind::Drum;
+                c(seqStore->set(ev, 2, 1.0).ok, "sequence set" + tag);
+                synth.setSequenceStore(seqStore.get());
+                const uint64_t noteOnsBefore = synth.sampler().diag.noteOns.load();
+                const uint64_t hitsBefore = synth.sampler().diag.hits.load();
+                transport.start();
+                for (int i = 0; i < 150; ++i) block(synth, buf, 128); // 19200 samples: beats 0 .. 0.8
+                c(seqStore->notesFired.load() == 2, "the sequence fired its note and drum hit" + tag);
+                c(synth.sampler().diag.noteOns.load() == noteOnsBefore && synth.sampler().diag.hits.load() == hitsBefore,
+                  "sequence events never reach the sampler" + tag);
+                c(voicesOn(synth, 6) == 1, "only the pad's sampler voice" + tag);
+                transport.stop();
+                for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+                c(voicesOn(synth, 6) == 1, "a transport stop leaves sampler voices alone" + tag);
+                synth.setSequenceStore(nullptr);
+            }
+            synth.samplerRelease(6);
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 0, "pad released after the sequence" + tag);
             const uint32_t queued = queue.samplerEventsQueued.load();
             c(!queue.pushSamplerHit(16, 100) && !queue.pushSamplerHit(-1, 100) && !queue.pushSamplerNoteOn(128, 100)
               && !queue.pushSamplerNoteOn(-1, 100) && queue.samplerEventsQueued.load() == queued, "out of range not queued" + tag);
@@ -1057,7 +1096,7 @@ static bool runSamplerInSynth() {
     const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
     c(allocs == 0 && frees == 0, "render allocations " + std::to_string(allocs) + "/" + std::to_string(frees));
     const bool pass = c.failed == 0;
-    std::printf("smq   sampler through PolySynthProcessor + note queue (arp off / on): hits, keys, releases, allNotesOff, counters"
+    std::printf("smq   sampler through PolySynthProcessor + note queue (arp off / on): hits, keys, releases, allNotesOff, silence, sequence, counters"
                 "  %-4s %d failed checks allocs %llu%s\n", pass ? "PASS" : "FAIL", c.failed, (unsigned long long)allocs,
                 c.detail.c_str());
     std::fflush(stdout);

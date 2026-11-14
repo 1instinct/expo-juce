@@ -399,6 +399,13 @@ if (ExpoJuce.hasSampler()) {
   `hasSampler()` is `false`, `loadSamplerSlot` rejects with `ERR_UNSUPPORTED`, the other calls do
   nothing or return `false`, and `getSamplerState()` returns the defaults.
 - `JucePadView` `mode="sampler"`: pad `note` is the slot (see [`JucePadView`](#jucepadview-052)).
+- With the [loop sequence](#loop-sequence-and-background-playback-090-rc5-ios): sequence events
+  never reach the sampler (a sequence holds synth notes and drum hits only), and stopping the
+  transport leaves sampler voices alone; play a sampler part from JS (`samplerHit`) for now.
+  With a background policy, sounding sampler voices keep the engine busy (no idle stop while one
+  plays). An interruption, or leaving the app with `keepAlive: false`, ends every sampler voice,
+  one-shots included, over 5 ms. A hit or key note-on while idle-stopped restarts the device (the
+  hit itself is lost, as for `noteOn`).
 - Diagnostics: `samplerHits`, `samplerVoices`, `samplerPeak`, `samplerBytes`.
 
 | Slot parameter | Range (default) |
@@ -551,6 +558,61 @@ if (hasMidiInput()) {
 - `midiInputToRenderMs` starts at the caller's `arrivalSeconds`: stamp it first thing in the
   callback (work done before the stamp is not counted).
 - Android and older binaries: `hasMidiInput()` is false, the setters return false.
+
+### Loop sequence and background playback (0.9.0-rc.5+, iOS)
+
+The engine can play a loop itself, on the audio thread at each note's exact sample against the
+transport, so it keeps time with the screen locked and the JS thread busy or suspended.
+
+```ts
+import * as Juce from 'expo-juce';
+
+if (Juce.hasSequencePlayer()) {
+  Juce.setSequence({
+    loopBeats: 4,
+    events: [
+      { kind: 'note', note: 60, velocity: 100, start: 0, length: 1 },
+      { kind: 'drum', note: 0, velocity: 120, start: 0, length: 0.25 },
+    ],
+  });
+  Juce.startTransport();
+}
+const sub = Juce.addSequenceNotesListener(({ notes }) => {
+  /* { note, kind, on, atBeat }, about every 16 ms */
+});
+```
+
+- `setSequence` replaces the loop atomically; at most `SEQUENCE_MAX_EVENTS` (8192) events, else it
+  returns false. `fromBeat` / `endBeat` bound where it fires (a count-in, a single pass);
+  `skipBefore` skips an event the app already played. The loop is at least 1/64 beat.
+  `setSequenceMuted`, `clearSequence`.
+- Jumps, stop, a new loop length, `allNotesOff` and muting release everything it started. A pad
+  or MIDI input note and a sequence note of the same pitch do not cut each other.
+- With the arpeggiator on, sequence notes go through it; latch holds only the player's notes.
+
+Background playback needs the host app's `audio` background mode. Then:
+
+```ts
+Juce.setBackgroundPolicy({ keepAlive: true, idleStopSeconds: 30 });
+Juce.setNowPlaying({ title: 'My loop', artist: 'me' });
+Juce.enableRemoteCommands(['play', 'pause', 'togglePlayPause']);
+Juce.addRemoteCommandListener(({ command, playing }) => {
+  /* keep the app's transport state in step */
+});
+Juce.addAudioInterruptionListener(({ type }) => {});
+Juce.addTransportChangeListener(({ playing, reason }) => {});
+```
+
+- Without `setBackgroundPolicy` nothing changes when the app goes to the background.
+- keepAlive false: leaving the app stops the transport and releases every note.
+- Idle in the background for `idleStopSeconds`, the engine stops its device and deactivates the
+  session so iOS can suspend the app. The foreground, a note-on or a transport start restarts it.
+  A lock-screen play after an idle stop tries to restart from the background; if iOS refuses,
+  `onRemoteCommand` has `failed: true` and diagnostics `backgroundStartError` says why.
+- Now Playing needs a session that does not mix with other apps. With it set, the session turns
+  non-mixable (other apps' audio pauses) only in the background while the transport plays or after
+  a lock-screen pause; Play in the foreground never changes the session.
+- An interruption (a call, Siri) stops the transport and does not resume it.
 
 ### Diagnostics
 

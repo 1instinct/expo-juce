@@ -28,10 +28,13 @@ int VoiceAllocator::findVoice(Voice* voices) {
 int VoiceAllocator::noteOn(int note, float velocity, Voice* voices,
                            Waveform waveform, double detuneCents,
                            float filterCutoff, float filterResonance,
-                           float masterLevel, uint64_t seq) {
+                           float masterLevel, uint64_t seq, VoiceSource source) {
+    // Retrigger: the latest voice of this note stops, unless one of the two belongs to the loop
+    // sequence and the other does not (see VoiceSource).
     if (note >= 0 && note < 128 && noteMap[note] >= 0) {
         int existing = noteMap[note];
-        if (existing < MAX_VOICES && voices[existing].getNoteNumber() == note) {
+        if (existing < MAX_VOICES && voices[existing].getNoteNumber() == note
+            && (voices[existing].source == VoiceSource::Sequence) == (source == VoiceSource::Sequence)) {
             voices[existing].stopNote();
         }
         noteMap[note] = -1;
@@ -59,6 +62,7 @@ int VoiceAllocator::noteOn(int note, float velocity, Voice* voices,
 
     voice.startNote(note, velocity);
     voice.startSeq = seq;
+    voice.source = source;
 
     if (note >= 0 && note < 128) {
         noteMap[note] = voiceIdx;

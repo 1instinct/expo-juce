@@ -55,6 +55,23 @@ attached to them. The API is in the README ([Sampler](../README.md#sampler-0100-
   samples.
 - Level and mute ramp per 256-sample chunk; the first block after `prepare` starts at the target.
 
+## With the loop sequence and the background policy (0.9.0-rc.5)
+
+- The loop sequence player (`setSequence`) has note and drum events only: its notes start synth
+  voices (or feed the arpeggiator) and its drum hits the drum part. None reaches the sampler, a
+  pad in sampler mode hits the sampler directly, and a transport stop or jump releases only what
+  the sequence started, so sampler voices are left alone. A sampler part in a loop is played from
+  JS (`samplerHit` on the beat) until a sequence event kind for the sampler exists.
+- Background policy: sounding sampler voices count as busy for the idle stop
+  (`voicesSounding` = synth + drums + sampler), so the device is not closed under a one-shot.
+  A hit or key note-on while idle-stopped wakes the device like `noteOn` (the hit itself is lost).
+- An interruption, and leaving the app with `keepAlive: false`, call `allNotesOff` (releases the
+  gated voices) and then `NoteEventQueue::pushSamplerSilence`: a mark like the releases that ends
+  every sampler voice started before it, one-shots included, over 5 ms, so a long one-shot neither
+  resumes when the device restarts after a call nor holds off the idle stop. A hit pushed after the
+  mark plays even when both are drained in the same block. `allNotesOff` alone still leaves
+  one-shots to play to their end.
+
 ## Loading and the hand-off
 
 Like the backing track:
@@ -108,6 +125,6 @@ Harness cases ([test/harness/README.md](../test/harness/README.md)): `sm` (the v
 one-shot, release, loop seam, choke, steal, zones, gain / pan / velocity / level), `smb` (32-voice
 timing), `sml` (WAV and MP3 loads, supersede, too long, memory cap, hand-off), `sms` (load / unload
 while rendering, no allocation on the audio thread), `smq` (through `PolySynthProcessor` and the
-note queue, arpeggiator off and on, `allNotesOff`) and `smd` (`src/samplerDefaults.ts` matches the
+note queue, arpeggiator off and on, `allNotesOff`, the silence mark, a sequence playing alongside) and `smd` (`src/samplerDefaults.ts` matches the
 native defaults). The Objective-C++ / Swift glue and the pad's sampler mode are compiled first by
 the iOS build.

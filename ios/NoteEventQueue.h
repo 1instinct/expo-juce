@@ -128,6 +128,14 @@ public:
         raise(samplerSlotReleasedUpTo[slot], samplerSlotLastSeq[slot].load(std::memory_order_acquire));
     }
 
+    // Ends every sampler voice started by an event pushed so far, one-shots included (they ignore
+    // releases and allNotesOff): the engine's interruption and background stop, so a long one-shot
+    // neither resumes after a call nor keeps sounding after the app leaves the screen. A mark like
+    // the releases: a sampler event pushed later is not affected.
+    void pushSamplerSilence() {
+        raise(samplerSilencedUpTo, lastSeq.load(std::memory_order_acquire));
+    }
+
     // Releases every note-on of `note` pushed so far.
     void pushNoteOff(int note) {
         if (note < 0 || note > 127) return;
@@ -178,6 +186,9 @@ public:
     // consumer compares it with the value it last saw to detect a pushAllNotesOff, which also
     // clears the arpeggiator's latched list (a per-note release alone keeps it).
     uint64_t allReleasedMark() const { return allReleasedUpTo.load(std::memory_order_acquire); }
+
+    // The pushSamplerSilence mark: sampler voices whose event is at or below it are ended.
+    uint64_t samplerSilenceMark() const { return samplerSilencedUpTo.load(std::memory_order_acquire); }
 
     // Drops queued note-ons (counted in notesDiscarded). Consumer side: call only while no audio
     // thread drains the queue (engine setup, before the device callback is attached).
@@ -268,4 +279,5 @@ private:
     std::atomic<uint64_t> samplerReleasedUpTo[128] = {};
     std::atomic<uint64_t> samplerSlotLastSeq[kMaxSamplerSlot + 1] = {};
     std::atomic<uint64_t> samplerSlotReleasedUpTo[kMaxSamplerSlot + 1] = {};
+    std::atomic<uint64_t> samplerSilencedUpTo{0};
 };

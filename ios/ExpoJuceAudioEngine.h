@@ -203,6 +203,38 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 - (double)getTempo;
 - (BOOL)isTransportPlaying;
 
+// Loop sequence (SequencePlayer.h, 0.9.0-rc.5): played on the audio thread against the transport.
+// data: `count` numbers, 6 per event: start (beats, 0 <= start < loopBeats), length (beats > 0;
+// drums: ignored), note (0–127, or the drum voice 0–8), velocity (1–127), kind (0 note, 1 drum),
+// skipBefore (absolute beat, NaN = none). fromBeat / endBeat: absolute beats; nothing fires before
+// fromBeat or at / after endBeat (-inf / +inf = no bound). Any thread but the audio thread; the
+// new sequence replaces the old one atomically. NO (nothing changes): count not a multiple of 6,
+// more than 8192 events, a bad loop length with events.
+- (BOOL)setSequenceData:(const double *)data
+                  count:(NSInteger)count
+              loopBeats:(double)loopBeats
+               fromBeat:(double)fromBeat
+                endBeat:(double)endBeat;
+- (void)setSequenceMuted:(BOOL)muted;
+
+// Events for the app's JS side (0.9.0-rc.5): onSequenceNotes, onRemoteCommand, onAudioInterruption,
+// onTransportChange, onBackgroundState, delivered to `handler` on a background serial queue.
+// Returns the caller's token: only that token clears it or switches the sequence notes on.
+- (uint64_t)setEngineEventHandler:(void (^)(NSString *name, NSDictionary<NSString *, id> *body))handler;
+- (void)clearEngineEventHandler:(uint64_t)token;
+// onSequenceNotes batches (every ~16 ms while notes play) are built only while this is on.
+- (void)setSequenceNotesListening:(BOOL)listening token:(uint64_t)token;
+
+// Background policy (BackgroundPolicy.h, 0.9.0-rc.5). Any thread; applied on the main thread.
+- (void)setBackgroundPolicyKeepAlive:(BOOL)keepAlive idleStopSeconds:(double)idleStopSeconds;
+// Now Playing (MPNowPlayingInfoCenter): keys title (required), artist, album; nil clears it.
+// While it is set and the transport plays (or the app is in the background) the session is not
+// mixable, which iOS requires to show it. NO (nothing changes) without a title. Any thread.
+- (BOOL)setNowPlaying:(NSDictionary<NSString *, id> *)info;
+// Lock-screen / Control Center commands routed to the native transport: any of "play", "pause",
+// "togglePlayPause" (an empty list removes them). NO (nothing changes) for an unknown name.
+- (BOOL)enableRemoteCommands:(NSArray<NSString *> *)commands;
+
 // Beat events
 - (void)setBeatCallback:(BeatCallback)callback;
 // The beat timer lives on the main queue; called off the main thread these re-dispatch to main.

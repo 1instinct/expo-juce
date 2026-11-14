@@ -108,6 +108,17 @@ export type ExpoJuceNativeModule = {
   getTempo(): number;
   isTransportPlaying(): boolean;
 
+  // Loop sequence (0.9.0-rc.5+, iOS): flat data, 6 numbers per event (see setSequence in index.ts)
+  hasSequencePlayer?(): boolean;
+  setSequence?(data: number[], loopBeats: number, fromBeat: number, endBeat: number): boolean;
+  setSequenceMuted?(muted: boolean): void;
+  setSequenceNotesListening?(listening: boolean): void;
+
+  // Background, Now Playing, remote commands (0.9.0-rc.5+, iOS)
+  setBackgroundPolicy?(options: { keepAlive?: boolean; idleStopSeconds?: number }): void;
+  setNowPlaying?(info: { title: string; artist?: string; album?: string } | null): boolean;
+  enableRemoteCommands?(commands: string[]): boolean;
+
   // Events
   setValueAsync(value: string): Promise<void>;
   // Event-emitter hooks (keeps the type compatible with expo-modules-core's EventEmitter).

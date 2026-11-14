@@ -49,6 +49,21 @@ import {
   SamplerSlotState,
   SamplerState,
   SamplerLoadResult,
+  SequenceEvent,
+  SequenceOptions,
+  SequenceNote,
+  SequenceNotesBatch,
+  SequenceDiagnostics,
+  BackgroundPolicy,
+  BackgroundState,
+  NowPlayingInfo,
+  RemoteCommand,
+  RemoteCommandEvent,
+  AudioInterruptionEvent,
+  TransportChangeEvent,
+  BackgroundStateEvent,
+  BackgroundPolicyDiagnostics,
+  NowPlayingDiagnostics,
 } from './ExpoJuce.types';
 import type { NativeSamplerSlotParams } from './ExpoJuceModule';
 import { defaultEffectsState } from './effectDefaults';
@@ -670,6 +685,136 @@ export function addBeatListener(listener: (event: BeatEventPayload) => void): Su
   return emitter.addListener<BeatEventPayload>('onBeat', listener);
 }
 
+// ── Loop sequence (0.9.0-rc.5+, iOS) ─────────────────────────────
+// The native player fires the loop's notes on the audio thread at their exact sample against the
+// transport, so it keeps time with the screen off and the JS thread busy. A pad, the MIDI input or
+// noteOn holding the same note does not cut a sequence note, nor a sequence note-off a pad's.
+// Jumps (setTransportPosition), stop, a new loop length and allNotesOff release what it holds; a
+// new sequence keeps the notes that are still in it. Older binaries, Android and web lack it:
+// hasSequencePlayer() is false and the setters return false (play the loop from JS there).
+
+export const SEQUENCE_MAX_EVENTS = 8192;
+const SEQUENCE_STRIDE = 6;
+
+export function hasSequencePlayer(): boolean {
+  return typeof ExpoJuceModule?.hasSequencePlayer === 'function' && ExpoJuceModule.hasSequencePlayer() === true;
+}
+
+/**
+ * Replaces the loop (atomically: the audio thread never sees half of it). False (nothing changes)
+ * without the native player, over SEQUENCE_MAX_EVENTS events or with a loop under 1/64 beat; invalid
+ * events (note out of range, length <= 0, start outside the loop) are skipped.
+ */
+export function setSequence(sequence: SequenceOptions): boolean {
+  if (typeof ExpoJuceModule?.setSequence !== 'function') return false;
+  const events = sequence.events ?? [];
+  if (events.length > SEQUENCE_MAX_EVENTS) return false;
+  const data = new Array<number>(events.length * SEQUENCE_STRIDE);
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    const o = i * SEQUENCE_STRIDE;
+    data[o] = e.start;
+    data[o + 1] = e.length;
+    data[o + 2] = e.note;
+    data[o + 3] = e.velocity;
+    data[o + 4] = e.kind === 'drum' ? 1 : 0;
+    data[o + 5] = typeof e.skipBefore === 'number' ? e.skipBefore : NaN;
+  }
+  const fromBeat = typeof sequence.fromBeat === 'number' ? sequence.fromBeat : -Infinity;
+  const endBeat = typeof sequence.endBeat === 'number' ? sequence.endBeat : Infinity;
+  if (ExpoJuceModule.setSequence(data, sequence.loopBeats, fromBeat, endBeat) !== true) return false;
+  if (sequence.muted !== undefined) setSequenceMuted(sequence.muted);
+  return true;
+}
+
+/** Removes the loop (its notes are released). */
+export function clearSequence(): boolean {
+  return setSequence({ loopBeats: 0, events: [] });
+}
+
+/** Silences the loop (its notes are released) or lets it play again. False without the player. */
+export function setSequenceMuted(muted: boolean): boolean {
+  if (typeof ExpoJuceModule?.setSequenceMuted !== 'function') return false;
+  ExpoJuceModule.setSequenceMuted(muted === true);
+  return true;
+}
+
+/**
+ * The notes the sequence plays, in batches (about every 16 ms). The engine builds them only while
+ * a listener is set. Nothing arrives without the native player.
+ */
+export function addSequenceNotesListener(listener: (batch: SequenceNotesBatch) => void): Subscription {
+  const subscription = emitter.addListener<SequenceNotesBatch>('onSequenceNotes', listener);
+  const counted = typeof ExpoJuceModule?.setSequenceNotesListening === 'function';
+  if (counted) ExpoJuceModule.setSequenceNotesListening!(true);
+  let removed = false;
+  return {
+    remove() {
+      if (removed) return;
+      removed = true;
+      subscription.remove();
+      if (counted) ExpoJuceModule.setSequenceNotesListening!(false);
+    },
+  } as Subscription;
+}
+
+// ── Background playback, Now Playing, remote commands (0.9.0-rc.5+, iOS) ──
+// The host app needs the "audio" background mode. Until setBackgroundPolicy is called nothing
+// changes when the app goes to the background. Each returns false where unsupported.
+
+/** See BackgroundPolicy. Applies until the app's JS reloads. */
+export function setBackgroundPolicy(policy: BackgroundPolicy): boolean {
+  if (typeof ExpoJuceModule?.setBackgroundPolicy !== 'function') return false;
+  const options: { keepAlive?: boolean; idleStopSeconds?: number } = {};
+  if (policy.keepAlive !== undefined) options.keepAlive = policy.keepAlive === true;
+  if (typeof policy.idleStopSeconds === 'number' && Number.isFinite(policy.idleStopSeconds)) {
+    options.idleStopSeconds = policy.idleStopSeconds;
+  }
+  ExpoJuceModule.setBackgroundPolicy(options);
+  return true;
+}
+
+/**
+ * The lock screen / Control Center entry (null clears it). While it is set and the transport plays
+ * (or the app is in the background) the audio session does not mix with other apps, which iOS
+ * requires to show it: other apps' audio pauses.
+ */
+export function setNowPlaying(info: NowPlayingInfo | null): boolean {
+  if (typeof ExpoJuceModule?.setNowPlaying !== 'function') return false;
+  if (info === null) return ExpoJuceModule.setNowPlaying(null) === true;
+  const clean: { title: string; artist?: string; album?: string } = { title: info.title };
+  if (info.artist) clean.artist = info.artist;
+  if (info.album) clean.album = info.album;
+  return ExpoJuceModule.setNowPlaying(clean) === true;
+}
+
+/**
+ * Lock screen / headphone commands handled by the native transport (it starts or stops at once,
+ * also with the JS thread suspended); onRemoteCommand tells the app. [] removes them.
+ */
+export function enableRemoteCommands(commands: RemoteCommand[]): boolean {
+  if (typeof ExpoJuceModule?.enableRemoteCommands !== 'function') return false;
+  return ExpoJuceModule.enableRemoteCommands(commands.slice()) === true;
+}
+
+export function addRemoteCommandListener(listener: (event: RemoteCommandEvent) => void): Subscription {
+  return emitter.addListener<RemoteCommandEvent>('onRemoteCommand', listener);
+}
+
+/** An audio interruption (a call, Siri) began or ended. The transport stops and does not resume. */
+export function addAudioInterruptionListener(listener: (event: AudioInterruptionEvent) => void): Subscription {
+  return emitter.addListener<AudioInterruptionEvent>('onAudioInterruption', listener);
+}
+
+/** The native side started or stopped the transport (interruption, remote command, background). */
+export function addTransportChangeListener(listener: (event: TransportChangeEvent) => void): Subscription {
+  return emitter.addListener<TransportChangeEvent>('onTransportChange', listener);
+}
+
+export function addBackgroundStateListener(listener: (event: BackgroundStateEvent) => void): Subscription {
+  return emitter.addListener<BackgroundStateEvent>('onBackgroundState', listener);
+}
+
 export {
   JucePadView,
   JucePadViewProps,
@@ -718,4 +863,19 @@ export {
   SamplerSlotState,
   SamplerState,
   SamplerLoadResult,
+  SequenceEvent,
+  SequenceOptions,
+  SequenceNote,
+  SequenceNotesBatch,
+  SequenceDiagnostics,
+  BackgroundPolicy,
+  BackgroundState,
+  NowPlayingInfo,
+  RemoteCommand,
+  RemoteCommandEvent,
+  AudioInterruptionEvent,
+  TransportChangeEvent,
+  BackgroundStateEvent,
+  BackgroundPolicyDiagnostics,
+  NowPlayingDiagnostics,
 };

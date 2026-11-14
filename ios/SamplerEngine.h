@@ -375,6 +375,13 @@ public:
         }
     }
 
+    // Ends every voice whose event is at or below `mark` (seq 0 included), one-shots too, with a
+    // linear fade over kSamplerChokeMs (the engine's interruption and background stop).
+    void silenceUpTo(uint64_t mark) {
+        for (Voice& v : voices)
+            if (v.active && v.seq <= mark) beginRelease(v, kSamplerChokeMs);
+    }
+
     // Adds the sampler (stereo) into L / R. With nothing sounding the buffers are not touched.
     void render(float* L, float* R, int numSamples) {
         const SamplerSettings st = store->settings();

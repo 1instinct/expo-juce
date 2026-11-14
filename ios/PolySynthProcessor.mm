@@ -6,6 +6,7 @@ PolySynthProcessor::PolySynthProcessor()
     : AudioProcessor(BusesProperties()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)) {
     lastAllReleasedSeen = queue->allReleasedMark();
+    lastSamplerSilenceSeen = queue->samplerSilenceMark();
 }
 
 PolySynthProcessor::~PolySynthProcessor() {
@@ -36,7 +37,7 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // Transport first, so the block-start beat / bpm / play state describe this block here as
     // they do for the effects and aux processors downstream (TransportEngine::getBlockStartBeat).
     double blockBeat = 0.0, bpm = 120.0;
-    bool playing = false;
+    bool playing = false, seeked = false;
     if (transport) {
         if (transport->advanceBlock(numSamples, sr)) {
             beatState.crossed.store(true);
@@ -46,6 +47,7 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         blockBeat = transport->getBlockStartBeat();
         bpm = transport->getBlockBpm();
         playing = transport->isBlockPlaying();
+        seeked = transport->wasBlockSeeked();
     }
 
     // Note-ons waiting in the queue: to the arpeggiator when it is enabled, else straight to
@@ -80,9 +82,42 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         lastAllReleasedSeen = queue->allReleasedMark();
     }
     samplerEngine.releaseHeld([this](bool fromKey, int id, uint64_t seq) { return queue->isSamplerReleased(fromKey, id, seq); });
+    {
+        // The engine's interruption / background stop: every sampler voice whose event came before
+        // it ends (one-shots too); events drained above that came after it keep playing.
+        const uint64_t silence = queue->samplerSilenceMark();
+        if (silence != lastSamplerSilenceSeen) {
+            lastSamplerSilenceSeen = silence;
+            samplerEngine.silenceUpTo(silence);
+        }
+    }
     for (int v = 0; v < MAX_VOICES; v++) {
         if (voices[v].isHeld() && queue->isReleased(voices[v].getNoteNumber(), voices[v].startSeq))
             voices[v].stopNote();
+    }
+
+    // The loop sequence's starts and releases for this block (SequencePlayer.h). The engine's
+    // allNotesOff ends what it holds too. With the arp enabled its synth notes go to the arp
+    // (block-level, like drained player notes), so they must be in before arp.process() below.
+    {
+        const uint64_t allReleased = queue->allReleasedMark();
+        if (allReleased != lastAllReleasedSeenBySequence) {
+            lastAllReleasedSeenBySequence = allReleased;
+            sequencer.requestReleaseAll();
+        }
+    }
+    seqOutputCount = 0;
+    sequencer.process(blockBeat, bpm, playing, seeked, sr, numSamples, [this](const seqplay::Output& out) {
+        if (seqOutputCount < seqplay::SequencePlayer::kMaxOutputs) seqOutputs[seqOutputCount++] = out;
+        if (sequenceLog != nullptr) sequenceLog->push(out);
+    });
+    if (arpNow.enabled) {
+        for (int i = 0; i < seqOutputCount; ++i) {
+            const seqplay::Output& out = seqOutputs[i];
+            if (out.kind != seqplay::EventKind::Note) continue;
+            if (out.on) arpeggiator.noteOnSequence(out.note, out.velocity);
+            else arpeggiator.releaseSequence(out.note);
+        }
     }
 
     // The arp's events for this block (always run: disabling stops its voices here).
@@ -110,21 +145,46 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         }
     }
 
-    // Render in segments split at the arp's event offsets (ascending): the voices play up to
-    // each event, the event starts or stops its voice(s), and so on. No events: one segment.
-    int pos = 0;
-    for (int i = 0; i < arpEventCount; ++i) {
-        const int at = std::clamp(arpEvents[i].sampleOffset, pos, numSamples);
+    // Render in segments split at the arp's and the sequence's event offsets (both ascending,
+    // merged; at an equal offset a release first): the voices play up to each event, the event
+    // starts or stops its voice(s), and so on. No events: one segment. Sequence note-ons that went
+    // to the arp, and drum hits, are not voice events.
+    const bool arpTakesSequenceNotes = arpNow.enabled;
+    auto voiceEvent = [&](int j) {
+        const seqplay::Output& out = seqOutputs[j];
+        return out.kind == seqplay::EventKind::Note && !(out.on && arpTakesSequenceNotes);
+    };
+    int pos = 0, ai = 0, si = 0;
+    for (;;) {
+        while (si < seqOutputCount && !voiceEvent(si)) ++si;
+        const bool haveArp = ai < arpEventCount, haveSeq = si < seqOutputCount;
+        if (!haveArp && !haveSeq) break;
+        bool takeSeq = haveSeq;
+        if (haveArp && haveSeq) {
+            const int a = arpEvents[ai].sampleOffset, s = seqOutputs[si].offset;
+            takeSeq = s < a || (s == a && !seqOutputs[si].on && arpEvents[ai].on);
+        }
+        const int at = std::clamp(takeSeq ? seqOutputs[si].offset : arpEvents[ai].sampleOffset, pos, numSamples);
         if (at > pos) renderVoices(monoBuffer + pos, at - pos, wf, detune, cutoff, reso, master);
         pos = at;
-        applyArpEvent(arpEvents[i]);
+        if (takeSeq) applySequenceOutput(seqOutputs[si++]);
+        else applyArpEvent(arpEvents[ai++]);
     }
     if (pos < numSamples) renderVoices(monoBuffer + pos, numSamples - pos, wf, detune, cutoff, reso, master);
 
     // Synth-only peak (diag.peak), then the drum part on top (with no drum sounding it does not
-    // touch the buffer).
+    // touch the buffer), split at the sequence's drum hits so each starts on its own sample.
     const float synthBlockPeak = numSamples > 0 ? buffer.getMagnitude(0, 0, numSamples) : 0.0f;
-    drumMachine.render(monoBuffer, numSamples);
+    int drumPos = 0;
+    for (int j = 0; j < seqOutputCount; ++j) {
+        const seqplay::Output& out = seqOutputs[j];
+        if (out.kind != seqplay::EventKind::Drum || !out.on) continue;
+        const int at = std::clamp(out.offset, drumPos, numSamples);
+        if (at > drumPos) drumMachine.render(monoBuffer + drumPos, at - drumPos);
+        drumPos = at;
+        drumMachine.trigger(out.note, out.velocity);
+    }
+    if (drumPos < numSamples) drumMachine.render(monoBuffer + drumPos, numSamples - drumPos);
 
     if (buffer.getNumChannels() > 1) {
         buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
@@ -174,12 +234,32 @@ void PolySynthProcessor::applyArpEvent(const ArpEvent& event) {
                          static_cast<Waveform>(waveform.load()),
                          (double)detuneCents.load(),
                          filterCutoff.load(), filterResonance.load(),
-                         masterLevel.load(), 0);
+                         masterLevel.load(), 0, VoiceSource::Arp);
         queue->lastNoteStarted.store(event.note, std::memory_order_relaxed);
         return;
     }
     for (int v = 0; v < MAX_VOICES; v++) {
-        if (voices[v].isHeld() && voices[v].startSeq == 0 && voices[v].getNoteNumber() == event.note)
+        if (voices[v].isHeld() && voices[v].source == VoiceSource::Arp && voices[v].getNoteNumber() == event.note)
+            voices[v].stopNote();
+    }
+}
+
+// Audio thread: a sequence note-on starts a voice of its own (VoiceSource::Sequence); a release
+// stops every held sequence voice of that note (the player counts the instances of a pitch, so a
+// release only comes once the last one ends).
+void PolySynthProcessor::applySequenceOutput(const seqplay::Output& out) {
+    if (out.kind != seqplay::EventKind::Note) return;
+    if (out.on) {
+        allocator.noteOn(out.note, (float)std::clamp((int)out.velocity, 1, 127), voices,
+                         static_cast<Waveform>(waveform.load()),
+                         (double)detuneCents.load(),
+                         filterCutoff.load(), filterResonance.load(),
+                         masterLevel.load(), 0, VoiceSource::Sequence);
+        queue->lastNoteStarted.store(out.note, std::memory_order_relaxed);
+        return;
+    }
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (voices[v].isHeld() && voices[v].source == VoiceSource::Sequence && voices[v].getNoteNumber() == out.note)
             voices[v].stopNote();
     }
 }
