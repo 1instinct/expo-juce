@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.10.0-rc.0
+
+### Added (iOS)
+
+- **Sampler.** 16 sample slots (`0`–`15`) on 32 preallocated stereo voices, mixed with the synth
+  and the drums before the effects chain. Pads play a slot at its root note (`samplerHit`,
+  `samplerRelease`); keys play every loaded slot whose key zone holds the note (`samplerNoteOn`,
+  `samplerNoteOff`). Per slot: root note, key zone, start / end, a loop crossfaded over 5 ms,
+  one-shot or gated, gain, pan, tune and fine tune, linear attack / release, velocity
+  sensitivity and choke groups 1–8. Pitch by playback rate with 4-point Hermite interpolation.
+  Voice stealing takes the voice released earliest, else the oldest; stolen voices fade over 64
+  samples, and a sound reaching its end fades over its last 1 ms. Sampler-wide `level`, `mute` and `polyphony` (1–32). See `docs/sampler.md`.
+- `loadSamplerSlot(slot, uri, params?)`: decodes a local file (WAV, AIFF, FLAC, MP3, CoreAudio
+  formats) and resamples it to the device rate on a loader queue, then publishes it by an atomic
+  pointer swap with a hazard pointer, like the backing track; replaced samples are freed on the
+  main thread once the audio thread has moved past them. Up to 60 s per sample and 256 MB across
+  slots, counting replaced samples not yet freed. `params` are applied right before the sample is
+  published, and only if it is. A later load or unload of the slot supersedes a load in flight. Resolves with
+  `{ frames, sampleRate, channels, durationMs }`; rejects with `ERR_SAMPLER_SLOT`,
+  `ERR_SAMPLER_FILE`, `_FORMAT`, `_TOO_LONG`, `_MEMORY` or `_SUPERSEDED`.
+- `hasSampler`, `unloadSamplerSlot`, `setSamplerSlot`, `setSampler`, `getSamplerState`, and the
+  exports `SAMPLER_SLOT_COUNT`, `SAMPLER_VOICE_COUNT`, `SAMPLER_SLOT_DEFAULTS`, `SAMPLER_DEFAULTS`
+  with the types `SamplerSlotParams`, `SamplerLoop`, `SamplerSettings`, `SamplerSlotState`,
+  `SamplerState`, `SamplerLoadResult`.
+- `JucePadView` `mode="sampler"`: every touch-down hits slot `note` (a second finger retriggers);
+  the last touch-up releases it.
+- The note queue carries sampler pad hits and key note-ons with their own release marks;
+  `allNotesOff` releases them too. A slot's release is per slot (it releases every holder), and a
+  key note-on with velocity 0 is a note-off.
+- `PolySynthProcessor::processBlock` runs with flush-to-zero (`juce::ScopedNoDenormals`).
+- With the loop sequence and background policy (0.9.0-rc.5): sequence events never reach the
+  sampler, and a transport stop leaves sampler voices alone. Sounding sampler voices count as busy
+  for the background idle stop, and a sampler hit or key note-on while idle-stopped wakes the
+  device (the hit is lost, as for `noteOn`). An interruption and the keepAlive-off background stop
+  end every sampler voice, one-shots included, over 5 ms (`NoteEventQueue::pushSamplerSilence`).
+- Diagnostics: `samplerHits`, `samplerVoices`, `samplerPeak`, `samplerBytes`.
+- Harness cases `sm`, `smb` (32 voices: about 23 µs per 128-frame block at 48 kHz on a desktop
+  core, budget 60), `sml`, `sms`, `smq`, `smd`.
+
+### Changed
+
+- The backing track's resampler uses the shared `ios/Hermite.h` (output unchanged, sample for
+  sample).
+
+### Android
+
+- Stubs only: `hasSampler()` is `false`, `loadSamplerSlot` rejects with `ERR_UNSUPPORTED`, the
+  setters return `false` and `getSamplerState()` returns the defaults (`DefaultShapes.SAMPLER`).
+  Diagnostics carry the sampler keys (zeros).
+
+### Compatibility
+
+- New entry points and optional diagnostics keys only. Without sampler calls the output is
+  unchanged: an idle sampler does not touch the buffer.
+- New native code: apps must rebuild the binary (and bump their runtime version for OTA updates).
+
 ## 0.9.0-rc.5
 
 ### Added (iOS)

@@ -43,6 +43,12 @@ import {
   MidiInputMap,
   MidiInputEvent,
   MidiInputBatch,
+  SamplerLoop,
+  SamplerSlotParams,
+  SamplerSettings,
+  SamplerSlotState,
+  SamplerState,
+  SamplerLoadResult,
   SequenceEvent,
   SequenceOptions,
   SequenceNote,
@@ -59,9 +65,17 @@ import {
   BackgroundPolicyDiagnostics,
   NowPlayingDiagnostics,
 } from './ExpoJuce.types';
+import type { NativeSamplerSlotParams } from './ExpoJuceModule';
 import { defaultEffectsState } from './effectDefaults';
 import { ARP_DEFAULTS, arpDefaults } from './arpDefaults';
 import { DRUM_KIT_DEFAULTS, DRUM_VOICE_COUNT, DRUM_VOICE_DEFAULTS, drumDefaults } from './drumDefaults';
+import {
+  SAMPLER_DEFAULTS,
+  SAMPLER_SLOT_COUNT,
+  SAMPLER_SLOT_DEFAULTS,
+  SAMPLER_VOICE_COUNT,
+  samplerDefaults,
+} from './samplerDefaults';
 
 // ── Lifecycle ────────────────────────────────────────────────────
 
@@ -374,6 +388,170 @@ export function getDrumState(): { kit: DrumKitParams; voices: DrumVoiceParams[] 
   return ExpoJuceModule.getDrumState();
 }
 
+// ── Sampler (0.10.0+, iOS) ───────────────────────────────────────
+// 16 sample slots (0-15) played by 32 shared voices, mixed with the synth and the drums before the
+// effects chain (the arpeggiator never applies to it). Pads play a slot at its root note
+// (samplerHit / samplerRelease, or JucePadView mode="sampler"); keys play every loaded slot whose
+// key zone holds the note (samplerNoteOn / samplerNoteOff). Parameters are synchronous and
+// lock-free, remembered natively before setup() and across engine rebuilds, like the loaded
+// samples. Binaries without the sampler (older, Android, web): hasSampler() is false,
+// loadSamplerSlot rejects with 'ERR_UNSUPPORTED', the other calls are no-ops returning false and
+// getSamplerState returns the defaults. See docs/sampler.md.
+
+export { SAMPLER_SLOT_COUNT, SAMPLER_VOICE_COUNT, SAMPLER_SLOT_DEFAULTS, SAMPLER_DEFAULTS };
+
+const SAMPLER_NUMBER_KEYS = [
+  'rootNote',
+  'lowNote',
+  'highNote',
+  'startMs',
+  'endMs',
+  'gainDb',
+  'pan',
+  'tune',
+  'fineCents',
+  'attackMs',
+  'releaseMs',
+  'velocitySens',
+  'chokeGroup',
+] as const;
+const SAMPLER_INTEGER_KEYS: ReadonlySet<string> = new Set(['rootNote', 'lowNote', 'highNote', 'chokeGroup']);
+
+const isSamplerSlot = (slot: number): boolean =>
+  Number.isInteger(slot) && slot >= 0 && slot < SAMPLER_SLOT_COUNT;
+const isMidiNote = (note: number): boolean => Number.isInteger(note) && note >= 0 && note <= 127;
+const velocity127 = (velocity: number): number => Math.min(127, Math.max(1, Math.round(velocity)));
+
+// Keeps known keys with usable values: finite numbers (integers rounded), booleans, and `loop` as
+// {startMs, endMs} or null (sent as false).
+function cleanSamplerParams(params: Partial<SamplerSlotParams> | null | undefined): NativeSamplerSlotParams {
+  const clean: NativeSamplerSlotParams = {};
+  if (params == null || typeof params !== 'object') return clean;
+  for (const key of SAMPLER_NUMBER_KEYS) {
+    const value = params[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      clean[key] = SAMPLER_INTEGER_KEYS.has(key) ? Math.round(value) : value;
+    }
+  }
+  if (typeof params.oneShot === 'boolean') clean.oneShot = params.oneShot;
+  if (params.loop === null) {
+    clean.loop = false;
+  } else if (
+    typeof params.loop === 'object' &&
+    params.loop !== undefined &&
+    Number.isFinite(params.loop.startMs) &&
+    Number.isFinite(params.loop.endMs)
+  ) {
+    clean.loop = { startMs: params.loop.startMs, endMs: params.loop.endMs };
+  }
+  return clean;
+}
+
+/** True when this binary has the sampler (0.10.0+, iOS). */
+export function hasSampler(): boolean {
+  return typeof ExpoJuceModule?.hasSampler === 'function' && ExpoJuceModule.hasSampler() === true;
+}
+
+/**
+ * Decodes a local audio file (file:// URI or absolute path; WAV, AIFF, FLAC, MP3, plus CoreAudio
+ * formats such as M4A) off the audio thread at the device rate and swaps it into `slot` (0-15);
+ * voices still playing the slot's previous sample fade out. `params` (partial; omitted keys keep
+ * their values) are applied right before the new sample is published, and only if it is: the sample
+ * plays with them from its first hit, and a load that fails or is superseded leaves the slot's
+ * current parameters intact. Up to 60 s per sample and 256 MB across slots (samples replaced but
+ * not yet freed count until the audio thread lets go of them). A later
+ * load or unload of the same slot supersedes a load in flight. Rejects with ERR_SAMPLER_SLOT,
+ * ERR_SAMPLER_FILE, _FORMAT, _TOO_LONG, _MEMORY, _SUPERSEDED, or ERR_UNSUPPORTED (no sampler).
+ */
+export async function loadSamplerSlot(
+  slot: number,
+  uri: string,
+  params?: Partial<SamplerSlotParams>
+): Promise<SamplerLoadResult> {
+  if (typeof ExpoJuceModule?.loadSamplerSlot !== 'function') {
+    const error = new Error('this binary has no sampler (expo-juce 0.10.0+, iOS)');
+    (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';
+    throw error;
+  }
+  if (!isSamplerSlot(slot)) {
+    const error = new Error(`slot must be an integer 0-${SAMPLER_SLOT_COUNT - 1}`);
+    (error as Error & { code?: string }).code = 'ERR_SAMPLER_SLOT';
+    throw error;
+  }
+  return ExpoJuceModule.loadSamplerSlot(slot, uri, params ? cleanSamplerParams(params) : null);
+}
+
+/** Empties `slot` (its voices fade out) and supersedes a load in flight. false: unsupported or bad slot. */
+export function unloadSamplerSlot(slot: number): boolean {
+  if (typeof ExpoJuceModule?.unloadSamplerSlot !== 'function') return false;
+  if (!isSamplerSlot(slot)) return false;
+  return ExpoJuceModule.unloadSamplerSlot(slot) === true;
+}
+
+/** Partial update of one slot's parameters; unknown keys ignored; values clamped. false: unsupported or bad slot. */
+export function setSamplerSlot(slot: number, params: Partial<SamplerSlotParams>): boolean {
+  if (typeof ExpoJuceModule?.setSamplerSlot !== 'function') return false;
+  if (!isSamplerSlot(slot)) return false;
+  return ExpoJuceModule.setSamplerSlot(slot, cleanSamplerParams(params)) === true;
+}
+
+/** Sampler-wide settings (level 0-1, mute, polyphony 1-32); partial; values clamped. false: unsupported. */
+export function setSampler(settings: Partial<SamplerSettings>): boolean {
+  if (typeof ExpoJuceModule?.setSampler !== 'function') return false;
+  const clean: Partial<SamplerSettings> = {};
+  if (typeof settings?.level === 'number' && Number.isFinite(settings.level)) clean.level = settings.level;
+  if (typeof settings?.mute === 'boolean') clean.mute = settings.mute;
+  if (typeof settings?.polyphony === 'number' && Number.isFinite(settings.polyphony)) {
+    clean.polyphony = Math.round(settings.polyphony);
+  }
+  return ExpoJuceModule.setSampler(clean) === true;
+}
+
+/** Pads: plays `slot` (0-15) at its root note, velocity 1-127. Same queue as noteOn; lock-free. Empty slot: nothing. */
+export function samplerHit(slot: number, velocity: number): void {
+  if (typeof ExpoJuceModule?.samplerHit !== 'function') return;
+  if (!isSamplerSlot(slot) || !Number.isFinite(velocity)) return;
+  ExpoJuceModule.samplerHit(slot, velocity127(velocity));
+}
+
+/**
+ * Pads: releases every voice a hit on `slot` started, whoever hit it (gated slots; one-shot slots
+ * ignore it). The release is per slot, not per caller: two pads (or a pad and `samplerHit`) on the
+ * same slot share it, so the first release ends the other's held sound too.
+ */
+export function samplerRelease(slot: number): void {
+  if (typeof ExpoJuceModule?.samplerRelease !== 'function') return;
+  if (!isSamplerSlot(slot)) return;
+  ExpoJuceModule.samplerRelease(slot);
+}
+
+/**
+ * Keys: plays `note` (0-127) on every loaded slot whose key zone holds it, velocity 1-127.
+ * Velocity 0 (after rounding) is a note-off, as in MIDI.
+ */
+export function samplerNoteOn(note: number, velocity: number): void {
+  if (typeof ExpoJuceModule?.samplerNoteOn !== 'function') return;
+  if (!isMidiNote(note) || !Number.isFinite(velocity)) return;
+  if (Math.round(velocity) <= 0) {
+    samplerNoteOff(note);
+    return;
+  }
+  ExpoJuceModule.samplerNoteOn(note, velocity127(velocity));
+}
+
+/** Keys: releases `note` (gated slots; one-shot slots ignore it). */
+export function samplerNoteOff(note: number): void {
+  if (typeof ExpoJuceModule?.samplerNoteOff !== 'function') return;
+  if (!isMidiNote(note)) return;
+  ExpoJuceModule.samplerNoteOff(note);
+}
+
+/** The settings and all 16 slots as stored natively (after clamping); the defaults without a sampler. */
+export function getSamplerState(): SamplerState {
+  if (typeof ExpoJuceModule?.getSamplerState !== 'function') return samplerDefaults();
+  return ExpoJuceModule.getSamplerState();
+}
+
 // ── MIDI byte input (0.9.0-rc.2+, iOS) ───────────────────────────
 // For MIDI that arrives in the app's own native code (a Bluetooth notification callback, a serial
 // port): that code calls the C function expojuce_midi_input_bytes (ios/ExpoJuceMidiInput.h) with
@@ -679,6 +857,12 @@ export {
   MidiInputMap,
   MidiInputEvent,
   MidiInputBatch,
+  SamplerLoop,
+  SamplerSlotParams,
+  SamplerSettings,
+  SamplerSlotState,
+  SamplerState,
+  SamplerLoadResult,
   SequenceEvent,
   SequenceOptions,
   SequenceNote,

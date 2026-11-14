@@ -75,6 +75,7 @@ void setMasterLevel(double level);
 std::string effectsStateJson();
 std::string arpeggiatorStateJson();
 std::string drumStateJson();
+std::string samplerStateJson(); // getSamplerState: the stored parameters, every slot empty (0.10.0+)
 std::string analysisJson();
 
 // ── Test seam ────────────────────────────────────────────────────

@@ -11,10 +11,15 @@ import type {
   DrumVoiceParams,
   EffectsState,
   MetronomeOptions,
+  SamplerLoadResult,
+  SamplerSettings,
+  SamplerState,
 } from './ExpoJuce.types';
+import type { NativeSamplerSlotParams } from './ExpoJuceModule';
 import { defaultEffectsState } from './effectDefaults';
 import { arpDefaults } from './arpDefaults';
 import { drumDefaults } from './drumDefaults';
+import { samplerDefaults } from './samplerDefaults';
 
 const emitter = new EventEmitter({} as any);
 
@@ -85,5 +90,30 @@ export default {
   },
   getDrumState(): DrumState {
     return drumDefaults();
+  },
+  // No sampler on web: loads reject, hits are ignored, nothing applied, defaults reported.
+  hasSampler(): boolean {
+    return false;
+  },
+  async loadSamplerSlot(_slot: number, _uri: string, _params: NativeSamplerSlotParams | null): Promise<SamplerLoadResult> {
+    const error = new Error('the sampler is not supported on web');
+    (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';
+    throw error;
+  },
+  unloadSamplerSlot(_slot: number): boolean {
+    return false;
+  },
+  setSamplerSlot(_slot: number, _params: NativeSamplerSlotParams): boolean {
+    return false;
+  },
+  setSampler(_settings: Partial<SamplerSettings>): boolean {
+    return false;
+  },
+  samplerHit(_slot: number, _velocity: number): void {},
+  samplerRelease(_slot: number): void {},
+  samplerNoteOn(_note: number, _velocity: number): void {},
+  samplerNoteOff(_note: number): void {},
+  getSamplerState(): SamplerState {
+    return samplerDefaults();
   },
 };

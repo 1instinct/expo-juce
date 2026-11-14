@@ -19,6 +19,8 @@
 #include "TransportEngine.h"
 #include "Arpeggiator.h"
 #include "DrumMachine.h"
+#include "SamplerEngine.h"
+#include "SamplerBank.h"
 #include "SpectrumAnalyser.h"
 #include "LatencyStats.h"
 #include "DisplayRate.h"
@@ -121,6 +123,9 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 // Main thread: a deferred free of retired backing-track buffers is scheduled.
 @property (nonatomic, assign) BOOL backingTrackCollectScheduled;
 - (void)scheduleBackingTrackCollect;
+// Main thread: the same for replaced sampler samples.
+@property (nonatomic, assign) BOOL samplerCollectScheduled;
+- (void)scheduleSamplerCollect;
 
 // Background policy, Now Playing and remote commands (0.9.0-rc.5). Main thread unless noted.
 @property (atomic, assign) BOOL idleStopped;          // device closed and session deactivated by the idle stop
@@ -224,6 +229,17 @@ static ArpSettingsStore sArpOptions;
 // (no lock, works before setup, survives rebuilds), attached to each synth's drum part, which reads
 // it once per block. Drum hits themselves go through sNoteQueue like note-ons.
 static DrumParamStore sDrumParams;
+
+// ── Sampler ──
+// Same pattern: slot parameters and settings in a process-lifetime store (atomics written under
+// its own writer mutex, never taken by the audio thread), and the loaded samples in a
+// process-lifetime bank (JUCE buffers: heap-allocated and never freed, like sBackingTrack). Both
+// are attached to each synth the engine builds. Samples are decoded on samplerQueue() (serial,
+// never the audio or main thread); replaced ones are freed on the main thread once the audio
+// thread has moved past them (SamplerBank::collect, scheduleSamplerCollect). Hits and key notes go
+// through sNoteQueue like note-ons.
+static SamplerParamStore sSamplerParams;
+static SamplerBank& sSamplerBank = *new SamplerBank();
 
 // ── Touch latency, main-thread stalls and the display rate ──
 // Process lifetime, atomics only (LatencyStats.h, DisplayRate.h). sTouchLatency: the delivery
@@ -454,6 +470,15 @@ static dispatch_queue_t backingTrackQueue() {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         queue = dispatch_queue_create("expo-juce.backing-track", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static dispatch_queue_t samplerQueue() {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("expo-juce.sampler", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
@@ -913,6 +938,8 @@ static int mainThreadMaxFramesPerSecond() {
     sSynth->setInputLatency(&sMidiInputLatency); // same, MIDI input arrival -> render
     sSynth->arp().setSettingsStore(&sArpOptions); // the live options, before and across rebuilds
     sSynth->drums().setParamStore(&sDrumParams);  // same for the drum part
+    sSynth->sampler().setParamStore(&sSamplerParams); // and the sampler: its parameters
+    sSynth->setSamplerSource(&sSamplerBank);          // and its samples (prepareToPlay passes the rate)
     sSynth->setSequenceStore(&sSequence);         // the loop sequence, before and across rebuilds
     sSynth->setSequenceNoteLog(&sSequenceLog);
 
@@ -1139,8 +1166,9 @@ static int mainThreadMaxFramesPerSecond() {
     sSynth = nullptr;
     sFx = nullptr;
     sAux = nullptr;
-    delete sGraph; sGraph = nullptr; // ~AuxProcessor releases its backing-track reader slot
+    delete sGraph; sGraph = nullptr; // ~AuxProcessor / ~PolySynthProcessor release their reader slots
     [self scheduleBackingTrackCollect];
+    [self scheduleSamplerCollect];
     carryXrunsLocked();
     self.deviceTargetBufferSize = 0;
     self.listedBufferSizes = @[];
@@ -1371,6 +1399,7 @@ static int mainThreadMaxFramesPerSecond() {
     if (self.isReady) {
         [self stopTransport];
         [self allNotesOff];
+        sNoteQueue.pushSamplerSilence(); // one-shots too: nothing resumes when the device restarts
     }
     emitEngineEvent(@"onAudioInterruption", @{ @"type": @"began", @"playing": @NO, @"wasPlaying": @(wasPlaying) });
     if (wasPlaying) emitEngineEvent(@"onTransportChange", @{ @"playing": @NO, @"reason": @"interruption" });
@@ -1589,7 +1618,8 @@ static int mainThreadMaxFramesPerSecond() {
     double lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
     double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0;
     double metronomeClicks = 0.0, backingTrackPositionSec = -1.0, backingTrackTempoRatio = 1.0;
-    double drumPeak = 0.0;
+    double drumPeak = 0.0, samplerPeak = 0.0;
+    int samplerVoices = 0;
     double xrunCount = (double)sXrunsCarried.load(std::memory_order_relaxed);
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
@@ -1622,6 +1652,8 @@ static int mainThreadMaxFramesPerSecond() {
                 lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
                 lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
                 drumPeak = (double)synth->drums().diag.peak.load(relaxed);
+                samplerPeak = (double)synth->sampler().diag.peak.load(relaxed);
+                samplerVoices = synth->sampler().diag.activeVoices.load(relaxed);
             }
             if (FxChainProcessor* fx = ready ? sFx : nullptr) {
                 fxProcessCount = (double)fx->diag.processCount.load(relaxed);
@@ -1675,6 +1707,11 @@ static int mainThreadMaxFramesPerSecond() {
     // Drum hits the engine has started (cumulative since launch, from the process-lifetime queue).
     d[@"drumHits"] = @((double)sNoteQueue.drumHitsConsumed.load(std::memory_order_relaxed));
     d[@"drumPeak"] = @(drumPeak);
+    // Sampler pad hits and key note-ons the engine consumed (cumulative since launch, same queue).
+    d[@"samplerHits"] = @((double)sNoteQueue.samplerEventsConsumed.load(std::memory_order_relaxed));
+    d[@"samplerVoices"] = @(samplerVoices);
+    d[@"samplerPeak"] = @(samplerPeak);
+    d[@"samplerBytes"] = @((double)sSamplerBank.residentBytes());
 
     // engineState: recovering (rebuild running or retry scheduled) > ready > failed > uninitialized.
     // `ready` is false when the lock was busy, which only happens during a lifecycle section.
@@ -2270,6 +2307,204 @@ static NSString *backingTrackPath(NSString *uri) {
     };
 }
 
+// ── Sampler ──
+// Hits and key notes: through sNoteQueue without the lock, like noteOn / drumHit (accepted only
+// while the engine is ready); releases are always recorded, like noteOff. Parameters:
+// sSamplerParams, the process-lifetime store (works before setup). Samples: sSamplerBank, loaded
+// on samplerQueue().
+
+- (void)samplerHit:(int)slot velocity:(int)velocity {
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) {
+        [self wakeFromIdleStopIfNeeded:@"sampler"]; // like noteOn: the hit is lost, the device restarts
+        return;
+    }
+    sNoteQueue.pushSamplerHit(slot, velocity);
+}
+
+- (void)samplerHit:(int)slot velocity:(int)velocity touchTimestamp:(double)touchTimestamp
+    entryTimestamp:(double)entryTimestamp {
+    const juce::int64 touchTicks = touchTicksFor(touchTimestamp);
+    const juce::int64 entryTicks = touchTicksFor(entryTimestamp);
+    if (sAcceptingNotes.load(std::memory_order_acquire)) sNoteQueue.pushSamplerHit(slot, velocity, touchTicks, entryTicks);
+    else [self wakeFromIdleStopIfNeeded:@"sampler"];
+    recordTouchDelivery(touchTimestamp, entryTimestamp); // after the push (see noteOn)
+}
+
+- (void)samplerRelease:(int)slot { sNoteQueue.pushSamplerRelease(slot); }
+
+- (void)samplerNoteOn:(int)note velocity:(int)velocity {
+    if (velocity <= 0) { // a note-off (MIDI convention), recorded ready or not
+        sNoteQueue.pushSamplerNoteOff(note);
+        return;
+    }
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) {
+        [self wakeFromIdleStopIfNeeded:@"sampler"];
+        return;
+    }
+    sNoteQueue.pushSamplerNoteOn(note, velocity);
+}
+
+- (void)samplerNoteOff:(int)note { sNoteQueue.pushSamplerNoteOff(note); }
+
+static NSNumber *boolFrom(NSDictionary<NSString *, id> *options, NSString *key) {
+    id value = options[key];
+    return [value isKindOfClass:[NSNumber class]] ? (NSNumber *)value : nil;
+}
+
+// The JS keys of `params` merged into `p` (keys: see the header); others unchanged.
+static void mergeSamplerParams(SamplerSlotParams& p, NSDictionary<NSString *, id> *params) {
+    if (NSNumber *v = numberFrom(params, @"rootNote")) p.rootNote = (int)std::lround(std::clamp(v.doubleValue, 0.0, 127.0));
+    if (NSNumber *v = numberFrom(params, @"lowNote")) p.lowNote = (int)std::lround(std::clamp(v.doubleValue, 0.0, 127.0));
+    if (NSNumber *v = numberFrom(params, @"highNote")) p.highNote = (int)std::lround(std::clamp(v.doubleValue, 0.0, 127.0));
+    if (NSNumber *v = numberFrom(params, @"startMs")) p.startMs = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"endMs")) p.endMs = (float)v.doubleValue;
+    if (NSNumber *v = boolFrom(params, @"oneShot")) p.oneShot = v.boolValue ? true : false;
+    if (NSNumber *v = numberFrom(params, @"gainDb")) p.gainDb = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"pan")) p.pan = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"tune")) p.tuneSemis = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"fineCents")) p.tuneCents = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"attackMs")) p.attackMs = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"releaseMs")) p.releaseMs = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"velocitySens")) p.velocitySens = (float)v.doubleValue;
+    if (NSNumber *v = numberFrom(params, @"chokeGroup")) p.chokeGroup = (int)std::lround(std::clamp(v.doubleValue, 0.0, (double)kSamplerChokeGroups));
+    // loop: { startMs, endMs } turns it on, false / null turns it off; anything else is ignored.
+    id loop = params[@"loop"];
+    if ([loop isKindOfClass:[NSDictionary class]]) {
+        NSNumber *ls = numberFrom((NSDictionary *)loop, @"startMs");
+        NSNumber *le = numberFrom((NSDictionary *)loop, @"endMs");
+        if (ls != nil && le != nil) {
+            p.loop = true;
+            p.loopStartMs = (float)ls.doubleValue;
+            p.loopEndMs = (float)le.doubleValue;
+        }
+    } else if (loop == [NSNull null] || ([loop isKindOfClass:[NSNumber class]] && ![(NSNumber *)loop boolValue])) {
+        p.loop = false;
+    }
+}
+
+// Read-modify-write of the stored slot. Two writers racing on one slot each keep their own keys
+// only if they do not overlap (the store's writer lock covers each write, not the merge).
+static bool applySamplerParams(int slot, NSDictionary<NSString *, id> *params) {
+    SamplerSlotParams p = sSamplerParams.slot(slot);
+    mergeSamplerParams(p, params);
+    return sSamplerParams.setSlot(slot, p);
+}
+
+- (BOOL)setSamplerSlot:(int)slot params:(NSDictionary<NSString *, id> *)params {
+    if (slot < 0 || slot >= kSamplerSlots) return NO;
+    if (params.count == 0) return YES;
+    return applySamplerParams(slot, params) ? YES : NO;
+}
+
+- (BOOL)setSampler:(NSDictionary<NSString *, id> *)settings {
+    if (NSNumber *v = numberFrom(settings, @"level")) sSamplerParams.setLevel(v.doubleValue);
+    if (NSNumber *v = boolFrom(settings, @"mute")) sSamplerParams.setMute(v.boolValue ? true : false);
+    if (NSNumber *v = numberFrom(settings, @"polyphony")) sSamplerParams.setPolyphony(v.doubleValue);
+    return YES;
+}
+
+- (NSDictionary<NSString *, id> *)samplerState {
+    NSMutableArray<NSDictionary<NSString *, id> *> *slots = [NSMutableArray arrayWithCapacity:kSamplerSlots];
+    for (int s = 0; s < kSamplerSlots; ++s) {
+        const SamplerSlotParams p = sSamplerParams.slot(s);
+        const SamplerSlotInfo info = sSamplerBank.slotInfo(s);
+        id loop = p.loop ? (id)@{ @"startMs": @(fxValueForJS(p.loopStartMs)), @"endMs": @(fxValueForJS(p.loopEndMs)) }
+                         : (id)[NSNull null];
+        [slots addObject:@{
+            @"loaded": @(info.loaded ? YES : NO),
+            @"frames": @(info.frames),
+            @"durationMs": @(info.durationMs),
+            @"rootNote": @(p.rootNote),
+            @"lowNote": @(p.lowNote),
+            @"highNote": @(p.highNote),
+            @"startMs": @(fxValueForJS(p.startMs)),
+            @"endMs": @(fxValueForJS(p.endMs)),
+            @"loop": loop,
+            @"oneShot": @(p.oneShot ? YES : NO),
+            @"gainDb": @(fxValueForJS(p.gainDb)),
+            @"pan": @(fxValueForJS(p.pan)),
+            @"tune": @(fxValueForJS(p.tuneSemis)),
+            @"fineCents": @(fxValueForJS(p.tuneCents)),
+            @"attackMs": @(fxValueForJS(p.attackMs)),
+            @"releaseMs": @(fxValueForJS(p.releaseMs)),
+            @"velocitySens": @(fxValueForJS(p.velocitySens)),
+            @"chokeGroup": @(p.chokeGroup),
+        }];
+    }
+    const SamplerSettings settings = sSamplerParams.settings();
+    return @{
+        @"level": @(fxValueForJS(settings.level)),
+        @"mute": @(settings.mute ? YES : NO),
+        @"polyphony": @(settings.polyphony),
+        @"slots": slots,
+    };
+}
+
+- (void)loadSamplerSlot:(int)slot
+                    uri:(NSString *)uri
+                 params:(NSDictionary<NSString *, id> *)params
+             completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode, NSString *errorMessage))completion {
+    if (slot < 0 || slot >= kSamplerSlots) {
+        completion(nil, @"ERR_SAMPLER_SLOT", [NSString stringWithFormat:@"slot %d is outside 0-%d", slot, kSamplerSlots - 1]);
+        return;
+    }
+    NSString *path = uri != nil ? backingTrackPath(uri) : nil;
+    if (path == nil) {
+        completion(nil, @"ERR_SAMPLER_FILE", [NSString stringWithFormat:@"not a local file URI: %@", uri ?: @"(nil)"]);
+        return;
+    }
+    // A newer load or an unload of this slot supersedes this one (checked while decoding and before publishing).
+    const uint64_t generation = sSamplerBank.beginLoad(slot);
+    const std::string pathString = path.UTF8String;
+    NSDictionary<NSString *, id> *paramsCopy = params.count > 0 ? [params copy] : nil;
+    dispatch_async(samplerQueue(), ^{
+        std::string error;
+        SamplerLoadInfo info;
+        // The parameters are applied under the bank's lock right before the sample is published,
+        // and only if it is: a failed or superseded load leaves the slot's current ones intact.
+        SamplerBank::BeforePublish beforePublish;
+        if (paramsCopy != nil) beforePublish = [slot, paramsCopy] { applySamplerParams(slot, paramsCopy); };
+        const bool ok = sSamplerBank.load(slot, generation, pathString, info, error, beforePublish);
+        [self scheduleSamplerCollect]; // the slot's previous sample, if one was replaced
+        if (!ok) {
+            NSString *full = [NSString stringWithUTF8String:error.c_str()] ?: @"ERR_SAMPLER_FILE: load failed";
+            NSRange colon = [full rangeOfString:@": "];
+            NSString *code = colon.location != NSNotFound ? [full substringToIndex:colon.location] : @"ERR_SAMPLER_FILE";
+            NSString *message = colon.location != NSNotFound ? [full substringFromIndex:NSMaxRange(colon)] : full;
+            completion(nil, code, message);
+            return;
+        }
+        completion(@{
+            @"frames": @(info.frames),
+            @"sampleRate": @(info.sampleRate),
+            @"channels": @(info.channels),
+            @"durationMs": @(info.durationMs),
+        }, nil, nil);
+    });
+}
+
+- (BOOL)unloadSamplerSlot:(int)slot {
+    if (!sSamplerBank.unload(slot)) return NO;
+    [self scheduleSamplerCollect];
+    return YES;
+}
+
+// Main thread. Frees replaced sampler samples the audio thread no longer uses; retries every
+// 100 ms while some are still in use or the bank is busy (collect never blocks the main thread).
+- (void)scheduleSamplerCollect {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self scheduleSamplerCollect]; });
+        return;
+    }
+    if (self.samplerCollectScheduled) return;
+    if (sSamplerBank.collect() == 0) return;
+    self.samplerCollectScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * (int64_t)NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        self.samplerCollectScheduled = NO;
+        [self scheduleSamplerCollect];
+    });
+}
+
 // ── Analysis ──
 // Any thread, no lock: everything is read from the process-lifetime sAnalysis (levels and scope
 // written by GraphPlayer, transport as of the last block written by the aux node, arp state
@@ -2464,6 +2699,7 @@ static NSString *backingTrackPath(NSString *uri) {
         const BOOL wasPlaying = [self isTransportPlaying];
         [self stopTransport];
         [self allNotesOff];
+        sNoteQueue.pushSamplerSilence(); // sampler one-shots too, so the idle stop is not held off
         if (wasPlaying) emitEngineEvent(@"onTransportChange", @{ @"playing": @NO, @"reason": @"background" });
     }
     [self updateSessionExclusivity];
@@ -2521,7 +2757,8 @@ static NSString *backingTrackPath(NSString *uri) {
         activity.transportPlaying = sTransport != nullptr && sTransport->isPlaying();
         if (sSynth != nullptr) {
             activity.voicesSounding = sSynth->diag.activeVoices.load(std::memory_order_relaxed)
-                + sSynth->drums().diag.activeVoices.load(std::memory_order_relaxed);
+                + sSynth->drums().diag.activeVoices.load(std::memory_order_relaxed)
+                + sSynth->sampler().diag.activeVoices.load(std::memory_order_relaxed);
         }
     }
     activity.sequenceNotes = sSequence.activeNotes.load(std::memory_order_relaxed);
