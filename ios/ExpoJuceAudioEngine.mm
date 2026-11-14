@@ -4,6 +4,7 @@
 #import "ExpoJuceAudioEngine.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMIDI/CoreMIDI.h>
+#import <MediaPlayer/MediaPlayer.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 #include <juce_core/juce_core.h>
@@ -25,9 +26,13 @@
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
 #include "OwnerToken.h"
+#include "SequencePlayer.h"
+#include "BackgroundPolicy.h"
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <vector>
 #include <algorithm>
 #include <mutex>
 #include <thread>
@@ -116,6 +121,21 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 // Main thread: a deferred free of retired backing-track buffers is scheduled.
 @property (nonatomic, assign) BOOL backingTrackCollectScheduled;
 - (void)scheduleBackingTrackCollect;
+
+// Background policy, Now Playing and remote commands (0.9.0-rc.5). Main thread unless noted.
+@property (atomic, assign) BOOL idleStopped;          // device closed and session deactivated by the idle stop
+@property (nonatomic, assign) BOOL rebuildAfterIdleStop; // a media-services reset came while idle-stopped
+@property (nonatomic, strong) dispatch_source_t backgroundCheckTimer;
+@property (atomic, copy) NSString *backgroundStartError; // the last failed restart from the background
+@property (nonatomic, copy) NSDictionary<NSString *, id> *nowPlayingInfo; // title, artist, album; nil = none
+@property (nonatomic, strong) NSMutableDictionary<NSString *, id> *remoteCommandTargets; // name -> target
+@property (atomic, copy) NSArray<NSString *> *enabledRemoteCommandNames;
+- (void)transportPlayStateChanged;
+- (void)updateNowPlayingInfo;
+- (void)updateSessionExclusivity;
+- (AVAudioSessionCategoryOptions)sessionCategoryOptions;
+- (void)resetRuntimeState;
+- (void)stopBackgroundCheck;
 // Main thread: the beat timer itself, without changing beatTimerWanted.
 - (void)resumeBeatTimer;
 - (void)cancelBeatTimer;
@@ -322,6 +342,100 @@ static void flushMidiInputEvents(void *) {
 static void scheduleMidiInputFlush() {
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, kMidiInputFlushNs), midiInputQueue(), nullptr,
                      flushMidiInputEvents);
+}
+
+// ── Loop sequence (SequencePlayer.h) ──
+// Process lifetime like the other stores: setSequence works before setup and survives rebuilds
+// (each synth the engine builds plays it). Heap-allocated and never freed. sSequenceLog carries
+// the notes the player fired to the drain timer below (only while JS listens).
+static seqplay::SequenceStore& sSequence = *new seqplay::SequenceStore;
+static seqplay::NoteLog& sSequenceLog = *new seqplay::NoteLog;
+static const int64_t kSequenceDrainNs = 16 * (int64_t)NSEC_PER_MSEC;
+
+// ── Engine events for JS (onSequenceNotes, onRemoteCommand, ...) ──
+// One handler, set by the module that owns it (token, as for the MIDI input handler); touched only
+// on engineEventQueue, where every event is delivered.
+static void (^sEngineEventHandler)(NSString *, NSDictionary<NSString *, id> *) = nil;
+static OwnerToken sEngineEventOwner;
+static dispatch_source_t sSequenceDrainTimer = nil; // engineEventQueue only
+
+// ── Background policy (BackgroundPolicy.h) ──
+// Set from any thread (atomics), applied on the main thread, which alone owns sIdleTracker.
+static std::atomic<bool> sPolicySet{false};
+static std::atomic<bool> sPolicyKeepAlive{true};
+static std::atomic<double> sPolicyIdleStopSeconds{bgpolicy::kDefaultIdleStopSeconds};
+static bgpolicy::IdleTracker sIdleTracker;                // main thread
+static std::atomic<int> sBackgroundState{0};              // bgpolicy::State, for diagnostics
+static std::atomic<double> sIdleStopAt{-1.0};             // CACurrentMediaTime() seconds, -1 = none
+static std::atomic<uint64_t> sIdleStops{0};
+static std::atomic<double> sLastIdleStopSec{-1.0};
+static std::atomic<bool> sInBackground{false};
+static std::atomic<bool> sNowPlayingSet{false};
+static std::atomic<bool> sSessionExclusive{false};        // the session is not mixable (Now Playing)
+
+static bgpolicy::Policy currentBackgroundPolicy() {
+    bgpolicy::Policy p;
+    p.set = sPolicySet.load(std::memory_order_acquire);
+    p.keepAlive = sPolicyKeepAlive.load(std::memory_order_relaxed);
+    p.idleStopSeconds = sPolicyIdleStopSeconds.load(std::memory_order_relaxed);
+    return p;
+}
+
+static dispatch_queue_t engineEventQueue() {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                                             QOS_CLASS_USER_INITIATED, 0);
+        queue = dispatch_queue_create("expo-juce.engine-events", attr);
+    });
+    return queue;
+}
+
+// Any thread: delivers one event to the handler (if any) on engineEventQueue.
+static void emitEngineEvent(NSString *name, NSDictionary<NSString *, id> *body) {
+    dispatch_async(engineEventQueue(), ^{
+        void (^handler)(NSString *, NSDictionary<NSString *, id> *) = sEngineEventHandler;
+        if (handler != nil) handler(name, body);
+    });
+}
+
+// engineEventQueue: the notes the sequence fired since the last drain, as one onSequenceNotes batch.
+static void drainSequenceNotes() {
+    @autoreleasepool {
+        NSMutableArray<NSDictionary<NSString *, id> *> *notes = [NSMutableArray array];
+        sSequenceLog.drain([&](const seqplay::NoteLog::Entry& e) {
+            [notes addObject:@{
+                @"note": @(e.note),
+                @"kind": e.kind == seqplay::EventKind::Drum ? @"drum" : @"note",
+                @"on": @(e.on ? YES : NO),
+                @"atBeat": @(e.atBeat),
+            }];
+        });
+        void (^handler)(NSString *, NSDictionary<NSString *, id> *) = sEngineEventHandler;
+        if (notes.count == 0 || handler == nil || !sSequenceLog.listening.load(std::memory_order_relaxed)) return;
+        handler(@"onSequenceNotes", @{ @"notes": notes, @"now": @(CACurrentMediaTime()) });
+    }
+}
+
+// Any thread: starts / stops the drain timer (on engineEventQueue, so calls apply in order).
+static void setSequenceDrainRunning(bool on) {
+    dispatch_async(engineEventQueue(), ^{
+        if (on && sSequenceDrainTimer == nil) {
+            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, engineEventQueue());
+            dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, kSequenceDrainNs), (uint64_t)kSequenceDrainNs,
+                                      2 * NSEC_PER_MSEC);
+            dispatch_source_set_event_handler(timer, ^{
+                drainSequenceNotes();
+            });
+            dispatch_resume(timer);
+            sSequenceDrainTimer = timer;
+        } else if (!on && sSequenceDrainTimer != nil) {
+            dispatch_source_cancel(sSequenceDrainTimer);
+            sSequenceDrainTimer = nil;
+            sSequenceLog.drain([](const seqplay::NoteLog::Entry&) {}); // nobody listens: drop them
+        }
+    });
 }
 
 // The C entry point (ExpoJuceMidiInput.mm) feeds sMidiInput from static initialisation on.
@@ -538,6 +652,15 @@ static int mainThreadMaxFramesPerSecond() {
             });
         });
         [ExpoJuceAudioEngine warmCoreMidiOffMainThread];
+        _remoteCommandTargets = [NSMutableDictionary dictionary];
+        _enabledRemoteCommandNames = @[];
+        // Background policy: app state for the whole life of the engine object (delivered on the
+        // main thread; ignored while the engine is not set up).
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center addObserver:self selector:@selector(handleAppDidEnterBackground:)
+                       name:UIApplicationDidEnterBackgroundNotification object:nil];
+        [center addObserver:self selector:@selector(handleAppWillEnterForeground:)
+                       name:UIApplicationWillEnterForegroundNotification object:nil];
     }
     return self;
 }
@@ -585,6 +708,7 @@ static int mainThreadMaxFramesPerSecond() {
         return YES;
     }
 
+    self.idleStopped = NO;
     self.requestedBufferSize = (bufferSize > 0) ? std::min(bufferSize, 4096) : kDefaultBufferSize;
     self.requestedSampleRate = (sampleRate > 0.0) ? sampleRate : kDefaultSampleRate;
     sXrunsCarried.store(0, std::memory_order_relaxed); // xrunCount counts from this setup
@@ -694,7 +818,7 @@ static int mainThreadMaxFramesPerSecond() {
     NSError *activationError = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryPlayback
-             withOptions:AVAudioSessionCategoryOptionMixWithOthers
+             withOptions:[self sessionCategoryOptions]
                    error:&sessionError];
     if (sessionError) {
         NSLog(@"[ExpoJuceAudioEngine] AVAudioSession category error: %@", sessionError);
@@ -779,6 +903,8 @@ static int mainThreadMaxFramesPerSecond() {
     sSynth->setInputLatency(&sMidiInputLatency); // same, MIDI input arrival -> render
     sSynth->arp().setSettingsStore(&sArpOptions); // the live options, before and across rebuilds
     sSynth->drums().setParamStore(&sDrumParams);  // same for the drum part
+    sSynth->setSequenceStore(&sSequence);         // the loop sequence, before and across rebuilds
+    sSynth->setSequenceNoteLog(&sSequenceLog);
 
     self.setupStep = 7;
     NSLog(@"[ExpoJuceAudioEngine] Step 7: addNode (synth, fx chain)");
@@ -1049,6 +1175,10 @@ static int mainThreadMaxFramesPerSecond() {
     // Also before setup (or after a failed one): the timer may run without an engine.
     [self cancelBeatTimer];
     [self stopStallProbe];
+    [self stopBackgroundCheck];
+    self.idleStopped = NO;
+    self.rebuildAfterIdleStop = NO;
+    sSessionExclusive.store(false, std::memory_order_relaxed); // the next setup starts mixable
     self.routeFormatCheckPending = NO;
     if (!self.isReady) return;
 
@@ -1156,7 +1286,7 @@ static int mainThreadMaxFramesPerSecond() {
 // Main thread. Another component (e.g. a recording or video library) switched the shared session
 // to a category that cannot play our output; switch it back.
 - (void)reassertSessionCategoryIfNeeded {
-    if (!self.isReady || self.isReassertingSession) return;
+    if (!self.isReady || self.isReassertingSession || self.idleStopped) return;
     AVAudioSession *session = [AVAudioSession sharedInstance];
     NSString *category = session.category;
     if ([category isEqualToString:AVAudioSessionCategoryPlayback] ||
@@ -1170,7 +1300,7 @@ static int mainThreadMaxFramesPerSecond() {
 
     NSError *categoryError = nil;
     [session setCategory:AVAudioSessionCategoryPlayback
-             withOptions:AVAudioSessionCategoryOptionMixWithOthers
+             withOptions:[self sessionCategoryOptions]
                    error:&categoryError];
     if (categoryError) {
         [self noteRecoveryError:[NSString stringWithFormat:@"re-assert setCategory: %@",
@@ -1198,11 +1328,14 @@ static int mainThreadMaxFramesPerSecond() {
             if (strongSelf == nil) return;
             strongSelf.interruptionCount = strongSelf.interruptionCount + 1;
             NSLog(@"[ExpoJuceAudioEngine] audio session interruption began");
+            [strongSelf handleInterruptionBegan];
         });
     } else if (type == AVAudioSessionInterruptionTypeEnded) {
-        // Resume whether or not the system set AVAudioSessionInterruptionOptionShouldResume:
-        // this is an instrument; it should be playable as soon as the interruption is over.
+        // The device is made playable again whether or not the system set
+        // AVAudioSessionInterruptionOptionShouldResume: this is an instrument; it should be playable
+        // as soon as the interruption is over. The transport stays stopped (the app decides).
         // Delayed so JUCE's own handler (which restarts its audio unit) runs first.
+        emitEngineEvent(@"onAudioInterruption", @{ @"type": @"ended", @"playing": @NO });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kRecoveryDelayMs * (int64_t)NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             [weakSelf recoverFromInterruption];
@@ -1210,9 +1343,21 @@ static int mainThreadMaxFramesPerSecond() {
     }
 }
 
+// Main thread. A call, Siri, or (with a non-mixable session) another app's audio took the session:
+// stop the transport and release every note, so nothing sounds on (or resumes) afterwards.
+- (void)handleInterruptionBegan {
+    const BOOL wasPlaying = self.isReady ? [self isTransportPlaying] : NO;
+    if (self.isReady) {
+        [self stopTransport];
+        [self allNotesOff];
+    }
+    emitEngineEvent(@"onAudioInterruption", @{ @"type": @"began", @"playing": @NO, @"wasPlaying": @(wasPlaying) });
+    if (wasPlaying) emitEngineEvent(@"onTransportChange", @{ @"playing": @NO, @"reason": @"interruption" });
+}
+
 // Main thread.
 - (void)recoverFromInterruption {
-    if (!self.isReady || sDeviceManager == nullptr) return;
+    if (!self.isReady || sDeviceManager == nullptr || self.idleStopped) return;
     NSLog(@"[ExpoJuceAudioEngine] audio session interruption ended; reactivating");
     NSError *activationError = nil;
     [[AVAudioSession sharedInstance] setActive:YES error:&activationError];
@@ -1240,7 +1385,7 @@ static int mainThreadMaxFramesPerSecond() {
 // advancing after another kDeadDeviceCheckMs, rebuild the engine.
 
 - (void)scheduleDeadDeviceCheck:(NSString *)context {
-    if (!self.isReady || self.isRecovering || sPlayer == nullptr) return;
+    if (!self.isReady || self.isRecovering || sPlayer == nullptr || self.idleStopped) return;
     GraphPlayer *player = sPlayer;
     const uint64_t before = player->callbackCount.load(std::memory_order_relaxed);
     __weak ExpoJuceAudioEngine *weakSelf = self;
@@ -1256,7 +1401,7 @@ static int mainThreadMaxFramesPerSecond() {
                       since:(uint64_t)before
                     context:(NSString *)context
                   restarted:(BOOL)restarted {
-    if (!self.isReady || self.isRecovering || sDeviceManager == nullptr) return;
+    if (!self.isReady || self.isRecovering || sDeviceManager == nullptr || self.idleStopped) return;
     if (sPlayer == nullptr || sPlayer != player) return;
     if (player->callbackCount.load(std::memory_order_relaxed) != before) return; // alive
 
@@ -1290,7 +1435,7 @@ static int mainThreadMaxFramesPerSecond() {
 // Main thread. Reopens the JUCE device with its last setup if it is closed or stopped; if that
 // does not get it running, rebuilds the whole engine.
 - (void)restartDeviceIfStopped:(NSString *)context {
-    if (!self.isReady || sDeviceManager == nullptr) return;
+    if (!self.isReady || sDeviceManager == nullptr || self.idleStopped) return;
     if ([self isDeviceRunning]) return;
 
     NSLog(@"[ExpoJuceAudioEngine] device not running after %@; reopening", context);
@@ -1312,6 +1457,11 @@ static int mainThreadMaxFramesPerSecond() {
         ExpoJuceAudioEngine *strongSelf = weakSelf;
         if (strongSelf == nil) return;
         strongSelf.mediaResetCount = strongSelf.mediaResetCount + 1;
+        // Idle-stopped in the background: rebuild when the device is wanted again.
+        if (strongSelf.idleStopped) {
+            strongSelf.rebuildAfterIdleStop = YES;
+            return;
+        }
         [strongSelf rebuildEngine:@"media services reset"];
     });
 }
@@ -1598,6 +1748,37 @@ static int mainThreadMaxFramesPerSecond() {
     d[@"maxFramesPerSecond"] = @(sMaxFramesPerSecond.load(std::memory_order_relaxed));
     d[@"displayRateHint"] = @(sDisplayRateHint.load(std::memory_order_relaxed));
 
+    // Loop sequence (SequencePlayer.h) and the background policy (BackgroundPolicy.h), 0.9.0-rc.5.
+    const auto relaxed = std::memory_order_relaxed;
+    d[@"sequence"] = @{
+        @"events": @(sSequence.eventCount()),
+        @"loopBeats": @(sSequence.loopBeats()),
+        @"playing": @(sSequence.firing.load(relaxed) ? YES : NO),
+        @"muted": @(sSequence.muted() ? YES : NO),
+        @"activeNotes": @(sSequence.activeNotes.load(relaxed)),
+        @"notesFired": @((double)sSequence.notesFired.load(relaxed)),
+        @"lateFires": @((double)sSequence.lateFires.load(relaxed)),
+        @"dropped": @((double)sSequence.dropped.load(relaxed)),
+        @"version": @((double)sSequence.version()),
+        @"listening": @(sSequenceLog.listening.load(relaxed) ? YES : NO),
+        @"notesLost": @((double)sSequenceLog.lost.load(relaxed)),
+    };
+    d[@"backgroundState"] = @(bgpolicy::stateName((bgpolicy::State)sBackgroundState.load(relaxed)));
+    d[@"idleStopAt"] = @(sIdleStopAt.load(relaxed)); // on the clockSec clock; -1 = none pending
+    d[@"backgroundPolicy"] = @{
+        @"set": @(sPolicySet.load(relaxed) ? YES : NO),
+        @"keepAlive": @(sPolicyKeepAlive.load(relaxed) ? YES : NO),
+        @"idleStopSeconds": @(sPolicyIdleStopSeconds.load(relaxed)),
+    };
+    d[@"idleStops"] = @((double)sIdleStops.load(relaxed));
+    d[@"lastIdleStopAt"] = @(sLastIdleStopSec.load(relaxed));
+    d[@"backgroundStartError"] = self.backgroundStartError ?: @"";
+    d[@"nowPlaying"] = @{
+        @"set": @(sNowPlayingSet.load(relaxed) ? YES : NO),
+        @"exclusiveSession": @(sSessionExclusive.load(relaxed) ? YES : NO),
+        @"remoteCommands": self.enabledRemoteCommandNames ?: @[],
+    };
+
     return d;
 }
 
@@ -1620,7 +1801,10 @@ static int mainThreadMaxFramesPerSecond() {
 // The MIDI input's mark that another source holds the note goes on before the note is queued, so
 // an input note-off racing this call never releases it; a note-on that was not queued undoes it.
 - (void)noteOn:(int)note velocity:(int)velocity {
-    if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
+    if (!sAcceptingNotes.load(std::memory_order_acquire)) {
+        [self wakeFromIdleStopIfNeeded:@"note"];
+        return;
+    }
     const int marked = std::clamp(note, 0, 127);
     const bool previous = sMidiInput.externalNoteOn(marked);
     if (!sNoteQueue.pushNoteOn(note, velocity)) sMidiInput.restoreExternal(marked, previous);
@@ -1652,6 +1836,8 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
         const int marked = std::clamp(note, 0, 127);
         const bool previous = sMidiInput.externalNoteOn(marked); // before the push (see noteOn)
         if (!sNoteQueue.pushNoteOn(note, velocity, touchTicks, entryTicks)) sMidiInput.restoreExternal(marked, previous);
+    } else {
+        [self wakeFromIdleStopIfNeeded:@"note"];
     }
     // After the push, so the handler leg (entry -> push stamp) does not include it.
     recordTouchDelivery(touchTimestamp, entryTimestamp);
@@ -1705,6 +1891,16 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
     const NSUInteger count = bytes.count;
     for (NSUInteger i = 0; i < count; ++i)
         buffer[i] = [bytes[i] isKindOfClass:[NSNumber class]] ? (uint8_t)(bytes[i].intValue & 0xFF) : 0;
+    if (self.idleStopped) {
+        // Only what looks like a note-on wakes the engine (not clock or sensing bytes). A BLE-MIDI
+        // timestamp byte can look like a status byte: a rare extra wake costs one idle period.
+        for (NSUInteger i = 0; i + 2 < count; ++i) {
+            if ((buffer[i] & 0xF0) == 0x90 && buffer[i + 1] < 0x80 && buffer[i + 2] > 0 && buffer[i + 2] < 0x80) {
+                [self wakeFromIdleStopIfNeeded:@"midi input"];
+                break;
+            }
+        }
+    }
     return expojuce_midi_input_bytes(buffer, (size_t)count, format, arrivalSeconds);
 }
 
@@ -1735,14 +1931,17 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
 - (uint64_t)claimModule {
     const uint64_t token = sModuleOwner.claim();
     [self setDisplayRateHint:0];
+    // Nor the old runtime's loop, background policy, Now Playing or remote commands.
+    [self resetRuntimeState];
     return token;
 }
 
 - (void)releaseModule:(uint64_t)token {
     if (sModuleOwner.release(token)) {
         // The display-rate hint belongs to the runtime that set it (cleared first: shutdown can
-        // take a while on the main thread).
+        // take a while on the main thread). So do the loop and the lock-screen state.
         [self setDisplayRateHint:0];
+        [self resetRuntimeState];
         [self stopBeatTimer];
         [self shutdown];
         return;
@@ -2109,8 +2308,15 @@ static NSString *backingTrackPath(NSString *uri) {
 
 // ── Transport ──
 
-- (void)startTransport { withTransport(self, ^(TransportEngine *transport) { transport->start(); }); }
-- (void)stopTransport { withTransport(self, ^(TransportEngine *transport) { transport->stop(); }); }
+- (void)startTransport {
+    [self wakeFromIdleStopIfNeeded:@"transport start"];
+    withTransport(self, ^(TransportEngine *transport) { transport->start(); });
+    [self transportPlayStateChanged];
+}
+- (void)stopTransport {
+    withTransport(self, ^(TransportEngine *transport) { transport->stop(); });
+    [self transportPlayStateChanged];
+}
 - (void)setTempo:(double)bpm { withTransport(self, ^(TransportEngine *transport) { transport->setTempo(bpm); }); }
 - (void)setTransportPosition:(double)beat { withTransport(self, ^(TransportEngine *transport) { transport->setPosition(beat); }); }
 
@@ -2130,6 +2336,432 @@ static NSString *backingTrackPath(NSString *uri) {
     __block BOOL playing = NO;
     withTransport(self, ^(TransportEngine *transport) { playing = transport->isPlaying() ? YES : NO; });
     return playing;
+}
+
+// ── Loop sequence ──
+// setSequence copies, checks and sorts off the audio thread and swaps the whole sequence in
+// (SequenceStore). Any thread but the audio thread, before setup and across rebuilds.
+
+- (BOOL)setSequenceData:(const double *)data
+                  count:(NSInteger)count
+              loopBeats:(double)loopBeats
+               fromBeat:(double)fromBeat
+                endBeat:(double)endBeat {
+    static constexpr NSInteger kStride = 6;
+    if (count < 0 || count % kStride != 0 || (count > 0 && data == nullptr)) return NO;
+    const NSInteger events = count / kStride;
+    if (events > seqplay::kMaxEvents) return NO;
+    std::vector<seqplay::Event> parsed((size_t)events);
+    for (NSInteger i = 0; i < events; ++i) {
+        const double* f = data + i * kStride;
+        seqplay::Event& e = parsed[(size_t)i];
+        e.start = f[0];
+        e.length = f[1];
+        // Out-of-range numbers become values sanitizeEvent rejects (255), never a wrapped note.
+        e.note = (std::isfinite(f[2]) && f[2] >= 0.0 && f[2] <= 127.0) ? (uint8_t)std::lround(f[2]) : (uint8_t)255;
+        e.velocity = std::isfinite(f[3]) ? (uint8_t)std::clamp(std::lround(f[3]), 1L, 127L) : (uint8_t)100;
+        e.kind = f[4] == 1.0 ? seqplay::EventKind::Drum : (f[4] == 0.0 ? seqplay::EventKind::Note : (seqplay::EventKind)255);
+        e.skipBefore = std::isnan(f[5]) ? -std::numeric_limits<double>::infinity() : f[5];
+    }
+    const seqplay::SetResult result = sSequence.set(parsed.data(), (int)events, loopBeats, fromBeat, endBeat);
+    return result.ok ? YES : NO;
+}
+
+- (void)setSequenceMuted:(BOOL)muted { sSequence.setMuted(muted == YES); }
+
+// ── Engine events ──
+
+- (uint64_t)setEngineEventHandler:(void (^)(NSString *, NSDictionary<NSString *, id> *))handler {
+    const uint64_t token = sEngineEventOwner.claim();
+    // Sequence notes stay off until the new owner's JS asks for them.
+    sSequenceLog.listening.store(false, std::memory_order_relaxed);
+    setSequenceDrainRunning(false);
+    void (^copied)(NSString *, NSDictionary<NSString *, id> *) = [handler copy];
+    dispatch_async(engineEventQueue(), ^{
+        if (sEngineEventOwner.isCurrent(token)) sEngineEventHandler = copied;
+    });
+    return token;
+}
+
+- (void)clearEngineEventHandler:(uint64_t)token {
+    if (!sEngineEventOwner.release(token)) return; // a newer module set its own
+    sSequenceLog.listening.store(false, std::memory_order_relaxed);
+    setSequenceDrainRunning(false);
+    dispatch_async(engineEventQueue(), ^{
+        if (sEngineEventOwner.current() == 0) sEngineEventHandler = nil;
+    });
+}
+
+- (void)setSequenceNotesListening:(BOOL)listening token:(uint64_t)token {
+    if (!sEngineEventOwner.isCurrent(token)) return;
+    sSequenceLog.listening.store(listening == YES, std::memory_order_relaxed);
+    setSequenceDrainRunning(listening == YES);
+}
+
+// Any thread: the runtime that set the loop, the policy and the lock-screen state is gone (a new
+// module, or the owner's release). The loop stops (its notes are released on the next block).
+- (void)resetRuntimeState {
+    sSequence.clear();
+    sSequence.setMuted(false);
+    sPolicySet.store(false, std::memory_order_release);
+    sPolicyKeepAlive.store(true, std::memory_order_relaxed);
+    sPolicyIdleStopSeconds.store(bgpolicy::kDefaultIdleStopSeconds, std::memory_order_relaxed);
+    __weak ExpoJuceAudioEngine *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        [strongSelf stopBackgroundCheck];
+        [strongSelf applyRemoteCommands:[NSSet set]];
+        strongSelf.nowPlayingInfo = nil;
+        sNowPlayingSet.store(false, std::memory_order_relaxed);
+        [strongSelf updateNowPlayingInfo];
+        [strongSelf updateSessionExclusivity];
+    });
+}
+
+// ── Background policy ──
+// Main thread. sIdleTracker decides (BackgroundPolicy.h); a 1 s timer samples what the engine is
+// doing while the app is in the background with a policy set.
+
+- (void)setBackgroundPolicyKeepAlive:(BOOL)keepAlive idleStopSeconds:(double)idleStopSeconds {
+    sPolicyKeepAlive.store(keepAlive == YES, std::memory_order_relaxed);
+    sPolicyIdleStopSeconds.store(bgpolicy::sanitizeIdleStopSeconds(idleStopSeconds), std::memory_order_relaxed);
+    sPolicySet.store(true, std::memory_order_release);
+    __weak ExpoJuceAudioEngine *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
+        if (strongSelf == nil || !sInBackground.load(std::memory_order_relaxed)) return;
+        [strongSelf startBackgroundCheck]; // set while already in the background
+    });
+}
+
+- (void)publishBackgroundState {
+    sBackgroundState.store((int)sIdleTracker.state(), std::memory_order_relaxed);
+    sIdleStopAt.store(sIdleTracker.idleStopAt(), std::memory_order_relaxed);
+}
+
+- (void)handleAppDidEnterBackground:(NSNotification *)notification {
+    sInBackground.store(true, std::memory_order_relaxed);
+    const bgpolicy::Policy policy = currentBackgroundPolicy();
+    const bool pause = sIdleTracker.enterBackground(policy, CACurrentMediaTime());
+    [self publishBackgroundState];
+    if (!self.isReady) return;
+    if (pause) {
+        // keepAlive off: what plays stops when the app leaves the screen.
+        const BOOL wasPlaying = [self isTransportPlaying];
+        [self stopTransport];
+        [self allNotesOff];
+        if (wasPlaying) emitEngineEvent(@"onTransportChange", @{ @"playing": @NO, @"reason": @"background" });
+    }
+    [self updateSessionExclusivity];
+    if (policy.set) [self startBackgroundCheck];
+    emitEngineEvent(@"onBackgroundState", @{ @"state": @(bgpolicy::stateName(sIdleTracker.state())) });
+}
+
+- (void)handleAppWillEnterForeground:(NSNotification *)notification {
+    sInBackground.store(false, std::memory_order_relaxed);
+    [self stopBackgroundCheck];
+    const bool restart = sIdleTracker.enterForeground();
+    [self publishBackgroundState];
+    if (restart) [self restartAfterIdleStop:@"foreground"];
+    [self updateSessionExclusivity];
+    emitEngineEvent(@"onBackgroundState", @{ @"state": @(bgpolicy::stateName(sIdleTracker.state())) });
+}
+
+- (void)startBackgroundCheck {
+    if (self.backgroundCheckTimer != nil) return;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 4);
+    __weak ExpoJuceAudioEngine *weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        [weakSelf backgroundCheckTick];
+    });
+    dispatch_resume(timer);
+    self.backgroundCheckTimer = timer;
+    [self backgroundCheckTick];
+}
+
+- (void)stopBackgroundCheck {
+    if (self.backgroundCheckTimer == nil) return;
+    dispatch_source_cancel(self.backgroundCheckTimer);
+    self.backgroundCheckTimer = nil;
+}
+
+// Main thread, every second in the background: busy pushes the idle stop back; idle for the
+// policy's seconds stops the device.
+- (void)backgroundCheckTick {
+    if (!sInBackground.load(std::memory_order_relaxed) || self.idleStopped) {
+        [self stopBackgroundCheck];
+        return;
+    }
+    if (self.isRecovering || self.rebuildRetryPending) return; // a rebuild is running; check again later
+    bgpolicy::Activity activity;
+    {
+        std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
+        if (!acquireUserLock(lock)) return;
+        if (!self.isReady) {
+            lock.unlock();
+            [self stopBackgroundCheck];
+            return;
+        }
+        activity.transportPlaying = sTransport != nullptr && sTransport->isPlaying();
+        if (sSynth != nullptr) {
+            activity.voicesSounding = sSynth->diag.activeVoices.load(std::memory_order_relaxed)
+                + sSynth->drums().diag.activeVoices.load(std::memory_order_relaxed);
+        }
+    }
+    activity.sequenceNotes = sSequence.activeNotes.load(std::memory_order_relaxed);
+    activity.inputHolds = sMidiInput.stats().held;
+    activity.arpRunning = sAnalysis.arpActive();
+    const bool stop = sIdleTracker.check(currentBackgroundPolicy(), activity, CACurrentMediaTime());
+    [self publishBackgroundState];
+    if (stop) [self idleStop];
+}
+
+// Main thread: nothing has played for the policy's seconds in the background. Close the device
+// and deactivate the session so iOS can suspend the app. Note-ons are refused until the restart
+// (none can pile up and play at once afterwards).
+- (void)idleStop {
+    [self stopBackgroundCheck];
+    if (!self.isReady || self.idleStopped) return;
+    NSLog(@"[ExpoJuceAudioEngine] idle in the background: stopping the audio device");
+    self.idleStopped = YES;
+    sAcceptingNotes.store(false, std::memory_order_release);
+    {
+        LifecycleLock lifecycle;
+        carryXrunsLocked();
+        if (sDeviceManager != nullptr) sDeviceManager->closeAudioDevice();
+    }
+    NSError *error = nil;
+    [[AVAudioSession sharedInstance] setActive:NO
+                                   withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                         error:&error];
+    if (error) [self noteRecoveryError:[NSString stringWithFormat:@"idle stop setActive:NO: %@", error.localizedDescription]];
+    sIdleStops.fetch_add(1, std::memory_order_relaxed);
+    sLastIdleStopSec.store(CACurrentMediaTime(), std::memory_order_relaxed);
+    sSessionExclusive.store(false, std::memory_order_relaxed); // reapplied on the restart
+    [self updateNowPlayingInfo];
+    emitEngineEvent(@"onBackgroundState", @{ @"state": @"idleStopped" });
+}
+
+// Main thread: reactivates the session and reopens the device after an idle stop (the existing
+// recovery path: reopen, or rebuild if it will not run). From the background (a remote play) iOS
+// may refuse the session: then the engine stays stopped and backgroundStartError says why.
+- (BOOL)restartAfterIdleStop:(NSString *)context {
+    if (!self.idleStopped) return YES;
+    // Mixable to start: iOS refuses a non-mixable session started from the background more often.
+    // updateSessionExclusivity below makes it exclusive again when Now Playing needs it.
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSError *categoryError = nil;
+    NSError *activationError = nil;
+    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&categoryError];
+    const BOOL active = [session setActive:YES error:&activationError];
+    if (!active && sInBackground.load(std::memory_order_relaxed)) {
+        self.backgroundStartError = [NSString stringWithFormat:@"%@: setActive: %@", context,
+                                     activationError.localizedDescription ?: @"refused"];
+        NSLog(@"[ExpoJuceAudioEngine] restart after idle stop refused (%@)", self.backgroundStartError);
+        return NO;
+    }
+    sSessionExclusive.store(false, std::memory_order_relaxed);
+    self.backgroundStartError = nil;
+    self.idleStopped = NO;
+    NSLog(@"[ExpoJuceAudioEngine] restarting the audio device after an idle stop (%@)", context);
+    if (self.rebuildAfterIdleStop) {
+        self.rebuildAfterIdleStop = NO;
+        [self rebuildEngine:[NSString stringWithFormat:@"media services reset (%@)", context]];
+    } else {
+        [self restartDeviceIfStopped:[NSString stringWithFormat:@"idle stop (%@)", context]];
+    }
+    if (self.isReady) sAcceptingNotes.store(true, std::memory_order_release);
+    [self scheduleDeadDeviceCheck:[NSString stringWithFormat:@"idle stop (%@)", context]];
+    if (sInBackground.load(std::memory_order_relaxed)) {
+        // Still in the background (a remote play, a key on a MIDI device): the idle timer starts over.
+        sIdleTracker.markRestarted(CACurrentMediaTime());
+        [self publishBackgroundState];
+        if (sPolicySet.load(std::memory_order_acquire)) [self startBackgroundCheck];
+        emitEngineEvent(@"onBackgroundState", @{ @"state": @(bgpolicy::stateName(sIdleTracker.state())) });
+    }
+    [self updateNowPlayingInfo];
+    [self updateSessionExclusivity];
+    return [self isDeviceRunning];
+}
+
+// Any thread: something wants sound while the engine is idle-stopped in the background (a note-on
+// from JS or a MIDI device, a transport start). The device restarts on the main thread (best effort:
+// iOS may refuse); what asked is not replayed, so the first note after an idle stop can be lost.
+- (void)wakeFromIdleStopIfNeeded:(NSString *)context {
+    if (!self.idleStopped) return;
+    static std::atomic<bool> pending{false};
+    if (pending.exchange(true, std::memory_order_acq_rel)) return;
+    __weak ExpoJuceAudioEngine *weakSelf = self;
+    NSString *what = [context copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        pending.store(false, std::memory_order_release);
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
+        if (strongSelf == nil || !strongSelf.idleStopped) return;
+        [strongSelf restartAfterIdleStop:what];
+    });
+}
+
+// ── Now Playing and remote commands ──
+// Main thread for everything MediaPlayer. The session is made non-mixable only while Now Playing
+// info is set and the transport plays or the app is in the background (bgpolicy::
+// wantsExclusiveSession): iOS shows the info and routes the lock-screen controls only to an app
+// whose session does not mix with others.
+
+- (AVAudioSessionCategoryOptions)sessionCategoryOptions {
+    return sSessionExclusive.load(std::memory_order_relaxed) ? (AVAudioSessionCategoryOptions)0
+                                                             : AVAudioSessionCategoryOptionMixWithOthers;
+}
+
+- (BOOL)setNowPlaying:(NSDictionary<NSString *, id> *)info {
+    NSDictionary<NSString *, id> *copied = nil;
+    if (info != nil && ![info isKindOfClass:[NSNull class]]) {
+        id title = info[@"title"];
+        if (![title isKindOfClass:[NSString class]] || [(NSString *)title length] == 0) return NO;
+        NSMutableDictionary<NSString *, id> *clean = [NSMutableDictionary dictionaryWithObject:title forKey:@"title"];
+        for (NSString *key in @[ @"artist", @"album" ]) {
+            id value = info[key];
+            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) clean[key] = value;
+        }
+        copied = [clean copy];
+    }
+    sNowPlayingSet.store(copied != nil, std::memory_order_relaxed);
+    __weak ExpoJuceAudioEngine *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        strongSelf.nowPlayingInfo = copied;
+        [strongSelf updateNowPlayingInfo];
+        [strongSelf updateSessionExclusivity];
+    });
+    return YES;
+}
+
+- (BOOL)enableRemoteCommands:(NSArray<NSString *> *)commands {
+    NSSet<NSString *> *known = [NSSet setWithArray:@[ @"play", @"pause", @"togglePlayPause" ]];
+    NSMutableSet<NSString *> *wanted = [NSMutableSet set];
+    for (id name in commands ?: @[]) {
+        if (![name isKindOfClass:[NSString class]] || ![known containsObject:name]) return NO;
+        [wanted addObject:name];
+    }
+    __weak ExpoJuceAudioEngine *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf applyRemoteCommands:wanted];
+    });
+    return YES;
+}
+
+static MPRemoteCommand *remoteCommandNamed(NSString *name) {
+    MPRemoteCommandCenter *center = [MPRemoteCommandCenter sharedCommandCenter];
+    if ([name isEqualToString:@"play"]) return center.playCommand;
+    if ([name isEqualToString:@"pause"]) return center.pauseCommand;
+    return center.togglePlayPauseCommand;
+}
+
+// Main thread: replaces the handlers (removes this engine's old targets first).
+- (void)applyRemoteCommands:(NSSet<NSString *> *)wanted {
+    for (NSString *name in @[ @"play", @"pause", @"togglePlayPause" ]) {
+        MPRemoteCommand *command = remoteCommandNamed(name);
+        id existing = self.remoteCommandTargets[name];
+        if (existing != nil) {
+            [command removeTarget:existing];
+            [self.remoteCommandTargets removeObjectForKey:name];
+        }
+        if (![wanted containsObject:name]) {
+            command.enabled = NO;
+            continue;
+        }
+        __weak ExpoJuceAudioEngine *weakSelf = self;
+        NSString *commandName = [name copy];
+        id target = [command addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+            ExpoJuceAudioEngine *strongSelf = weakSelf;
+            if (strongSelf == nil) return MPRemoteCommandHandlerStatusCommandFailed;
+            return [strongSelf handleRemoteCommand:commandName];
+        }];
+        if (target != nil) self.remoteCommandTargets[name] = target;
+        command.enabled = YES;
+    }
+    self.enabledRemoteCommandNames = [[wanted allObjects] sortedArrayUsingSelector:@selector(compare:)];
+}
+
+// Main thread (MPRemoteCommandCenter calls its handlers there): the native transport, then the
+// app's JS is told so its transport state follows.
+- (MPRemoteCommandHandlerStatus)handleRemoteCommand:(NSString *)name {
+    if (!self.isReady) return MPRemoteCommandHandlerStatusCommandFailed;
+    const BOOL playing = [self isTransportPlaying];
+    const BOOL play = [name isEqualToString:@"play"] || ([name isEqualToString:@"togglePlayPause"] && !playing);
+    if (play) {
+        if (self.idleStopped && ![self restartAfterIdleStop:@"remote play"]) {
+            emitEngineEvent(@"onRemoteCommand", @{ @"command": name, @"playing": @NO, @"failed": @YES });
+            return MPRemoteCommandHandlerStatusCommandFailed;
+        }
+        if (!playing) [self startTransport];
+    } else if (playing) {
+        [self stopTransport];
+    }
+    emitEngineEvent(@"onRemoteCommand", @{ @"command": name, @"playing": @(play) });
+    if (play != playing) emitEngineEvent(@"onTransportChange", @{ @"playing": @(play), @"reason": @"remoteCommand" });
+    return MPRemoteCommandHandlerStatusSuccess;
+}
+
+// Any thread: the transport started or stopped; the Now Playing rate and the session follow.
+- (void)transportPlayStateChanged {
+    if (!sNowPlayingSet.load(std::memory_order_relaxed) && !sSessionExclusive.load(std::memory_order_relaxed)) return;
+    if ([NSThread isMainThread]) {
+        [self updateNowPlayingInfo];
+        [self updateSessionExclusivity];
+        return;
+    }
+    __weak ExpoJuceAudioEngine *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ExpoJuceAudioEngine *strongSelf = weakSelf;
+        [strongSelf updateNowPlayingInfo];
+        [strongSelf updateSessionExclusivity];
+    });
+}
+
+// Main thread.
+- (void)updateNowPlayingInfo {
+    MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+    NSDictionary<NSString *, id> *info = self.nowPlayingInfo;
+    if (info == nil) {
+        center.nowPlayingInfo = nil;
+        return;
+    }
+    const BOOL playing = self.isReady && !self.idleStopped && [self isTransportPlaying];
+    NSMutableDictionary<NSString *, id> *now = [NSMutableDictionary dictionary];
+    now[MPMediaItemPropertyTitle] = info[@"title"];
+    if (info[@"artist"] != nil) now[MPMediaItemPropertyArtist] = info[@"artist"];
+    if (info[@"album"] != nil) now[MPMediaItemPropertyAlbumTitle] = info[@"album"];
+    now[MPNowPlayingInfoPropertyPlaybackRate] = @(playing ? 1.0 : 0.0);
+    now[MPNowPlayingInfoPropertyIsLiveStream] = @YES; // a loop: no duration, no scrubbing
+    now[MPNowPlayingInfoPropertyMediaType] = @(MPNowPlayingInfoMediaTypeAudio);
+    center.nowPlayingInfo = now;
+}
+
+// Main thread: the session mixes with other audio unless Now Playing needs it not to.
+- (void)updateSessionExclusivity {
+    if (!self.isReady || self.idleStopped) return;
+    const bool want = bgpolicy::wantsExclusiveSession(self.nowPlayingInfo != nil, [self isTransportPlaying] == YES,
+                                                      sInBackground.load(std::memory_order_relaxed));
+    if (want == sSessionExclusive.load(std::memory_order_relaxed)) return;
+    sSessionExclusive.store(want, std::memory_order_relaxed);
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSError *categoryError = nil;
+    [session setCategory:AVAudioSessionCategoryPlayback withOptions:[self sessionCategoryOptions] error:&categoryError];
+    if (categoryError) {
+        [self noteRecoveryError:[NSString stringWithFormat:@"session %@: setCategory: %@", want ? @"exclusive" : @"mixable",
+                                 categoryError.localizedDescription]];
+    }
+    if (want) {
+        NSError *activationError = nil;
+        [session setActive:YES error:&activationError];
+        if (activationError) {
+            [self noteRecoveryError:[NSString stringWithFormat:@"session exclusive: setActive: %@",
+                                     activationError.localizedDescription]];
+        }
+    }
 }
 
 // ── Beat events ──

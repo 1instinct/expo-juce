@@ -120,6 +120,18 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (BOOL)isTransportPlaying;
 + (void)setBeatCallback:(ExpoJuceBeatBlock)callback;
 
+// ── Loop sequence, background, Now Playing (0.9.0-rc.5) ─────────
+// See ExpoJuceAudioEngine.h. Any thread.
++ (BOOL)setSequenceData:(const double *_Nullable)data count:(NSInteger)count loopBeats:(double)loopBeats fromBeat:(double)fromBeat endBeat:(double)endBeat NS_SWIFT_NAME(setSequence(data:count:loopBeats:fromBeat:endBeat:));
++ (void)setSequenceMuted:(BOOL)muted NS_SWIFT_NAME(setSequenceMuted(_:));
+// handler runs on a background serial queue. Returns a token, as for the MIDI input handler.
++ (uint64_t)setEngineEventHandler:(void (^)(NSString *name, NSDictionary<NSString *, id> *body))handler NS_SWIFT_NAME(setEngineEventHandler(_:));
++ (void)clearEngineEventHandler:(uint64_t)token NS_SWIFT_NAME(clearEngineEventHandler(_:));
++ (void)setSequenceNotesListening:(BOOL)listening token:(uint64_t)token NS_SWIFT_NAME(setSequenceNotesListening(_:token:));
++ (void)setBackgroundPolicyKeepAlive:(BOOL)keepAlive idleStopSeconds:(double)idleStopSeconds NS_SWIFT_NAME(setBackgroundPolicy(keepAlive:idleStopSeconds:));
++ (BOOL)setNowPlaying:(nullable NSDictionary<NSString *, id> *)info NS_SWIFT_NAME(setNowPlaying(_:));
++ (BOOL)enableRemoteCommands:(NSArray<NSString *> *)commands NS_SWIFT_NAME(enableRemoteCommands(_:));
+
 @end
 
 NS_ASSUME_NONNULL_END

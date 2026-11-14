@@ -58,6 +58,8 @@ Pod::Spec.new do |s|
     "DisplayRate.h",
     "DeviceFormat.h",
     "MidiInput.h",
+    "SequencePlayer.h",
+    "BackgroundPolicy.h",
     "ExpoJuceMidiInput.h", # plain C, but its <stdint.h> include trips check:headers; native callers dlsym it
   ]
 
@@ -66,7 +68,7 @@ Pod::Spec.new do |s|
   s.preserve_paths = ["juce_modules/**"]
 
   s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
-                 'Foundation', 'Accelerate', 'CoreMIDI',
+                 'Foundation', 'Accelerate', 'CoreMIDI', 'MediaPlayer',
                  'CoreGraphics', 'CoreImage', 'CoreText',
                  'QuartzCore', 'UIKit', 'WebKit', 'Metal', 'MetalKit'
   s.weak_frameworks = 'UserNotifications'

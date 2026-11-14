@@ -7,6 +7,12 @@ public class ExpoJuceModule: Module {
   // undo what the new one set up (the bridge ignores a stale token).
   private var midiInputHandlerToken: UInt64 = 0
   private var moduleToken: UInt64 = 0
+  // This instance's engine event handler (sequence notes, remote commands, interruptions, ...).
+  private var engineEventToken: UInt64 = 0
+  // JS listeners of onSequenceNotes (setSequenceNotesListening counts them): the engine builds the
+  // batches only while one listens.
+  private var sequenceNotesListeners = 0
+  private let sequenceNotesLock = NSLock()
 
   // Reads a finite number from an options dictionary passed from JS.
   private static func numberOption(_ options: [String: Any]?, _ key: String) -> Double? {
@@ -37,10 +43,16 @@ public class ExpoJuceModule: Module {
       self.midiInputHandlerToken = ExpoJuceBridge.setMidiInputHandler { [weak self] batch in
         self?.sendEvent("onMidiInput", batch)
       }
+      // Engine events (a background serial queue): onSequenceNotes, onRemoteCommand,
+      // onAudioInterruption, onTransportChange, onBackgroundState.
+      self.engineEventToken = ExpoJuceBridge.setEngineEventHandler { [weak self] name, body in
+        self?.sendEvent(name, body)
+      }
     }
 
     OnDestroy {
       ExpoJuceBridge.clearMidiInputHandler(self.midiInputHandlerToken)
+      ExpoJuceBridge.clearEngineEventHandler(self.engineEventToken)
       // Stops the beat timer and shuts the engine down unless a newer instance owns it.
       ExpoJuceBridge.releaseModule(self.moduleToken)
     }
@@ -49,7 +61,10 @@ public class ExpoJuceModule: Module {
       "PI": Double.pi
     ])
 
-    Events("onChange", "onBeat", "onMidiInput")
+    Events(
+      "onChange", "onBeat", "onMidiInput", "onSequenceNotes", "onRemoteCommand", "onAudioInterruption",
+      "onTransportChange", "onBackgroundState"
+    )
 
     Function("hello") {
       return "Hello world!"
@@ -330,6 +345,54 @@ public class ExpoJuceModule: Module {
 
     Function("isTransportPlaying") { () -> Bool in
       return ExpoJuceBridge.isTransportPlaying()
+    }
+
+    // ── Loop sequence (0.9.0-rc.5) ─────────────────────────────────
+
+    // Lets JS detect a binary with the native sequence player (older binaries lack this function).
+    Function("hasSequencePlayer") { () -> Bool in
+      return true
+    }
+
+    // data: 6 numbers per event (start, length, note, velocity, kind 0 note / 1 drum, skipBefore or
+    // NaN for none); fromBeat / endBeat: -Infinity / Infinity for no bound (JSI passes NaN and the
+    // infinities as numbers). false (nothing changes) for a bad array, over 8192 events or a bad loop.
+    Function("setSequence") { (data: [Double], loopBeats: Double, fromBeat: Double, endBeat: Double) -> Bool in
+      return data.withUnsafeBufferPointer { buffer in
+        ExpoJuceBridge.setSequence(
+          data: buffer.baseAddress, count: buffer.count, loopBeats: loopBeats, fromBeat: fromBeat, endBeat: endBeat)
+      }
+    }
+
+    Function("setSequenceMuted") { (muted: Bool) in
+      ExpoJuceBridge.setSequenceMuted(muted)
+    }
+
+    // Counted: onSequenceNotes batches are built while at least one JS listener asks for them.
+    Function("setSequenceNotesListening") { (listening: Bool) in
+      self.sequenceNotesLock.lock()
+      self.sequenceNotesListeners = max(0, self.sequenceNotesListeners + (listening ? 1 : -1))
+      let on = self.sequenceNotesListeners > 0
+      self.sequenceNotesLock.unlock()
+      ExpoJuceBridge.setSequenceNotesListening(on, token: self.engineEventToken)
+    }
+
+    // ── Background, Now Playing, remote commands (0.9.0-rc.5) ───────
+
+    // options: { keepAlive?: boolean (default true); idleStopSeconds?: number (default 30) }.
+    Function("setBackgroundPolicy") { (options: [String: Any]?) in
+      let keepAlive = (options?["keepAlive"] as? Bool) ?? true
+      let idle = ExpoJuceModule.numberOption(options, "idleStopSeconds") ?? 30
+      ExpoJuceBridge.setBackgroundPolicy(keepAlive: keepAlive, idleStopSeconds: idle)
+    }
+
+    // info: { title: string; artist?: string; album?: string } or null to clear.
+    Function("setNowPlaying") { (info: [String: Any]?) -> Bool in
+      return ExpoJuceBridge.setNowPlaying(info)
+    }
+
+    Function("enableRemoteCommands") { (commands: [String]) -> Bool in
+      return ExpoJuceBridge.enableRemoteCommands(commands)
     }
 
     // ── Async / View ───────────────────────────────────────────────

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.9.0-rc.5
+
+### Added (iOS)
+
+- **Native loop sequence player.** `setSequence({ loopBeats, events, muted?, fromBeat?, endBeat? })`
+  hands the engine a loop of up to 8192 note and drum events (`{ kind, note, velocity, start,
+  length, skipBefore? }`). The audio thread fires each one at its exact sample against the
+  transport, wrapping at the loop end, so the loop keeps time with the JS thread busy or suspended.
+  The sequence is copied, checked and sorted off the audio thread and swapped in whole (two slots,
+  no lock and no allocation on the audio thread). Jumps, stop, a new loop length, `allNotesOff`
+  and muting release every note it started; a new sequence keeps the notes that are still in it and
+  releases the rest. Notes share holds with pads and the MIDI input: a pad holding a note the
+  sequence also plays is not cut by the sequence's note-off, and the other way round. With the
+  arpeggiator on, sequence notes go through it (as notes played from JS did). `setSequenceMuted`,
+  `clearSequence`, `hasSequencePlayer()`.
+- `addSequenceNotesListener`: the notes the sequence plays (`{ note, kind, on, atBeat }`) in
+  batches about every 16 ms, built only while a listener is set.
+- **Background playback policy.** `setBackgroundPolicy({ keepAlive, idleStopSeconds })`: with
+  keepAlive the engine keeps playing in the background while it has something to play; without it,
+  leaving the app stops the transport and releases every note. Idle in the background for
+  `idleStopSeconds` (default 30), the engine closes its audio device and deactivates the session so
+  iOS can suspend the app; coming back restarts it. A note-on, a MIDI note-on or a transport start
+  while idle-stopped restarts the device (best effort from the background; the first note is lost).
+  Apps that never call it keep the old behaviour.
+- **Now Playing and remote commands.** `setNowPlaying({ title, artist?, album? })` and
+  `enableRemoteCommands(['play', 'pause', 'togglePlayPause'])`: lock screen and Control Center
+  commands start and stop the native transport directly and emit `onRemoteCommand`. While Now
+  Playing is set and the transport plays (or the app is in the background), the session is not
+  mixable, which iOS requires to show it: other apps' audio pauses.
+- **Interruptions** (a call, Siri) stop the transport and release every note, with no automatic
+  resume; `onAudioInterruption` (`began` / `ended`) and `onTransportChange` tell the app.
+  `onTransportChange` also reports remote commands and the keepAlive-off background stop;
+  `onBackgroundState` reports `foreground` / `background` / `idleStopped`.
+- Diagnostics: `sequence` (`events, loopBeats, playing, muted, activeNotes, notesFired, lateFires,
+  dropped, version, listening, notesLost`), `backgroundState`, `idleStopAt`, `backgroundPolicy`,
+  `idleStops`, `lastIdleStopAt`, `backgroundStartError`, `nowPlaying`.
+- Harness cases `seq`, `seqv` and `bg`.
+- The podspec links `MediaPlayer`.
+
+### Changed (iOS)
+
+- A note retrigger cuts the previous voice of the same note only within the same source group:
+  a sequence note does not cut a pad's or the arpeggiator's voice of that note, nor they a sequence
+  note's. The arpeggiator's note-offs release only arpeggiator voices.
+- A module created (launch, reload) clears the old runtime's sequence, background policy, Now
+  Playing info and remote commands, as does the owning module going away.
+
+### Compatibility
+
+- New entry points, events and optional diagnostics keys. Android and web: `hasSequencePlayer()`
+  is false and the new setters return false; play the loop from JS there.
+- Lock-screen playback needs the host app's `audio` background mode (`UIBackgroundModes`).
+
 ## 0.9.0-rc.4
 
 ### Added (iOS)
