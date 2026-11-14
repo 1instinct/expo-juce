@@ -133,4 +133,24 @@
     [[ExpoJuceAudioEngine sharedInstance] setBeatCallback:callback];
 }
 
+// ── Loop sequence, background, Now Playing ──
++ (BOOL)setSequenceData:(const double *)data count:(NSInteger)count loopBeats:(double)loopBeats fromBeat:(double)fromBeat endBeat:(double)endBeat {
+    return [[ExpoJuceAudioEngine sharedInstance] setSequenceData:data count:count loopBeats:loopBeats fromBeat:fromBeat endBeat:endBeat];
+}
++ (void)setSequenceMuted:(BOOL)muted { [[ExpoJuceAudioEngine sharedInstance] setSequenceMuted:muted]; }
++ (uint64_t)setEngineEventHandler:(void (^)(NSString *, NSDictionary<NSString *, id> *))handler {
+    return [[ExpoJuceAudioEngine sharedInstance] setEngineEventHandler:handler];
+}
++ (void)clearEngineEventHandler:(uint64_t)token { [[ExpoJuceAudioEngine sharedInstance] clearEngineEventHandler:token]; }
++ (void)setSequenceNotesListening:(BOOL)listening token:(uint64_t)token {
+    [[ExpoJuceAudioEngine sharedInstance] setSequenceNotesListening:listening token:token];
+}
++ (void)setBackgroundPolicyKeepAlive:(BOOL)keepAlive idleStopSeconds:(double)idleStopSeconds {
+    [[ExpoJuceAudioEngine sharedInstance] setBackgroundPolicyKeepAlive:keepAlive idleStopSeconds:idleStopSeconds];
+}
++ (BOOL)setNowPlaying:(NSDictionary<NSString *, id> *)info { return [[ExpoJuceAudioEngine sharedInstance] setNowPlaying:info]; }
++ (BOOL)enableRemoteCommands:(NSArray<NSString *> *)commands {
+    return [[ExpoJuceAudioEngine sharedInstance] enableRemoteCommands:commands];
+}
+
 @end

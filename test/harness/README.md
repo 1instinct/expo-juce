@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, seq, seqv, bg)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -165,6 +165,24 @@ Exit code non-zero on any failure.
   note-ons never play, and the engine's own note-on marking before its push and restoring the mark
   when the push failed. `own` (`ios/OwnerToken.h`: a module destroyed after its replacement was
   created releases nothing of the new one's; racing claims stay consistent).
+- Loop sequence and background policy (0.9.0-rc.5): `seq` (`ios/SequencePlayer.h` alone: every
+  note-on and note-off at its exact sample over odd block sizes and the loop wrap, a tempo change
+  mid-loop, jumps / stop / start releasing what it holds, a new sequence keeping the notes still in
+  it and releasing the rest, a loop-length change, mute / clear, `fromBeat` / `endBeat` /
+  `skipBefore`, overlapping same-pitch events counted, store limits and sanitising, 3000 swaps
+  against the audio thread that must only ever see a whole sequence, a block too full for its
+  starts (128 notes and 400 drum hits in one 4096-sample block) still releasing every note, loops
+  under 1/64 beat refused and the pass walk bounded (91000 passes in a block, beats past 2^53),
+  no allocation in `process`),
+  `seqv` (through `PolySynthProcessor`: a note's onset at its sample, a drum hit's onset, a pad
+  holding a note the sequence also plays and the other way round, `allNotesOff` and stop releasing
+  sequence notes, sequence notes feeding the arpeggiator, a pad and the sequence holding the same
+  pitch in the arpeggiator without releasing each other, latch ignored for notes only the sequence
+  held, no allocation in the render), `bg`
+  (`ios/BackgroundPolicy.h`: idle timer, busy activity pushing the stop back, keepAlive off pausing,
+  restart on foreground and after a remote play, the exclusive-session rule: never on entering the
+  background stopped, kept after a lock-screen pause, never flipped by Play in the foreground).
+  `mih` also checks the sink's refused hook (how a MIDI note wakes the engine from its idle stop).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

@@ -369,12 +369,15 @@ public:
 };
 
 // The engine's sink: the process-lifetime NoteEventQueue, accepting note-ons only while
-// `accepting` is true (nullptr = always). Arrival seconds are on the juce::Time high-resolution
+// `accepting` is true (nullptr = always). A refused note-on or drum hit calls `refused` (if set;
+// the engine wakes from its background idle stop there; any thread, must be cheap and must not
+// call back into the input). Arrival seconds are on the juce::Time high-resolution
 // clock (mach_absolute_time on Apple = CACurrentMediaTime()); the queue records them for the
 // arrival → render latency leg.
 class NoteQueueSink : public MidiInputSink {
 public:
-    NoteQueueSink(NoteEventQueue& q, const std::atomic<bool>* acceptingFlag) : queue(q), accepting(acceptingFlag) {}
+    NoteQueueSink(NoteEventQueue& q, const std::atomic<bool>* acceptingFlag, void (*refusedHook)() = nullptr)
+        : queue(q), accepting(acceptingFlag), refused(refusedHook) {}
 
     static juce::int64 ticksFor(double seconds) {
         return seconds > 0.0 ? juce::Time::secondsToHighResolutionTicks(seconds) : (juce::int64)0;
@@ -384,19 +387,25 @@ public:
     }
 
     bool noteOn(int note, int velocity, double arrivalSeconds) override {
-        if (accepting && !accepting->load(std::memory_order_acquire)) return false;
+        if (accepting && !accepting->load(std::memory_order_acquire)) return refuse();
         return queue.pushNoteOn(note, velocity, 0, 0, ticksFor(arrivalSeconds));
     }
     bool drumHit(int voice, int velocity, double arrivalSeconds) override {
-        if (accepting && !accepting->load(std::memory_order_acquire)) return false;
+        if (accepting && !accepting->load(std::memory_order_acquire)) return refuse();
         return queue.pushDrumHit(voice, velocity, 0, 0, ticksFor(arrivalSeconds));
     }
     void noteOff(int note) override { queue.pushNoteOff(note); }
     void allNotesOff() override { queue.pushAllNotesOff(); }
 
 private:
+    bool refuse() {
+        if (refused != nullptr) refused();
+        return false;
+    }
+
     NoteEventQueue& queue;
     const std::atomic<bool>* accepting;
+    void (*refused)();
 };
 
 // ── Events for the app ───────────────────────────────────────────

@@ -21,6 +21,8 @@
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
 #include "OwnerToken.h"
+#include "SequencePlayer.h"
+#include "BackgroundPolicy.h"
 
 #include <atomic>
 #include <chrono>
@@ -29,6 +31,8 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
+#include <tuple>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -4599,7 +4603,9 @@ static bool runMidiHolds() {
     {
         NoteEventQueue queue;
         std::atomic<bool> accepting{false};
-        midiin::NoteQueueSink qsink(queue, &accepting);
+        static std::atomic<int> refusedCalls{0};
+        refusedCalls.store(0);
+        midiin::NoteQueueSink qsink(queue, &accepting, [] { refusedCalls.fetch_add(1); });
         midiin::MidiInput input(qsink);
         identityMap(a, v);
         a[36] = 60;
@@ -4630,6 +4636,7 @@ static bool runMidiHolds() {
         const Bytes n1 = on(36, 100);
         const int parsedNotReady = input.input(n1.data(), n1.size(), midiin::kFormatBleMidi, 0.0);
         check(parsedNotReady == 1 && input.stats().dropped == 1 && queue.notesQueued.load() == 0, "not accepting: dropped, not queued");
+        check(refusedCalls.load() == 1, "not accepting: the refused hook ran (the engine wakes from its idle stop)");
         accepting.store(true);
         const double arrival = midiin::NoteQueueSink::nowSeconds() - 0.005; // arrived 5 ms ago
         input.input(n1.data(), n1.size(), midiin::kFormatBleMidi, arrival);
@@ -4804,6 +4811,643 @@ static bool runMidiEntry() {
     return pass;
 }
 
+//==============================================================================
+// Loop sequence player (ios/SequencePlayer.h, 0.9.0-rc.5), driven like PolySynthProcessor drives
+// it: the transport advances a block, then the player runs with the block's start beat / bpm /
+// play state / seek flag, and its outputs are recorded at absolute sample positions.
+struct SeqRec { int64_t at; int note; bool on; bool drum; double beat; };
+
+struct SeqRig {
+    double sr = 48000.0;
+    TransportEngine transport;
+    std::unique_ptr<seqplay::SequenceStore> store = std::make_unique<seqplay::SequenceStore>();
+    seqplay::SequencePlayer player;
+    std::vector<SeqRec> out;
+    int64_t clock = 0;
+    uint64_t allocs = 0;
+    SeqRig() { player.setStore(store.get()); out.reserve(200000); }
+
+    // Renders `total` samples in blocks cycling through `blocks`; before(clock) runs before each.
+    void run(int64_t total, const std::vector<int>& blocks, const std::function<void(int64_t)>& before = {}) {
+        size_t bi = 0;
+        for (int64_t done = 0; done < total;) {
+            const int n = (int)std::min<int64_t>(blocks[bi++ % blocks.size()], total - done);
+            if (before) before(clock);
+            gRenderAllocs.store(0); gRenderFrees.store(0);
+            tCountAllocs = true;
+            transport.advanceBlock(n, sr);
+            player.process(transport.getBlockStartBeat(), transport.getBlockBpm(), transport.isBlockPlaying(),
+                           transport.wasBlockSeeked(), sr, n, [&](const seqplay::Output& o) {
+                               out.push_back({clock + o.offset, o.note, o.on, o.kind == seqplay::EventKind::Drum, o.atBeat});
+                           });
+            tCountAllocs = false;
+            allocs += gRenderAllocs.load() + gRenderFrees.load();
+            clock += n;
+            done += n;
+        }
+    }
+};
+
+static seqplay::Event seqNote(double start, double length, int note, int velocity = 100) {
+    seqplay::Event e;
+    e.start = start; e.length = length; e.note = (uint8_t)note; e.velocity = (uint8_t)velocity;
+    e.kind = seqplay::EventKind::Note;
+    return e;
+}
+static seqplay::Event seqDrum(double start, int voice, int velocity = 100) {
+    seqplay::Event e;
+    e.start = start; e.length = 0.0; e.note = (uint8_t)voice; e.velocity = (uint8_t)velocity;
+    e.kind = seqplay::EventKind::Drum;
+    return e;
+}
+// First sample at or after beat t at a constant tempo from beat 0 at sample 0.
+static int64_t seqSampleOf(double t, double samplesPerBeat) {
+    return (int64_t)std::ceil(t * samplesPerBeat - 1.0e-6);
+}
+
+static bool runSequence() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failed; detail += " [" + what + "]"; } };
+    uint64_t allocs = 0;
+    const std::vector<int> odd = {471, 128, 1024, 333, 64, 97};
+
+    // 1. Exact sample offsets across odd block sizes and the loop wrap: 120 bpm, 48 kHz (24000
+    //    samples a beat), a 4-beat loop, three passes. Events on integer samples, between samples,
+    //    on the loop's first and last sample, a note across the loop end and a drum hit.
+    {
+        SeqRig rig;
+        const double spb = 24000.0, L = 4.0;
+        std::vector<seqplay::Event> ev = {
+            seqNote(0.0, 0.5, 60), seqNote(0.25, 0.25, 62), seqNote(1.0 / 3.0, 0.1, 64), seqNote(1.0, 1.0, 65),
+            seqNote(3.99, 0.5, 67), seqNote(4.0 - 1.0 / 24000.0, 0.0001, 69), seqDrum(2.0, 0), seqDrum(2.5 + 1e-5, 3),
+        };
+        check(rig.store->set(ev.data(), (int)ev.size(), L).ok, "set");
+        rig.transport.start();
+        rig.run((int64_t)(3 * L * spb), odd);
+        allocs += rig.allocs;
+        // Expected: every event once per pass, on at its sample, off at start + length.
+        std::vector<SeqRec> want;
+        for (int pass = 0; pass < 3; ++pass) {
+            for (const auto& e : ev) {
+                const double t = pass * L + e.start;
+                want.push_back({seqSampleOf(t, spb), e.note, true, e.kind == seqplay::EventKind::Drum, t});
+                if (e.kind == seqplay::EventKind::Note && t + e.length < 3 * L)
+                    want.push_back({seqSampleOf(t + e.length, spb), e.note, false, false, t + e.length});
+            }
+        }
+        auto key = [](const SeqRec& r) { return std::make_tuple(r.at, r.on ? 1 : 0, r.note, r.drum ? 1 : 0); };
+        std::sort(want.begin(), want.end(), [&](const SeqRec& a, const SeqRec& b) { return key(a) < key(b); });
+        std::vector<SeqRec> got = rig.out;
+        std::sort(got.begin(), got.end(), [&](const SeqRec& a, const SeqRec& b) { return key(a) < key(b); });
+        // The 0.0001-beat note (2.4 samples) at the loop's last sample: its release comes in the
+        // block after its start when the start is a block's last sample, so compare its off loosely.
+        int mismatches = 0;
+        std::string first;
+        const size_t n = std::min(want.size(), got.size());
+        for (size_t i = 0; i < n; ++i) {
+            const bool loose = !want[i].on && want[i].note == 69;
+            const bool same = got[i].on == want[i].on && got[i].note == want[i].note && got[i].drum == want[i].drum
+                && (loose ? std::llabs(got[i].at - want[i].at) <= 1 : got[i].at == want[i].at);
+            if (!same && mismatches++ == 0)
+                first = "want " + std::to_string(want[i].at) + (want[i].on ? " on " : " off ") + std::to_string(want[i].note)
+                    + " got " + std::to_string(got[i].at) + (got[i].on ? " on " : " off ") + std::to_string(got[i].note);
+        }
+        check(want.size() == got.size(), "count want " + std::to_string(want.size()) + " got " + std::to_string(got.size()));
+        check(mismatches == 0, "exact offsets: " + std::to_string(mismatches) + " differ, first " + first);
+        check(rig.store->notesFired.load() == 3 * ev.size() && rig.store->lateFires.load() == 0, "fired / late");
+        detail += " exact " + std::to_string(got.size()) + " events";
+    }
+
+    // 2. Tempo change mid-loop (120 -> 90 -> 173 bpm at block starts): every event still fires once
+    //    per pass, in order, on the first sample at or after its beat by the transport's own beats.
+    {
+        SeqRig rig;
+        std::vector<seqplay::Event> ev;
+        for (int k = 0; k < 16; ++k) ev.push_back(seqNote(k * 0.25, 0.125, 48 + k));
+        rig.store->set(ev.data(), (int)ev.size(), 4.0);
+        rig.transport.start();
+        std::vector<std::pair<int64_t, double>> blockStarts; // (sample, beat) at each block start
+        std::vector<double> blockBps;
+        rig.run(48000 * 9, odd, [&](int64_t at) {
+            if (at >= 48000 * 3 && rig.transport.getTempo() == 120.0) rig.transport.setTempo(90.0);
+            if (at >= 48000 * 6 && rig.transport.getTempo() == 90.0) rig.transport.setTempo(173.0);
+            blockStarts.push_back({at, rig.transport.getPosition()});
+            blockBps.push_back(rig.transport.getTempo() / (60.0 * 48000.0));
+        });
+        allocs += rig.allocs;
+        int wrong = 0, ons = 0;
+        double lastBeat = -1.0;
+        for (const SeqRec& r : rig.out) {
+            if (!r.on) continue;
+            ++ons;
+            if (r.beat <= lastBeat) ++wrong;
+            lastBeat = r.beat;
+            // The block holding r.at, and the first sample at or after r.beat in it.
+            size_t b = 0;
+            while (b + 1 < blockStarts.size() && blockStarts[b + 1].first <= r.at) ++b;
+            const int64_t expect = blockStarts[b].first
+                + (int64_t)std::max(0.0, std::ceil((r.beat - blockStarts[b].second) / blockBps[b] - 1e-6));
+            if (expect != r.at) ++wrong;
+        }
+        const double endBeat = rig.transport.getPosition();
+        const int expectOns = (int)std::floor(endBeat / 0.25 - 1e-9) + 1;
+        check(wrong == 0 && ons == expectOns, "tempo change: " + std::to_string(wrong) + " wrong, ons " + std::to_string(ons)
+              + " want " + std::to_string(expectOns));
+        check(rig.player.activeNoteCount() <= 1, "tempo: notes left");
+    }
+
+    // 3. A jump releases everything at once and the loop goes on from the new position; a stop
+    //    releases everything; a start plays an event on the start beat at once.
+    {
+        SeqRig rig;
+        std::vector<seqplay::Event> ev = { seqNote(0.0, 3.0, 60), seqNote(1.0, 2.5, 64), seqNote(2.0, 0.5, 67) };
+        rig.store->set(ev.data(), (int)ev.size(), 4.0);
+        rig.transport.start();
+        rig.run(24000 * 1.5, {256}); // 60 and 64 sounding
+        check(rig.player.activeNoteCount() == 2, "two sounding before the jump");
+        const int64_t jumpAt = rig.clock;
+        rig.transport.setPosition(2.0); // the next block
+        rig.run(256, {256});
+        int offsAtJump = 0, onsAtJump = 0;
+        for (const SeqRec& r : rig.out) {
+            if (r.at == jumpAt && !r.on) ++offsAtJump;
+            if (r.at == jumpAt && r.on && r.note == 67) ++onsAtJump;
+        }
+        check(offsAtJump == 2 && onsAtJump == 1, "jump: offs " + std::to_string(offsAtJump) + " on " + std::to_string(onsAtJump));
+        rig.run(24000, {256});
+        rig.transport.stop();
+        rig.run(512, {256});
+        check(rig.player.activeNoteCount() == 0, "stop releases");
+        int ons = 0, offs = 0;
+        for (const SeqRec& r : rig.out) (r.on ? ons : offs)++;
+        check(ons == offs, "every on has its off (" + std::to_string(ons) + "/" + std::to_string(offs) + ")");
+        // Start from beat 1.0 exactly: 64 plays on the first sample.
+        rig.out.clear();
+        rig.transport.setPosition(1.0);
+        rig.transport.start();
+        const int64_t startAt = rig.clock;
+        rig.run(256, {256});
+        check(!rig.out.empty() && rig.out[0].on && rig.out[0].note == 64 && rig.out[0].at == startAt, "start on the beat");
+        allocs += rig.allocs;
+    }
+
+    // 4. A new sequence while notes sound: a note whose event is gone is released at once; one whose
+    //    event stays keeps sounding with the new length; a loop-length change releases everything.
+    {
+        SeqRig rig;
+        std::vector<seqplay::Event> ev = { seqNote(0.0, 3.0, 60), seqNote(0.0, 3.0, 64) };
+        rig.store->set(ev.data(), (int)ev.size(), 4.0);
+        rig.transport.start();
+        rig.run(24000, {128}); // beat 1: both sounding
+        std::vector<seqplay::Event> next = { seqNote(0.0, 1.5, 60), seqNote(2.0, 1.0, 72) };
+        rig.store->set(next.data(), (int)next.size(), 4.0);
+        const int64_t swapAt = rig.clock;
+        rig.run(24000, {128});
+        bool off64 = false, early60 = false, off60 = false;
+        for (const SeqRec& r : rig.out) {
+            if (!r.on && r.note == 64 && r.at == swapAt) off64 = true;
+            if (!r.on && r.note == 60 && r.at < 36000) early60 = true;
+            if (!r.on && r.note == 60 && r.at == 36000) off60 = true;
+        }
+        check(off64 && !early60 && off60, "swap: removed note released, kept note ends at its new length");
+        rig.run(12000, {128}); // beat 2.5: 72 sounding (60 ended at 1.5)
+        check(rig.player.activeNoteCount() == 1, "72 sounding");
+        std::vector<seqplay::Event> longer = { seqNote(2.0, 1.0, 72) };
+        rig.store->set(longer.data(), 1, 8.0);
+        const int64_t loopAt = rig.clock;
+        rig.run(128, {128});
+        bool off72 = false;
+        for (const SeqRec& r : rig.out) if (!r.on && r.note == 72 && r.at == loopAt) off72 = true;
+        check(off72 && rig.player.activeNoteCount() == 0, "loop length change releases");
+        allocs += rig.allocs;
+    }
+
+    // 5. Mute releases and plays nothing; unmute plays the next event. Clearing releases.
+    {
+        SeqRig rig;
+        std::vector<seqplay::Event> ev = { seqNote(0.0, 0.75, 60), seqNote(1.0, 0.75, 62) };
+        rig.store->set(ev.data(), 2, 2.0);
+        rig.transport.start();
+        rig.run(6000, {128});
+        rig.store->setMuted(true);
+        const int64_t muteAt = rig.clock;
+        rig.run(48000, {128});
+        bool offAtMute = false;
+        int onsMuted = 0;
+        for (const SeqRec& r : rig.out) {
+            if (!r.on && r.note == 60 && r.at == muteAt) offAtMute = true;
+            if (r.on && r.at > muteAt) ++onsMuted;
+        }
+        check(offAtMute && onsMuted == 0, "mute");
+        rig.store->setMuted(false);
+        rig.run(48000, {128});
+        int onsAfter = 0;
+        for (const SeqRec& r : rig.out) if (r.on && r.at > muteAt) ++onsAfter;
+        check(onsAfter == 2, "unmute plays the next events (" + std::to_string(onsAfter) + ")");
+        rig.run(6000, {128}); // 60 sounding again
+        rig.store->clear();
+        rig.run(128, {128});
+        check(rig.player.activeNoteCount() == 0, "clear releases");
+        allocs += rig.allocs;
+    }
+
+    // 6. Count-in and a single pass: nothing before fromBeat (the loop's tail must not play under
+    //    the count), nothing at or after endBeat; skipBefore skips one pass; the engine's
+    //    allNotesOff releases.
+    {
+        SeqRig rig;
+        std::vector<seqplay::Event> ev = { seqNote(0.0, 0.5, 60), seqNote(3.0, 0.5, 63) };
+        ev[0].skipBefore = 4.0; // already sounded in pass 0
+        rig.store->set(ev.data(), 2, 4.0, 0.0, 8.0);
+        rig.transport.setPosition(-4.0);
+        rig.transport.start();
+        rig.run(24000 * 14, {333});
+        std::vector<double> beats;
+        for (const SeqRec& r : rig.out) if (r.on) beats.push_back(r.beat);
+        check(beats == std::vector<double>({3.0, 4.0, 7.0}), "fromBeat / endBeat / skipBefore: got " + std::to_string(beats.size()));
+        SeqRig held;
+        std::vector<seqplay::Event> one = { seqNote(0.0, 2.0, 60) };
+        held.store->set(one.data(), 1, 4.0);
+        held.transport.start();
+        held.run(1000, {128});
+        held.player.requestReleaseAll();
+        held.run(128, {128});
+        check(held.player.activeNoteCount() == 0 && !held.out.back().on, "allNotesOff releases");
+        allocs += rig.allocs + held.allocs;
+    }
+
+    // 7. Overlapping instances of one pitch: the release goes out once, when the last one ends.
+    {
+        SeqRig rig;
+        std::vector<seqplay::Event> ev = { seqNote(0.0, 2.0, 60), seqNote(1.0, 2.0, 60) };
+        rig.store->set(ev.data(), 2, 4.0);
+        rig.transport.start();
+        rig.run(24000 * 4 - 1000, {256});
+        std::vector<std::pair<int64_t, bool>> seen;
+        for (const SeqRec& r : rig.out) seen.push_back({r.at, r.on});
+        const std::vector<std::pair<int64_t, bool>> want = {{0, true}, {24000, true}, {72000, false}};
+        check(seen == want, "overlap: " + std::to_string(seen.size()) + " outputs");
+        allocs += rig.allocs;
+    }
+
+    // 8. The store: limits, sanitising, sorting.
+    {
+        auto store = std::make_unique<seqplay::SequenceStore>();
+        std::vector<seqplay::Event> big((size_t)seqplay::kMaxEvents + 1, seqNote(0.0, 1.0, 60));
+        check(!store->set(big.data(), (int)big.size(), 4.0).ok, "over the cap refused");
+        big.pop_back();
+        check(store->set(big.data(), (int)big.size(), 4.0).accepted == seqplay::kMaxEvents, "the cap itself");
+        std::vector<seqplay::Event> mixed = { seqNote(3.0, 1.0, 60), seqNote(-0.1, 1.0, 60), seqNote(4.0, 1.0, 60),
+                                              seqNote(1.0, 0.0, 60), seqNote(1.0, NAN, 60), seqDrum(1.0, 9),
+                                              seqNote(0.5, 1.0, 200), seqDrum(2.0, 8), seqNote(1.0, 1.0, 61, 0) };
+        const seqplay::SetResult r = store->set(mixed.data(), (int)mixed.size(), 4.0);
+        check(r.ok && r.accepted == 3 && r.dropped == 6, "sanitise: accepted " + std::to_string(r.accepted));
+        const seqplay::Sequence* s = store->acquire();
+        check(s && s->count == 3 && s->events[0].start == 1.0 && s->events[0].velocity == 1 && s->events[1].start == 2.0
+              && s->events[2].start == 3.0, "sorted, velocity clamped");
+        store->release();
+        check(!store->set(mixed.data(), 1, 0.0).ok && !store->set(mixed.data(), 1, NAN).ok, "bad loop length");
+        check(store->clear() && store->eventCount() == 0, "clear");
+    }
+
+    // 9. Writers racing the audio thread: 3000 swaps against a reader that must only ever see a
+    //    whole sequence (every event of a version carries that version's note and count).
+    {
+        auto store = std::make_unique<seqplay::SequenceStore>();
+        std::atomic<bool> stop{false};
+        std::atomic<int> torn{0}, reads{0};
+        std::thread reader([&] {
+            while (!stop.load()) {
+                const seqplay::Sequence* s = store->acquire();
+                if (s) {
+                    const int expectNote = (int)(s->version % 100);
+                    const int expectCount = 1 + (int)(s->version % 50);
+                    if (s->count != expectCount) torn.fetch_add(1);
+                    for (int i = 0; i < s->count; ++i) if (s->events[i].note != expectNote) { torn.fetch_add(1); break; }
+                    reads.fetch_add(1);
+                }
+                store->release();
+            }
+        });
+        std::vector<seqplay::Event> ev;
+        for (uint64_t v = 1; v <= 3000; ++v) {
+            ev.assign((size_t)(1 + v % 50), seqNote(0.0, 1.0, (int)(v % 100)));
+            for (size_t i = 0; i < ev.size(); ++i) ev[i].start = 0.01 * (double)i;
+            if (!store->set(ev.data(), (int)ev.size(), 4.0).ok) torn.fetch_add(1000);
+        }
+        stop.store(true);
+        reader.join();
+        check(torn.load() == 0 && reads.load() > 0, "swaps: torn " + std::to_string(torn.load()));
+    }
+
+    // 10. A block too full for its starts never loses a release: 128 notes at beat 0 (length 0.1)
+    //     and 400 drum hits at 0.05–0.09, 4096-sample blocks. Every note-on gets its note-off.
+    {
+        auto store = std::make_unique<seqplay::SequenceStore>();
+        std::vector<seqplay::Event> ev;
+        for (int n = 0; n < 128; ++n) ev.push_back(seqNote(0.0, 0.1, n));
+        for (int i = 0; i < 400; ++i) ev.push_back(seqDrum(0.05 + 0.04 * i / 400.0, i % 9));
+        check(store->set(ev.data(), (int)ev.size(), 4.0).ok, "full block: set");
+        auto player = std::make_unique<seqplay::SequencePlayer>();
+        player->setStore(store.get());
+        int ons[128] = {0}, offs[128] = {0};
+        auto sink = [&](const seqplay::Output& o) { if (o.kind == seqplay::EventKind::Note) (o.on ? ons : offs)[o.note]++; };
+        const int N = 4096;
+        double beat = 0.0;
+        for (int b = 0; b < 4; ++b) {
+            player->process(beat, 120.0, true, false, 48000.0, N, sink);
+            beat += N * 120.0 / 60.0 / 48000.0;
+        }
+        int stuck = 0, started = 0;
+        for (int n = 0; n < 128; ++n) { started += ons[n]; stuck += ons[n] != offs[n] ? 1 : 0; }
+        check(stuck == 0 && started > 0 && player->activeNoteCount() == 0,
+              "full block: " + std::to_string(stuck) + " notes without a note-off");
+        player->process(beat, 120.0, false, false, 48000.0, N, sink);
+        check(player->activeNoteCount() == 0, "full block: nothing held after stop");
+    }
+
+    // 11. Bounded work: loops under 1/64 beat are refused; a block spanning thousands of passes
+    //     (or a transport far past 2^53 passes) walks at most kMaxPassesPerBlock of them.
+    {
+        auto store = std::make_unique<seqplay::SequenceStore>();
+        seqplay::Event e = seqNote(0.0, 1e-10, 60);
+        check(!store->set(&e, 1, 1e-9).ok && !store->set(&e, 1, seqplay::kMinLoopBeats * 0.5).ok, "tiny loop refused");
+        check(store->set(&e, 1, seqplay::kMinLoopBeats).ok, "1/64 loop taken");
+        e.skipBefore = 1e300; // every firing skipped: only the pass walk costs
+        check(store->set(&e, 1, seqplay::kMinLoopBeats).ok, "1/64 loop, skipped");
+        auto player = std::make_unique<seqplay::SequencePlayer>();
+        player->setStore(store.get());
+        auto sink = [&](const seqplay::Output&) {};
+        const auto t0 = std::chrono::steady_clock::now();
+        // 1e6 bpm: one 4096-sample block is 1422 beats = 91000 passes.
+        player->process(0.0, 1.0e6, true, false, 48000.0, 4096, sink);
+        player->process(1422.2, 1.0e6, true, false, 48000.0, 4096, sink);
+        // Past 2^53 passes: pass + 1.0 no longer moves.
+        player->process(1.0e17, 120.0, true, true, 48000.0, 4096, sink);
+        player->process(1.0e17 + 0.17, 120.0, true, false, 48000.0, 4096, sink);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        check(ms < 50.0, "pass walk bounded (" + std::to_string(ms) + " ms)");
+    }
+
+    check(allocs == 0, "allocations " + std::to_string(allocs));
+    const bool pass = failed == 0;
+    std::printf("seq   sequence player: exact offsets, wrap, tempo, jump, swap, mute, count-in, overlap, store  %-4s"
+                " %d failed checks%s\n", pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// Through PolySynthProcessor: a sequence note sounds from its sample, a drum hit starts on its
+// sample, the player's held note and the sequence's note of the same pitch never cut each other,
+// the engine's allNotesOff and a stop end the sequence's voices, and with the arpeggiator on the
+// sequence's notes feed it. No allocation.
+static bool runSequenceVoices() {
+    const double sr = 48000.0;
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failed; detail += " [" + what + "]"; } };
+    struct Rig {
+        TransportEngine transport;
+        PolySynthProcessor synth;
+        std::unique_ptr<seqplay::SequenceStore> store = std::make_unique<seqplay::SequenceStore>();
+        seqplay::NoteLog log;
+        Rig(double sr) {
+            synth.setTransport(&transport);
+            synth.setRateAndBufferSizeDetails(sr, 512);
+            synth.prepareToPlay(sr, 512);
+            synth.setWaveform(Waveform::Square);
+            synth.setAttack(1.0);
+            synth.setRelease(1.0);
+            synth.setMasterLevel(0.5);
+            synth.setSequenceStore(store.get());
+            synth.setSequenceNoteLog(&log);
+        }
+    };
+    uint64_t allocs = 0;
+    auto render = [&](Rig& rig, int total, std::vector<float>& out, int block = 471,
+                      const std::function<void(int)>& before = {}) {
+        juce::AudioBuffer<float> buf(2, 1024);
+        juce::MidiBuffer midi;
+        out.assign((size_t)total, 0.0f);
+        for (int done = 0; done < total;) {
+            const int n = std::min(block, total - done);
+            if (before) before(done);
+            buf.setSize(2, n, false, false, true);
+            gRenderAllocs.store(0); gRenderFrees.store(0);
+            tCountAllocs = true;
+            rig.synth.processBlock(buf, midi);
+            tCountAllocs = false;
+            allocs += gRenderAllocs.load() + gRenderFrees.load();
+            std::memcpy(&out[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+            done += n;
+        }
+    };
+    auto firstAbove = [](const std::vector<float>& x, int from, float level) {
+        for (int i = from; i < (int)x.size(); ++i) if (std::fabs(x[(size_t)i]) > level) return i;
+        return -1;
+    };
+    // 1. Onsets: a note at beat 0.3 (sample 7200), a drum hit at beat 0.7 (16800); 471-sample blocks.
+    {
+        Rig rig(sr);
+        std::vector<seqplay::Event> ev = { seqNote(0.3, 0.2, 69, 127) };
+        rig.store->set(ev.data(), 1, 4.0);
+        rig.transport.start();
+        rig.log.listening.store(true);
+        std::vector<float> out;
+        render(rig, 14400, out);
+        const int onset = firstAbove(out, 0, 0.0f);
+        check(onset >= 7200 && onset <= 7202, "note onset " + std::to_string(onset));
+        int nonZeroBefore = 0;
+        for (int i = 0; i < 7200; ++i) nonZeroBefore += out[(size_t)i] != 0.0f ? 1 : 0;
+        check(nonZeroBefore == 0, "silent before the note");
+        // Released at beat 0.5 (12000): silent again within the 1 ms release (+ the fade tail).
+        int lastLoud = -1;
+        for (int i = 0; i < 14400; ++i) if (std::fabs(out[(size_t)i]) > 1e-4f) lastLoud = i;
+        check(lastLoud >= 12000 && lastLoud < 12000 + 200, "released at its end (" + std::to_string(lastLoud) + ")");
+        int logged = 0;
+        rig.log.drain([&](const seqplay::NoteLog::Entry& e) { logged += (e.note == 69 && std::fabs(e.atBeat - (e.on ? 0.3 : 0.5)) < 1e-9) ? 1 : 0; });
+        check(logged == 2, "note log on + off");
+        check(rig.synth.noteQueue().lastNoteStarted.load() == 69, "lastNoteStarted");
+
+        Rig drums(sr);
+        std::vector<seqplay::Event> hit = { seqDrum(0.7, 0, 127) };
+        drums.store->set(hit.data(), 1, 4.0);
+        drums.transport.start();
+        render(drums, 19200, out);
+        const int hitAt = firstAbove(out, 0, 0.0f);
+        check(hitAt >= 16800 && hitAt <= 16802, "drum onset " + std::to_string(hitAt));
+    }
+    // 2. Holds: the player holds 60; the sequence plays 60 for half a beat; its release leaves the
+    //    player's voice sounding. Then the sequence holds 64 and the player's 64 on/off leaves it.
+    {
+        Rig rig(sr);
+        std::vector<seqplay::Event> ev = { seqNote(0.25, 0.25, 60), seqNote(1.0, 2.0, 64) };
+        rig.store->set(ev.data(), 2, 4.0);
+        std::vector<float> out;
+        rig.synth.noteOn(60, 100);
+        rig.transport.start();
+        render(rig, 18000, out); // past the sequence's 60 (6000..12000)
+        check(rig.synth.diag.activeVoices.load() == 1, "player's 60 still sounding after the sequence's release ("
+              + std::to_string(rig.synth.diag.activeVoices.load()) + ")");
+        rig.synth.noteOff(60);
+        render(rig, 12000, out); // to beat 1.25: the sequence's 64 sounding
+        check(rig.synth.diag.activeVoices.load() == 1, "sequence 64 sounding");
+        rig.synth.noteOn(64, 100);
+        render(rig, 2400, out);
+        rig.synth.noteOff(64);
+        render(rig, 4800, out);
+        check(rig.synth.diag.activeVoices.load() == 1, "the player's 64 off leaves the sequence's 64 ("
+              + std::to_string(rig.synth.diag.activeVoices.load()) + ")");
+        // The engine's allNotesOff ends the sequence's note too.
+        rig.synth.allNotesOff();
+        render(rig, 2400, out);
+        check(rig.synth.diag.activeVoices.load() == 0 && rig.synth.sequence().activeNoteCount() == 0, "allNotesOff");
+        // Stop with a note sounding: nothing left.
+        render(rig, 48000 * 2, out); // next pass: 60, then 64 from beat 5
+        rig.transport.stop();
+        render(rig, 2400, out);
+        check(rig.synth.diag.activeVoices.load() == 0, "stop leaves no voice");
+    }
+    // 3. Arp on: the sequence's notes feed it (as notes sent with noteOn did); arp steps sound.
+    {
+        Rig rig(sr);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.5f;
+        rig.synth.arp().setSettings(s);
+        std::vector<seqplay::Event> ev = { seqNote(0.0, 1.0, 60), seqNote(0.0, 1.0, 64) };
+        rig.store->set(ev.data(), 2, 4.0);
+        rig.transport.start();
+        std::vector<float> out;
+        render(rig, 12000, out);
+        check(rig.synth.arp().isActive(), "arp running on the sequence's notes");
+        int onsets = 0;
+        for (int k = 0; k < 2; ++k) onsets += firstAbove(out, k * 6000, 0.0f) >= k * 6000 ? 1 : 0;
+        check(onsets == 2, "arp steps sound");
+        render(rig, 24000, out); // past beat 1: the sequence released them
+        check(!rig.synth.arp().isActive() || rig.synth.arp().getSettings().latch, "arp stops after the release");
+    }
+    // 4. Arp on, one pitch from two sources: the sequence's release of 60 leaves the pad's 60 held
+    //    in the arp; the pad's release of 64 leaves the sequence's 64.
+    {
+        Rig rig(sr);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.5f;
+        rig.synth.arp().setSettings(s);
+        std::vector<seqplay::Event> ev = { seqNote(0.25, 0.25, 60), seqNote(1.0, 2.0, 64) };
+        rig.store->set(ev.data(), 2, 4.0);
+        std::vector<float> out;
+        rig.synth.noteOn(60, 100);
+        rig.transport.start();
+        render(rig, 18000, out); // past the sequence's 60 (beats 0.25..0.5)
+        check(rig.synth.arp().isActive() && rig.synth.arp().heldCount() == 1,
+              "arp: the sequence's 60 off leaves the pad's 60 (" + std::to_string(rig.synth.arp().heldCount()) + ")");
+        rig.synth.noteOff(60);
+        render(rig, 12000, out); // beat 1.25: only the sequence's 64
+        check(rig.synth.arp().heldCount() == 1, "arp: the pad's 60 off");
+        rig.synth.noteOn(64, 100);
+        render(rig, 2400, out);
+        rig.synth.noteOff(64);
+        render(rig, 4800, out);
+        check(rig.synth.arp().isActive() && rig.synth.arp().heldCount() == 1,
+              "arp: the pad's 64 off leaves the sequence's 64 (" + std::to_string(rig.synth.arp().heldCount()) + ")");
+        render(rig, 48000, out); // past beat 3: the sequence's 64 ends
+        check(rig.synth.arp().heldCount() == 0 && !rig.synth.arp().isActive(), "arp: both released");
+    }
+    // 5. Arp latch: notes only the sequence held do not latch (a stop leaves the arp silent, the idle
+    //    stop is not held off); the pad's notes still latch.
+    {
+        Rig rig(sr);
+        ArpSettings s = ArpSettings::defaults();
+        s.enabled = true; s.gate = 0.5f; s.latch = true;
+        rig.synth.arp().setSettings(s);
+        std::vector<seqplay::Event> ev = { seqNote(0.0, 2.0, 60), seqNote(0.0, 2.0, 67) };
+        rig.store->set(ev.data(), 2, 4.0);
+        rig.transport.start();
+        std::vector<float> out;
+        render(rig, 12000, out);
+        check(rig.synth.arp().heldCount() == 2, "latch: sequence notes held");
+        rig.transport.stop();
+        render(rig, 2400, out);
+        check(rig.synth.arp().heldCount() == 0 && !rig.synth.arp().isActive(), "latch: stop leaves nothing in the arp ("
+              + std::to_string(rig.synth.arp().heldCount()) + ")");
+        render(rig, 4800, out);
+        float tail = 0.0f;
+        for (int i = 2400; i < 4800; ++i) tail = std::max(tail, std::fabs(out[(size_t)i]));
+        check(tail == 0.0f, "latch: silent after the stop");
+        rig.synth.noteOn(62, 100);
+        render(rig, 2400, out);
+        rig.synth.noteOff(62);
+        render(rig, 2400, out);
+        check(rig.synth.arp().heldCount() == 1 && rig.synth.arp().isActive(), "latch: the pad's note still latches");
+        rig.synth.allNotesOff();
+        render(rig, 2400, out);
+    }
+    check(allocs == 0, "allocations " + std::to_string(allocs));
+    const bool pass = failed == 0;
+    std::printf("seqv  sequence through PolySynthProcessor: onsets, drum hit, shared holds, allNotesOff, stop, arp  %-4s"
+                " %d failed checks%s\n", pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// The background policy's decisions (ios/BackgroundPolicy.h).
+static bool runBackgroundPolicy() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failed; detail += " [" + what + "]"; } };
+    using namespace bgpolicy;
+    Policy unset;
+    Policy keep; keep.set = true; keep.keepAlive = true; keep.idleStopSeconds = 30.0;
+    Policy pause = keep; pause.keepAlive = false;
+    Activity idle, playing, voice, held, seqHeld, arp;
+    playing.transportPlaying = true;
+    voice.voicesSounding = 1;
+    held.inputHolds = 1;
+    seqHeld.sequenceNotes = 2;
+    arp.arpRunning = true;
+    check(!isBusy(idle) && isBusy(playing) && isBusy(voice) && isBusy(held) && isBusy(seqHeld) && isBusy(arp), "busy");
+    {
+        IdleTracker t;
+        check(!t.check(keep, idle, 100.0) && t.idleStopAt() < 0, "foreground never stops");
+        check(!t.enterBackground(keep, 100.0) && t.state() == State::Background, "keepAlive: no pause");
+        check(!t.check(keep, playing, 110.0) && t.idleStopAt() == 140.0, "busy pushes the stop");
+        check(!t.check(keep, idle, 139.9), "idle 29.9 s");
+        check(t.check(keep, idle, 140.0) && t.state() == State::IdleStopped && t.idleStopAt() < 0, "idle 30 s: stop");
+        check(!t.check(keep, idle, 200.0), "stopped once");
+        t.markRestarted(300.0);
+        check(t.state() == State::Background && t.check(keep, idle, 330.0), "restarted in the background, idle again");
+        check(t.enterForeground() && t.state() == State::Foreground, "foreground after a stop: restart");
+        check(!t.enterForeground(), "no restart when it was not stopped");
+    }
+    {
+        IdleTracker t;
+        check(t.enterBackground(pause, 0.0), "keepAlive off: pause on background");
+        check(!t.check(pause, voice, 10.0) && t.check(pause, idle, 40.0), "then the idle stop");
+    }
+    {
+        IdleTracker t;
+        check(!t.enterBackground(unset, 0.0) && !t.check(unset, idle, 1e6) && t.idleStopAt() < 0, "unset: nothing");
+    }
+    check(sanitizeIdleStopSeconds(NAN) == 30.0 && sanitizeIdleStopSeconds(0.0) == 1.0 && sanitizeIdleStopSeconds(1e9) == 3600.0,
+          "sanitize");
+    // wantsExclusiveSession(current, nowPlayingSet, transportPlaying, inBackground, pausedByRemote)
+    check(!wantsExclusiveSession(false, false, true, true, true), "exclusive: never without Now Playing");
+    check(!wantsExclusiveSession(false, true, true, false, false), "exclusive: foreground Play does not flip it");
+    check(!wantsExclusiveSession(false, true, false, true, false), "exclusive: not on entering the background stopped");
+    check(wantsExclusiveSession(false, true, true, true, false), "exclusive: in the background while playing");
+    check(wantsExclusiveSession(true, true, false, true, true), "exclusive: kept after a lock-screen pause");
+    check(!wantsExclusiveSession(true, true, false, true, false), "exclusive: dropped when stopped otherwise");
+    check(wantsExclusiveSession(true, true, true, false, false), "exclusive: kept in the foreground while playing");
+    check(!wantsExclusiveSession(true, true, false, false, false), "exclusive: dropped on stop in the foreground");
+    check(std::string(stateName(State::IdleStopped)) == "idleStopped", "names");
+    const bool pass = failed == 0;
+    std::printf("bg    background policy: busy, idle stop after 30 s, pause, unset, restart, exclusive session  %-4s"
+                " %d failed checks%s\n", pass ? "PASS" : "FAIL", failed, detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the cases named on the command line run (none: every case).
 static std::vector<std::string> gOnlyCases;
 static bool want(const char* id) {
@@ -4913,6 +5557,9 @@ int main(int argc, char** argv) {
     if (want("mih")) unexpected += runMidiHolds() ? 0 : 1;
     if (want("mic")) unexpected += runMidiEntry() ? 0 : 1;
     if (want("own")) unexpected += runOwnerToken() ? 0 : 1;
+    if (want("seq")) unexpected += runSequence() ? 0 : 1;
+    if (want("seqv")) unexpected += runSequenceVoices() ? 0 : 1;
+    if (want("bg")) unexpected += runBackgroundPolicy() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

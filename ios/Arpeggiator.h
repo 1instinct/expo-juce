@@ -17,6 +17,11 @@
 // vectors):
 //  - Held list in press order with velocities. `latch` keeps the list when every note is
 //    released; the first note-on after a full release replaces it. allNotesOff clears it.
+//  - Two sources hold an entry: the player (noteOn / releaseHeld, by note queue seq) and the loop
+//    sequence (noteOnSequence / releaseSequence). An entry goes when neither holds it, so a pad
+//    and the sequence playing the same pitch never release each other's note. Latch applies to
+//    the player only: a note only the sequence held goes on its release (a stopped, muted or
+//    cleared sequence leaves nothing sounding).
 //  - Cycle: `up` = held sorted ascending, then +12 per extra octave appended; `down` = reversed;
 //    `upDown` = up followed by its interior reversed; `played` = press order, octave copies
 //    appended in press order; `random` = a uniform pick from the up cycle per step; `chord` =
@@ -203,19 +208,17 @@ public:
     // A drained note-on; the processor routes them here only while the block's snapshot is
     // enabled. A 17th distinct note is dropped (counted in eventsDropped).
     void noteOn(int note, int velocity, uint64_t seq) {
-        note = std::clamp(note, 0, 127);
-        velocity = std::clamp(velocity, 1, 127);
-        if (latchedAll) { numHeld = 0; latchedAll = false; running = false; }
-        const bool wasEmpty = numHeld == 0;
-        int i = 0;
-        for (; i < numHeld; ++i)
-            if (held[i].note == note) break;
-        if (i == numHeld) {
-            if (numHeld >= kMaxHeld) { eventsDropped.fetch_add(1, std::memory_order_relaxed); return; }
-            ++numHeld;
-        }
-        held[i] = { note, velocity, seq, false };
-        if (wasEmpty || !running) start();
+        HeldNote* h = press(note, velocity);
+        if (h == nullptr) return;
+        h->player = true;
+        h->seq = seq;
+        h->latched = false;
+    }
+
+    // A loop sequence note-on (PolySynthProcessor, while the arp is enabled).
+    void noteOnSequence(int note, int velocity) {
+        HeldNote* h = press(note, velocity);
+        if (h != nullptr) h->sequence = true;
     }
 
     // The player released `note` (every held entry of it).
@@ -223,23 +226,37 @@ public:
         releaseHeld([note](int n, uint64_t) { return n == note; });
     }
 
-    // Releases every held entry for which isReleased(note, seq) is true (the processor passes
+    // The player's holds for which isReleased(note, seq) is true end (the processor passes
     // NoteEventQueue::isReleased). Latched: the entries stay until the next press replaces them.
+    // An entry the sequence still holds stays either way.
     template <typename Pred>
     void releaseHeld(Pred&& isReleased) {
         const bool latching = cur.latch;
         int kept = 0;
         for (int i = 0; i < numHeld; ++i) {
             HeldNote h = held[i];
-            if (isReleased(h.note, h.seq)) {
-                if (!latching) continue;
-                h.released = true;
+            if (h.player && isReleased(h.note, h.seq)) {
+                h.player = false;
+                if (latching) h.latched = true;
             }
-            held[kept++] = h;
+            if (h.player || h.sequence || h.latched) held[kept++] = h;
         }
         numHeld = kept;
         afterListChange(latching);
     }
+
+    // The sequence released `note`. Not latched: it goes unless the player holds (or latched) it.
+    void releaseSequence(int note) {
+        int kept = 0;
+        for (int i = 0; i < numHeld; ++i) {
+            HeldNote h = held[i];
+            if (h.note == note) h.sequence = false;
+            if (h.player || h.sequence || h.latched) held[kept++] = h;
+        }
+        numHeld = kept;
+        afterListChange(cur.latch);
+    }
+
 
     // Stops the arp's sounding voices in the next process() and clears the held / latched list.
     void allNotesOff() { flushRequested = true; }
@@ -265,8 +282,11 @@ public:
         if (!s.latch && latchedAll) {
             // Latch turned off while holding: the released entries go.
             int kept = 0;
-            for (int i = 0; i < numHeld; ++i)
-                if (!held[i].released) held[kept++] = held[i];
+            for (int i = 0; i < numHeld; ++i) {
+                HeldNote h = held[i];
+                h.latched = false;
+                if (h.player || h.sequence) held[kept++] = h;
+            }
             numHeld = kept;
             afterListChange(false);
         }
@@ -355,9 +375,30 @@ public:
     std::atomic<uint32_t> eventsDropped{0};
 
 private:
-    struct HeldNote { int note; int velocity; uint64_t seq; bool released; };
+    // player / sequence: who holds it; latched: the player released it with latch on.
+    struct HeldNote { int note; int velocity; uint64_t seq; bool player; bool sequence; bool latched; };
     struct Pending { int samplesUntil; int note; int velocity; bool on; int gateSamples; };
     struct Event { int offset; int note; int velocity; bool on; int order; };
+
+    // Adds `note` to the held list (or finds it) and starts the arp if it was not running.
+    // nullptr: a 17th distinct note (dropped, counted in eventsDropped).
+    HeldNote* press(int note, int velocity) {
+        note = std::clamp(note, 0, 127);
+        velocity = std::clamp(velocity, 1, 127);
+        if (latchedAll) { numHeld = 0; latchedAll = false; running = false; }
+        const bool wasEmpty = numHeld == 0;
+        int i = 0;
+        for (; i < numHeld; ++i)
+            if (held[i].note == note) break;
+        if (i == numHeld) {
+            if (numHeld >= kMaxHeld) { eventsDropped.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+            held[i] = { note, velocity, 0, false, false, false };
+            ++numHeld;
+        }
+        held[i].velocity = velocity;
+        if (wasEmpty || !running) start();
+        return &held[i];
+    }
 
     void start() {
         running = true;
@@ -379,7 +420,7 @@ private:
     void afterListChange(bool latching) {
         if (numHeld == 0) { running = false; latchedAll = false; return; }
         bool allReleased = latching;
-        for (int i = 0; i < numHeld && allReleased; ++i) allReleased = held[i].released;
+        for (int i = 0; i < numHeld && allReleased; ++i) allReleased = !held[i].player && !held[i].sequence;
         latchedAll = allReleased;
     }
 

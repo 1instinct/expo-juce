@@ -10,6 +10,7 @@
 #include "DrumMachine.h"
 #include "AnalysisRing.h"
 #include "LatencyStats.h"
+#include "SequencePlayer.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -90,7 +91,11 @@ public:
     // The queue this synth reads its notes from: its own by default; the engine passes its
     // process-lifetime queue (before the synth is attached to a device). nullptr = own queue. The
     // queue's current all-notes-off mark counts as already applied (it may predate this synth).
-    void setNoteQueue(NoteEventQueue* q) { queue = q ? q : &ownQueue; lastAllReleasedSeen = queue->allReleasedMark(); }
+    void setNoteQueue(NoteEventQueue* q) {
+        queue = q ? q : &ownQueue;
+        lastAllReleasedSeen = queue->allReleasedMark();
+        lastAllReleasedSeenBySequence = lastAllReleasedSeen;
+    }
     NoteEventQueue& noteQueue() { return *queue; }
 
     void setWaveform(Waveform wf);
@@ -120,6 +125,16 @@ public:
     DrumMachine& drums() { return drumMachine; }
     const DrumMachine& drums() const { return drumMachine; }
 
+    // The loop sequence player (SequencePlayer.h, 0.9.0-rc.5): plays the sequence in the attached
+    // store while the transport plays, at sample offsets inside the block. Its synth notes start
+    // voices of their own (VoiceSource::Sequence: a player release never stops them, their release
+    // never stops a player's note); with the arpeggiator enabled they feed the arpeggiator instead,
+    // as player notes do. Its drum hits trigger the drum part at their offsets. The engine attaches
+    // its process-lifetime store and note log (no store: the player plays nothing).
+    void setSequenceStore(seqplay::SequenceStore* s) { sequencer.setStore(s); }
+    void setSequenceNoteLog(seqplay::NoteLog* log) { sequenceLog = log; }
+    const seqplay::SequencePlayer& sequence() const { return sequencer; }
+
     void setTransport(TransportEngine* t) { transport = t; }
     // Receives the arpeggiator state every block (AnalysisRing::publishArp). nullptr = none.
     void setAnalysis(AnalysisRing* a) { analysis = a; }
@@ -140,6 +155,7 @@ private:
     void recordNoteLatency(const NoteEvent& event);
     void renderVoices(float* mono, int numSamples, Waveform wf, float detune, float cutoff, float reso, float master);
     void applyArpEvent(const ArpEvent& event);
+    void applySequenceOutput(const seqplay::Output& out);
 
     Voice voices[MAX_VOICES];
     VoiceAllocator allocator;
@@ -152,6 +168,11 @@ private:
     ArpEvent arpEvents[kArpEventCapacity]; // this block's arp events (audio thread)
     int arpEventCount = 0;
     uint64_t lastAllReleasedSeen = 0;      // NoteEventQueue::allReleasedMark last applied to the arp
+    seqplay::SequencePlayer sequencer;
+    seqplay::NoteLog* sequenceLog = nullptr;
+    seqplay::Output seqOutputs[seqplay::SequencePlayer::kMaxOutputs]; // this block's (audio thread)
+    int seqOutputCount = 0;
+    uint64_t lastAllReleasedSeenBySequence = 0; // NoteEventQueue::allReleasedMark last applied to the sequence
 
     std::atomic<int> waveform{static_cast<int>(Waveform::Sine)};
     std::atomic<float> filterCutoff{20000.0f};
