@@ -54,6 +54,8 @@ Pod::Spec.new do |s|
     "Arpeggiator.h",
     "SpectrumAnalyser.h",
     "DrumMachine.h",
+    "Hermite.h",
+    "SamplerEngine.h",
     "LatencyStats.h",
     "DisplayRate.h",
     "DeviceFormat.h",

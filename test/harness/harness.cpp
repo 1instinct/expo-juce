@@ -21,6 +21,7 @@
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
 #include "OwnerToken.h"
+#include "SamplerEngine.h"
 
 #include <atomic>
 #include <chrono>
@@ -4804,6 +4805,8 @@ static bool runMidiEntry() {
     return pass;
 }
 
+#include "sampler_cases.inc"
+
 // Only the cases named on the command line run (none: every case).
 static std::vector<std::string> gOnlyCases;
 static bool want(const char* id) {
@@ -4913,6 +4916,8 @@ int main(int argc, char** argv) {
     if (want("mih")) unexpected += runMidiHolds() ? 0 : 1;
     if (want("mic")) unexpected += runMidiEntry() ? 0 : 1;
     if (want("own")) unexpected += runOwnerToken() ? 0 : 1;
+    if (want("sm")) unexpected += runSamplerCore() ? 0 : 1;
+    if (want("smb")) unexpected += runSamplerBudget() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");
