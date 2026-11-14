@@ -538,3 +538,273 @@ static bool runSamplerBudget() {
     std::fflush(stdout);
     return pass;
 }
+
+// ── sml: loading and the hand-off (ios/SamplerBank.h / .mm) ──────────────────────────────────
+
+static bool runSamplerLoader() {
+    using namespace smtest;
+    int failedCases = 0;
+    std::printf("sml   sampler loader and hand-off (ios/SamplerBank.h)\n");
+    auto codeOf = [](const std::string& e) { return e.substr(0, e.find(':')); };
+
+    // sml_load_wav_and_mp3: a stereo 44.1 kHz WAV resampled to the wanted 48 kHz (a 1 kHz sine
+    // stays a 1 kHz sine), a mono 48 kHz WAV kept as is on both channels, the MP3 fixture; a missing
+    // file and a file that is not audio fail with their codes and publish nothing.
+    {
+        Checks c;
+        SamplerBank bank;
+        bank.requestRate(48000.0);
+        juce::AudioBuffer<float> st(2, 22050);
+        for (int i = 0; i < 22050; ++i) {
+            st.setSample(0, i, 0.5f * (float)std::sin(2.0 * M_PI * 1000.0 * i / 44100.0));
+            st.setSample(1, i, 0.25f * (float)std::cos(2.0 * M_PI * 1000.0 * i / 44100.0));
+        }
+        const std::string stPath = writeWav(st, 44100.0, "ej-sampler-st.wav", 2);
+        SamplerLoadInfo info;
+        std::string error;
+        const bool okSt = bank.load(0, bank.beginLoad(0), stPath, info, error);
+        c(okSt, "stereo WAV loads: " + error);
+        c(info.frames == 24000 && info.sampleRate == 48000.0 && info.channels == 2 && std::fabs(info.durationMs - 500.0) < 1e-6
+          && info.sourceRate == 44100.0, "stereo info: frames " + std::to_string(info.frames) + " rate " +
+          std::to_string(info.sampleRate) + " ch " + std::to_string(info.channels) + " ms " + std::to_string(info.durationMs));
+        const SamplerSlotInfo si = bank.slotInfo(0);
+        c(si.loaded && si.frames == 24000 && si.channels == 2 && si.bytes == 24000LL * 2 * 4, "slotInfo(0)");
+        const SampleBuffer* b = bank.acquireSlot(0);
+        float worst = 0.0f;
+        if (b != nullptr && b->frames == 24000) {
+            for (int i = 2; i < 23990; ++i) {
+                worst = std::max(worst, std::fabs(b->L[i] - 0.5f * (float)std::sin(2.0 * M_PI * 1000.0 * i / 48000.0)));
+                worst = std::max(worst, std::fabs(b->R[i] - 0.25f * (float)std::cos(2.0 * M_PI * 1000.0 * i / 48000.0)));
+            }
+        }
+        c(b != nullptr && b->rate == 48000.0 && worst < 2e-3f, "resampled sine within 2e-3 of the ideal: " + std::to_string(worst));
+
+        juce::AudioBuffer<float> mono(1, 4800);
+        for (int i = 0; i < 4800; ++i) mono.setSample(0, i, noise(i, 5));
+        const std::string monoPath = writeWav(mono, 48000.0, "ej-sampler-mono.wav", 1);
+        const bool okMono = bank.load(1, bank.beginLoad(1), monoPath, info, error);
+        const SampleBuffer* m = bank.acquireSlot(1);
+        bool same = m != nullptr && m->frames == 4800;
+        for (int i = 0; same && i < 4800; ++i) same = m->L[i] == m->R[i] && std::fabs(m->L[i] - noise(i, 5)) < 1.0f / 4194304.0f;
+        c(okMono && info.channels == 1 && info.frames == 4800 && same, "mono 48 kHz kept as is on both channels");
+
+        const std::string mp3 = std::string(HARNESS_FIXTURES) + "/loop-124bpm-44k.mp3";
+        const bool okMp3 = bank.load(2, bank.beginLoad(2), mp3, info, error);
+        c(okMp3 && std::abs(info.frames - 749820) <= 1 && info.sampleRate == 48000.0 && info.sourceRate == 44100.0,
+          "MP3 fixture: frames " + std::to_string(info.frames) + " " + error);
+        const double mp3Ms = info.durationMs;
+        const int64_t mp3Frames = info.frames;
+
+        const bool missing = bank.load(3, bank.beginLoad(3), "/nonexistent/x.wav", info, error);
+        c(!missing && codeOf(error) == "ERR_SAMPLER_FILE", "missing file: " + error);
+        const juce::File junk = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("ej-sampler-junk.wav");
+        junk.replaceWithText("this is not audio");
+        const bool garbage = bank.load(3, bank.beginLoad(3), junk.getFullPathName().toStdString(), info, error);
+        c(!garbage && codeOf(error) == "ERR_SAMPLER_FORMAT", "not audio: " + error);
+        c(!bank.slotInfo(3).loaded && bank.acquireSlot(3) == nullptr, "failed loads publish nothing");
+        c(bank.residentBytes() == (24000LL + 4800 + mp3Frames) * 8, "resident bytes " + std::to_string(bank.residentBytes()));
+        c(!bank.load(16, 0, stPath, info, error) && codeOf(error) == "ERR_SAMPLER_SLOT", "slot 16 rejected: " + error);
+        junk.deleteFile();
+        juce::File(juce::String(stPath)).deleteFile();
+        juce::File(juce::String(monoPath)).deleteFile();
+        char note[96];
+        std::snprintf(note, sizeof(note), "resample error %.5f, MP3 %.0f ms", worst, mp3Ms);
+        failedCases += report("sml_load_wav_and_mp3", c, note) ? 0 : 1;
+        bank.releaseReader();
+    }
+
+    // sml_supersede_returns_SUPERSEDED: a newer beginLoad or an unload supersedes a load (before
+    // it starts, between decode chunks, at install); the superseded load publishes nothing.
+    {
+        Checks c;
+        SamplerBank bank;
+        juce::AudioBuffer<float> a(1, 144000); // 3 s at 48 kHz: three decode chunks
+        for (int i = 0; i < 144000; ++i) a.setSample(0, i, noise(i, 9));
+        const std::string path = writeWav(a, 48000.0, "ej-sampler-3s.wav", 1);
+        SamplerLoadInfo info;
+        std::string error;
+        const uint64_t g1 = bank.beginLoad(1);
+        const uint64_t g2 = bank.beginLoad(1);
+        c(!bank.load(1, g1, path, info, error) && codeOf(error) == "ERR_SAMPLER_SUPERSEDED", "older generation: " + error);
+        c(!bank.slotInfo(1).loaded, "nothing published");
+        int calls = 0;
+        auto partial = SamplerBank::decode(path, 0.0, [&] { return ++calls >= 2; }, -1, info, error);
+        c(partial == nullptr && codeOf(error) == "ERR_SAMPLER_SUPERSEDED" && calls == 2, "cancelled between chunks: " + error);
+        const uint64_t g3 = bank.beginLoad(2);
+        bank.unload(2);
+        auto ready = SamplerBank::fromAudio(a.getReadPointer(0), a.getReadPointer(0), 1000, 48000.0);
+        c(!bank.install(2, std::move(ready), g3, error) && codeOf(error) == "ERR_SAMPLER_SUPERSEDED", "unload supersedes: " + error);
+        c(bank.load(1, g2, path, info, error), "the newest load still succeeds: " + error);
+        bank.unloadAll();
+        bank.collect();
+        c(SamplerSample::live.load() == 0, "nothing left alive: " + std::to_string(SamplerSample::live.load()));
+        juce::File(juce::String(path)).deleteFile();
+        failedCases += report("sml_supersede_returns_SUPERSEDED", c) ? 0 : 1;
+    }
+
+    // sml_too_long: 61 s is refused (ERR_SAMPLER_TOO_LONG), 59 s loads.
+    {
+        Checks c;
+        SamplerBank bank;
+        bank.requestRate(48000.0);
+        SamplerLoadInfo info;
+        std::string error;
+        juce::AudioBuffer<float> longAudio(1, 8000 * 61);
+        longAudio.clear();
+        const std::string longPath = writeWav(longAudio, 8000.0, "ej-sampler-61s.wav", 1);
+        c(!bank.load(0, bank.beginLoad(0), longPath, info, error) && codeOf(error) == "ERR_SAMPLER_TOO_LONG", "61 s: " + error);
+        const std::string tooLong = error;
+        juce::AudioBuffer<float> okAudio(1, 8000 * 59);
+        okAudio.clear();
+        const std::string okPath = writeWav(okAudio, 8000.0, "ej-sampler-59s.wav", 1);
+        c(bank.load(0, bank.beginLoad(0), okPath, info, error) && info.frames == 48000 * 59, "59 s loads: " + error);
+        juce::File(juce::String(longPath)).deleteFile();
+        juce::File(juce::String(okPath)).deleteFile();
+        bank.unloadAll();
+        bank.collect();
+        failedCases += report("sml_too_long", c, tooLong) ? 0 : 1;
+    }
+
+    // sml_memory_cap: the total across slots is capped (the slot being replaced does not count);
+    // a file larger than what is left fails before decoding; low available memory refuses too.
+    {
+        Checks c;
+        SamplerBank bank;
+        bank.setMemoryCapBytes(1024 * 1024);
+        std::vector<float> x(60000, 0.1f);
+        std::string error;
+        auto make = [&] { return SamplerBank::fromAudio(x.data(), x.data(), 60000, 48000.0); }; // 480000 bytes
+        c(bank.install(0, make(), bank.beginLoad(0), error), "slot 0: " + error);
+        c(bank.install(1, make(), bank.beginLoad(1), error), "slot 1: " + error);
+        c(!bank.install(2, make(), bank.beginLoad(2), error) && codeOf(error) == "ERR_SAMPLER_MEMORY", "slot 2 over the cap: " + error);
+        const std::string capError = error;
+        c(bank.install(0, make(), bank.beginLoad(0), error), "replacing slot 0 fits: " + error);
+        c(bank.residentBytes() == 960000, "resident " + std::to_string(bank.residentBytes()));
+        bank.unload(1);
+        c(bank.install(2, make(), bank.beginLoad(2), error), "after unloading slot 1, slot 2 fits: " + error);
+        juce::AudioBuffer<float> big(1, 200000); // 1.6 MB once stereo float
+        big.clear();
+        const std::string bigPath = writeWav(big, 48000.0, "ej-sampler-big.wav", 1);
+        SamplerLoadInfo info;
+        c(!bank.load(3, bank.beginLoad(3), bigPath, info, error) && codeOf(error) == "ERR_SAMPLER_MEMORY", "file over the cap: " + error);
+        bank.setMemoryCapBytes(SamplerBank::kDefaultMemoryCapBytes);
+        SamplerBank::setAvailableMemoryProvider([] { return (int64_t)1000; });
+        c(!bank.load(3, bank.beginLoad(3), bigPath, info, error) && codeOf(error) == "ERR_SAMPLER_MEMORY", "low available memory: " + error);
+        SamplerBank::setAvailableMemoryProvider(nullptr);
+        c(bank.load(3, bank.beginLoad(3), bigPath, info, error), "loads under the default cap: " + error);
+        juce::File(juce::String(bigPath)).deleteFile();
+        bank.unloadAll();
+        bank.collect();
+        c(SamplerSample::live.load() == 0 && bank.residentBytes() == 0, "all freed");
+        failedCases += report("sml_memory_cap", c, capError) ? 0 : 1;
+    }
+
+    // sml_handoff_keeps_buffer_in_use: the buffer the reader acquired survives collect() after it
+    // is replaced, and is freed once the reader has moved to the new one; releaseReader lets go.
+    {
+        Checks c;
+        SamplerBank bank;
+        std::vector<float> x(1000, 0.1f);
+        std::string error;
+        bank.install(0, SamplerBank::fromAudio(x.data(), x.data(), 1000, 48000.0), bank.beginLoad(0), error);
+        const SampleBuffer* first = bank.acquireSlot(0);
+        bank.install(0, SamplerBank::fromAudio(x.data(), x.data(), 500, 48000.0), bank.beginLoad(0), error);
+        c(bank.collect() == 1 && SamplerSample::live.load() == 2, "the acquired buffer is kept");
+        c(first != nullptr && first->frames == 1000, "and still readable");
+        const SampleBuffer* second = bank.acquireSlot(0);
+        c(second != nullptr && second->frames == 500, "the reader moves to the new buffer");
+        c(bank.collect() == 0 && SamplerSample::live.load() == 1, "then the old one is freed");
+        bank.unload(0);
+        c(bank.collect() == 1, "an unloaded buffer still acquired is kept");
+        bank.releaseReader();
+        c(bank.collect() == 0 && SamplerSample::live.load() == 0, "releaseReader lets it go");
+        failedCases += report("sml_handoff_keeps_buffer_in_use", c) ? 0 : 1;
+    }
+
+    const bool pass = failedCases == 0;
+    std::printf("sml   sampler loader: formats, supersede, too long, memory cap, hand-off  %-4s %d failed\n",
+                pass ? "PASS" : "FAIL", failedCases);
+    std::fflush(stdout);
+    return pass;
+}
+
+// ── sms: loads / unloads while the audio thread plays ────────────────────────────────────────
+// sml_swap_while_playing_no_alloc_on_audio_thread: a render thread runs beginBlock + hits + note-ons
+// + render against the bank while the control thread installs and unloads 400 times and collects:
+// 0 allocations and 0 frees on the audio thread, finite output, every buffer freed at the end.
+static bool runSamplerSwapStress() {
+    using namespace smtest;
+    SamplerBank bank;
+    bank.requestRate(48000.0);
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> blocks{0};
+    std::atomic<int> nonFinite{0};
+    std::atomic<int> soundingBlocks{0};
+    int pendingMax = 0, installed = 0;
+    {
+        SamplerEngine e;
+        e.prepare(48000.0, 1024);
+        e.setSource(&bank);
+        for (int s = 0; s < kSamplerSlots; ++s) {
+            SamplerSlotParams p;
+            p.oneShot = (s % 2) == 0;
+            p.loop = (s % 4) == 1;
+            p.chokeGroup = s % 3;
+            e.setSlotParams(s, p);
+        }
+        gRenderAllocs.store(0); gRenderFrees.store(0);
+        std::thread audio([&] {
+            std::vector<float> l(1024), r(1024);
+            const int sizes[3] = {128, 471, 1024};
+            for (uint64_t b = 0; !stop.load(); ++b) {
+                const int n = sizes[b % 3];
+                std::fill(l.begin(), l.end(), 0.0f);
+                std::fill(r.begin(), r.end(), 0.0f);
+                tCountAllocs = true;
+                e.beginBlock();
+                e.hit((int)(b % kSamplerSlots), 100);
+                if (b % 5 == 0) e.noteOn(48 + (int)(b % 24), 90);
+                if (b % 7 == 0) e.noteOff(48 + (int)((b + 12) % 24));
+                e.render(l.data(), r.data(), n);
+                tCountAllocs = false;
+                bool sounding = false;
+                for (int i = 0; i < n; ++i) {
+                    if (!std::isfinite(l[(size_t)i]) || !std::isfinite(r[(size_t)i])) nonFinite.fetch_add(1);
+                    sounding = sounding || l[(size_t)i] != 0.0f;
+                }
+                if (sounding) soundingBlocks.fetch_add(1);
+                blocks.fetch_add(1);
+            }
+        });
+        std::string error;
+        for (int i = 0; i < 400; ++i) {
+            const int slot = (i * 7) % kSamplerSlots;
+            if (i % 9 == 8) {
+                bank.unload(slot);
+            } else {
+                const int frames = 2000 + 53 * i;
+                std::vector<float> x((size_t)frames);
+                for (int k = 0; k < frames; ++k) x[(size_t)k] = 0.3f * noise(k, (uint32_t)i);
+                installed += bank.install(slot, SamplerBank::fromAudio(x.data(), x.data(), frames, 48000.0), bank.beginLoad(slot), error) ? 1 : 0;
+            }
+            if (i % 3 == 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
+            pendingMax = std::max(pendingMax, bank.collect());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stop.store(true);
+        audio.join();
+    }
+    bank.releaseReader(); // the reader is gone (what ~PolySynthProcessor does)
+    const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
+    bank.unloadAll();
+    const int pendingAfter = bank.collect();
+    const int live = SamplerSample::live.load();
+    const bool pass = allocs == 0 && frees == 0 && nonFinite.load() == 0 && pendingAfter == 0 && live == 0 && blocks.load() > 50
+                   && pendingMax <= kSamplerSlots && installed == 400 - 400 / 9 && soundingBlocks.load() > blocks.load() / 2;
+    std::printf("sms   sml_swap_while_playing_no_alloc_on_audio_thread: 400 install/unload while rendering (%llu blocks, %d"
+                " sounding)  %-4s installed %d, render allocs %llu frees %llu, non-finite %d, max retired waiting %d, live after"
+                " unload %d\n", (unsigned long long)blocks.load(), soundingBlocks.load(), pass ? "PASS" : "FAIL", installed,
+                (unsigned long long)allocs, (unsigned long long)frees, nonFinite.load(), pendingMax, live);
+    std::fflush(stdout);
+    return pass;
+}

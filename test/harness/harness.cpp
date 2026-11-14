@@ -22,6 +22,7 @@
 #include "ExpoJuceMidiInput.h"
 #include "OwnerToken.h"
 #include "SamplerEngine.h"
+#include "SamplerBank.h"
 
 #include <atomic>
 #include <chrono>
@@ -4918,6 +4919,8 @@ int main(int argc, char** argv) {
     if (want("own")) unexpected += runOwnerToken() ? 0 : 1;
     if (want("sm")) unexpected += runSamplerCore() ? 0 : 1;
     if (want("smb")) unexpected += runSamplerBudget() ? 0 : 1;
+    if (want("sml")) unexpected += runSamplerLoader() ? 0 : 1;
+    if (want("sms")) unexpected += runSamplerSwapStress() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");
