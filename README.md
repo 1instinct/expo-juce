@@ -406,7 +406,7 @@ Options (all optional; numbers are clamped):
 | `bands` | `true` | 24 bands, the table and scaling of `getAnalysis().bands` (one 2048-point FFT); `false` returns 24 zeros |
 | `scope` | `'window'` | `'none'` (`scope: []`), `'window'` or `'cycle'` |
 | `scopePoints` | 64 | 16–128 |
-| `cycleHz` | the last note the synth started | `'cycle'`: the fundamental |
+| `cycleHz` | the last note the synth started, at the synth's detune | `'cycle'`: the fundamental |
 | `windowMs` | 20 | 5–42, `'window'` and the `'cycle'` fallback |
 
 - `active`: the source is producing sound. Backing: a track is loaded at the device rate, enabled,
@@ -417,8 +417,8 @@ Options (all optional; numbers are clamped):
 - `scope` (−1..1, not normalised):
   - `'window'`: the last `windowMs`, each point a Hann-weighted average over its own span (no
     aliasing: a 9 kHz tone reads under 0.002 of its level in 64 points over 20 ms, where picking
-    samples would show it at full level), centred on the largest positive peak of the last two
-    window lengths, refined between samples. A steady tone stands still from call to call; a hit
+    samples would show it at full level), centred on the largest positive peak between half a window and one and a half
+    windows old (so the whole window is inside the last two), refined between samples. A steady tone stands still from call to call; a hit
     sits in the middle once it is half a window old.
   - `'cycle'`: one period P = sampleRate / f, starting at its peak (point 0 is the maximum,
     placed between samples) and resampled to `scopePoints` with the same anti-alias weighting, so

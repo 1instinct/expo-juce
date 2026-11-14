@@ -82,6 +82,7 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     const float reso = filterResonance.load();
     const float detune = detuneCents.load();
     const float master = masterLevel.load();
+    queue->synthDetuneCents.store(detune, std::memory_order_relaxed);
 
     float* monoBuffer = buffer.getWritePointer(0);
 

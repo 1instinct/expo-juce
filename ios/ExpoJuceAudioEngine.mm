@@ -2141,7 +2141,8 @@ static NSString *backingTrackPath(NSString *uri) {
     const bool active = running && (instrument ? ring.loudRecently() : ring.sounding());
     SourceAnalysisResult r;
     (instrument ? sInstrumentAnalyser : sBackingAnalyser)
-        .analyse(ring, running, active, sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed), o, r);
+        .analyse(ring, running, active, sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed), o, r,
+                 sNoteQueue.synthDetuneCents.load(std::memory_order_relaxed));
     NSMutableArray<NSNumber *> *bandValues = [NSMutableArray arrayWithCapacity:SpectrumAnalyser::kBands];
     for (int i = 0; i < SpectrumAnalyser::kBands; ++i) [bandValues addObject:@(r.bands[i])];
     NSMutableArray<NSNumber *> *points = [NSMutableArray arrayWithCapacity:(NSUInteger)r.scopeCount];

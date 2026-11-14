@@ -88,7 +88,7 @@ Exit code non-zero on any failure.
   metronome alone leaves both rings at exactly 0; backing `active` follows stop / start / level 0 /
   disabled / past the end with loop off, the instrument's its level; levels reset per read), `srcs`
   (cycle on a 220 Hz synth saw: period 218.18, peak at point 0, 12 calls apart by 5–16 ms within 3% of
-  the range; `cycleHz` without a note; no note, a wrong note and a C4 + E4 chord fall back to window;
+  the range; with the synth detuned an octave up one cycle of 440 Hz and at +30 cents the detuned period; `cycleHz` without a note; no note, a wrong note and a C4 + E4 chord fall back to window;
   a 30 Hz sine fits; window: a steady 330 Hz tone within 3% across calls and centred on its peak, a
   9 kHz tone under 0.02 in 64 points over 20 ms, a decaying hit centred; not running: zeros of the
   asked shape; `analyse` does not allocate; reader time per call), `srct` (ring write cost per

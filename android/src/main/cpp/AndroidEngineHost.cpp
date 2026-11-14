@@ -690,7 +690,8 @@ std::string sourceAnalysisJson(const std::string& source, bool bands, const std:
     // No aux node on Android yet: the backing track never sounds.
     const bool active = running && instrument && ring.loudRecently();
     SourceAnalysisResult r;
-    sourceAnalyser(instrument).analyse(ring, running, active, sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed), o, r);
+    sourceAnalyser(instrument).analyse(ring, running, active, sNoteQueue.lastNoteStarted.load(std::memory_order_relaxed), o, r,
+                                       sNoteQueue.synthDetuneCents.load(std::memory_order_relaxed));
     juce::Array<juce::var> bandValues, points;
     for (int i = 0; i < SpectrumAnalyser::kBands; ++i) bandValues.add(forJS(r.bands[i]));
     for (int i = 0; i < r.scopeCount; ++i) points.add(forJS(r.scope[i]));

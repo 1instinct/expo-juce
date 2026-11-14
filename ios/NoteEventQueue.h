@@ -164,6 +164,10 @@ public:
     std::atomic<uint32_t> drumHitsDiscarded{0};
     // Last note the synth started (0–127), -1 = none yet. Written by the consumer (relaxed).
     std::atomic<int> lastNoteStarted{-1};
+    // The synth's detune (cents) as of its last block, which moves every voice; with
+    // lastNoteStarted it gives the sounding pitch (getSourceAnalysis's cycle scope). Written by the
+    // consumer (relaxed).
+    std::atomic<float> synthDetuneCents{0.0f};
 
 private:
     // Spinlock guard for the producer side (test_and_set acquire / clear release). Critical

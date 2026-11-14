@@ -15,7 +15,7 @@
 - **Scope modes** (`scope: 'none' | 'window' | 'cycle'`, `scopePoints` 16–128, `windowMs` 5–42,
   `cycleHz`): `'window'` is anti-alias filtered (a Hann-weighted average per point instead of
   picking samples) and centred on the largest positive peak, so a steady tone stands still;
-  `'cycle'` returns one period of the source (at `cycleHz` or the last note the synth started)
+  `'cycle'` returns one period of the source (at `cycleHz` or the last note the synth started, at the synth's detune)
   starting at its peak, stable from call to call, and falls back to `'window'` when the source is
   not periodic at that period (chords, drums, noise) or the period does not fit the history.
 - Taps: `FxChainProcessor` writes its output into the instrument ring at the end of each block;
@@ -29,7 +29,7 @@
 - Harness cases `srcm` (the mix with the taps is bit-identical to the mix without; the aux node's
   track-then-metronome order is exactly track + metronome; each ring holds its source alone; no
   allocation), `srcb` (band energy in the right source, metronome in neither, `active` flags),
-  `srcs` (cycle period, peak at point 0, stability across calls, chord / wrong-note / no-note
+  `srcs` (cycle period (with the synth's detune), peak at point 0, stability across calls, chord / wrong-note / no-note
   fallbacks, 30 Hz cycle, window stability, anti-aliasing, hit centring, inactive shape, no
   allocation) and `srct` (tap cost); `host_test` checks the Android shapes and an instrument cycle.
 

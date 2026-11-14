@@ -306,7 +306,7 @@ export type SourceAnalysisOptions = {
   scope?: ScopeMode;
   /** Scope points, 16–128 (default 64). */
   scopePoints?: number;
-  /** `'cycle'`: the fundamental in Hz; omitted (or 0) = the last note the synth started. */
+  /** `'cycle'`: the fundamental in Hz; omitted (or 0) = the last note the synth started, at the synth's detune. */
   cycleHz?: number;
   /** `'window'` (and the `'cycle'` fallback): span in ms, 5–42 (default 20). */
   windowMs?: number;

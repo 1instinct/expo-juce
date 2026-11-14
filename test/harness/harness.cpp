@@ -2781,6 +2781,24 @@ static bool runSourceScope() {
         analyse(rig.instrument, 64, cyc, r2);
         check(r2.scopeMode == SourceScopeMode::Window, "wrong note → window");
     }
+    // The synth's detune moves every voice: the cycle follows it (an octave up is one cycle of
+    // 440 Hz, not two; +30 cents is still a cycle, at the detuned period).
+    for (const double cents : {1200.0, 30.0}) {
+        SourceRig rig(true);
+        rig.synth->setWaveform(Waveform::Saw);
+        rig.synth->setDetune(cents);
+        rig.synth->noteOn(57, 110); // A3 + detune
+        rig.render(24000);
+        const double detune = rig.synth->noteQueue().synthDetuneCents.load();
+        SourceAnalysisResult rd;
+        tCountAllocs = true;
+        an.analyse(rig.instrument, true, true, 57, cyc, rd, detune);
+        tCountAllocs = false;
+        const double want = sr / (220.0 * std::pow(2.0, cents / 1200.0));
+        check(rd.scopeMode == SourceScopeMode::Cycle && std::fabs(rd.scopePeriod - want) < 1e-3,
+              "detune " + fmt3(cents) + ": mode " + std::string(sourceScopeModeName(rd.scopeMode)) + " period "
+              + fmt3(rd.scopePeriod) + " (want " + fmt3(want) + ")");
+    }
     // Chord: C4 + E4, last note E4 → window.
     {
         SourceRig rig(true);

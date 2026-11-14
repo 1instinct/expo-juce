@@ -11,7 +11,7 @@
 //   average over ±(span / points) samples around its position, so nothing above the points' own
 //   Nyquist folds back (the old every-16th-sample pick aliased everything above ~1.5 kHz). It is
 //   triggered: the window is centred on the largest positive sample (after the same smoothing)
-//   within the last two window lengths, refined between samples, so a steady tone stands still
+//   between half a window and one and a half windows old (the window stays inside the last two), refined between samples, so a steady tone stands still
 //   and a hit sits in the middle.
 // - cycle: one period P = sampleRate / f of the source (f = `cycleHz`, or the last note the synth
 //   started). The DC-free signal is low-passed at about 4 f (one pole) to find the latest rising
@@ -41,7 +41,7 @@ struct SourceAnalysisOptions {
     bool bands = true;
     SourceScopeMode scope = SourceScopeMode::Window;
     int scopePoints = kDefaultPoints;
-    double cycleHz = 0.0;   // ≤ 0 / non-finite: the last note the synth started
+    double cycleHz = 0.0;   // ≤ 0 / non-finite: the last note the synth started (at its detune)
     double windowMs = kDefaultWindowMs;
 
     // Clamps / defaults (call after filling from the caller's options).
@@ -225,9 +225,10 @@ public:
     SourceAnalyser() : raw((size_t)SourceRing::kReadable), scratch((size_t)SourceRing::kReadable) {}
 
     // `running`: the engine is rendering (else zeros). `active`: the source is sounding.
-    // `lastNote`: MIDI note for Cycle mode when options.cycleHz is 0 (−1 = none).
+    // `lastNote`: MIDI note for Cycle mode when options.cycleHz is 0 (−1 = none); `detuneCents`: the
+    // synth's detune, which moves every voice (NoteEventQueue::synthDetuneCents).
     void analyse(SourceRing& ring, bool running, bool active, int lastNote, SourceAnalysisOptions options,
-                 SourceAnalysisResult& r) {
+                 SourceAnalysisResult& r, double detuneCents = 0.0) {
         options.sanitize();
         r = SourceAnalysisResult{};
         const int points = options.scopePoints;
@@ -246,7 +247,12 @@ public:
         if (options.bands) spectrum.analyse(raw.data() + (n - SpectrumAnalyser::kSize), sr, r.bands);
         if (options.scope == SourceScopeMode::Cycle) {
             double hz = options.cycleHz;
-            if (!(hz > 0.0) && lastNote >= 0 && lastNote <= 127) hz = 440.0 * std::pow(2.0, (lastNote - 69) / 12.0);
+            if (!(hz > 0.0) && lastNote >= 0 && lastNote <= 127) {
+                hz = 440.0 * std::pow(2.0, (lastNote - 69) / 12.0);
+                // As PolySynthProcessor::renderVoices applies it.
+                if (std::isfinite(detuneCents) && std::fabs(detuneCents) > 0.01)
+                    hz *= std::pow(2.0, std::clamp(detuneCents, -1200.0, 1200.0) / 1200.0);
+            }
             double period = 0.0;
             if (sourcescope::cycle(raw.data(), n, sr, hz, points, r.scope, period, scratch.data())) {
                 r.scopeMode = SourceScopeMode::Cycle;
