@@ -9,9 +9,9 @@ class VoiceAllocator {
 public:
     VoiceAllocator();
 
+    // A stolen voice's tail is rendered with the given (current, smoothed) parameters.
     int noteOn(int note, float velocity, Voice* voices,
-               Waveform waveform, double detuneCents,
-               float filterCutoff, float filterResonance,
+               Waveform waveform, float filterCutoff, float filterResonance,
                float masterLevel, uint64_t seq = 0, VoiceSource source = VoiceSource::Player);
 
     void noteOff(int note, Voice* voices);

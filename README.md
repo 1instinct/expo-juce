@@ -53,6 +53,8 @@ Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack buil
 
 `setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. 0.5.2 adds: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (keeping synth settings and transport state across rebuilds).
 
+Synth parameter smoothing: cutoff, resonance, detune, master level and sustain ramp per sample over 40 ms instead of stepping (see [Parameter smoothing](#parameter-smoothing)); a note released at sustain 0 now fades over its release time (it was cut on the next block). Verified in the offline harness (case `sm`); not yet run on a device.
+
 ### Sub-project 2: Effects Chain
 **Status:** In progress (0.6.0) — engine + JS API done and verified in the offline harness; not yet run on a device
 
@@ -108,7 +110,8 @@ ExpoJuce.noteOn(60, 127);   // note 0–127, velocity 0–127
 ExpoJuce.noteOff(60);
 ExpoJuce.allNotesOff();
 
-// Global synth parameters — synchronous, std::atomic
+// Global synth parameters — synchronous, std::atomic. Cutoff, resonance, detune, master level
+// and sustain glide to a new value over 40 ms (see "Parameter smoothing" below)
 ExpoJuce.setWaveform('saw');          // 'sine' | 'square' | 'saw' | 'triangle'
 ExpoJuce.setFilterCutoff(2000);       // Hz, 20–20000 (default 20000)
 ExpoJuce.setFilterResonance(0.3);     // 0–1 → Q 0.707–10
@@ -135,6 +138,26 @@ ExpoJuce.playTestTone(500);           // 440 Hz into the device output, bypasses
 
 await ExpoJuce.shutdown();
 ```
+
+### Parameter smoothing
+
+Controllers often send parameter values in steps 25–30 times a second; applied as-is, a sweep
+clicks on every step ("zipper noise"). The synth ramps each change on the audio thread, per
+sample, over 40 ms from the value it is currently at:
+
+| Parameter | Ramp |
+|---|---|
+| `setFilterCutoff` | multiplicative (constant ratio per sample: linear in octaves) |
+| `setDetune` | multiplicative on the pitch ratio (= linear in cents) |
+| `setFilterResonance`, `setMasterLevel`, `setSustain` | linear |
+| `setAttack`, `setDecay`, `setRelease` | none: a time only changes the slope of the running envelope stage, never its level, so it applies at once (to held notes and to the next notes) without a click; a note already in its release keeps the release it started with |
+| `setWaveform` | none (switches at the next block) |
+
+40 ms is just longer than a 25–30 Hz controller's step interval (33–40 ms): each step arrives
+before the previous ramp has finished, so a sweep is one continuous glide with no flat
+segments, and the sound lags the control by at most 40 ms. (The effect chain ramps its
+parameters over 50 ms.) Settings restored on a rebuilt engine are applied at once, not ramped.
+Non-finite values (NaN, ±Infinity) are ignored. The JS API is unchanged.
 
 ### Effects (0.6.0+)
 

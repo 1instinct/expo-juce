@@ -31,27 +31,26 @@ void Voice::prepare(double sampleRate, int blockSize) {
     filter.setType(juce::dsp::StateVariableTPTFilter<float>::Type::lowpass);
 
     adsr.setSampleRate(sampleRate);
+    applyEnvelope(true); // the rates depend on the sample rate
     cachedSampleRate = sampleRate;
+    appliedFreq = appliedCutoff = appliedResonance = -1.0f;
     prepared = true;
 }
 
 void Voice::startNote(int note, float velocity) {
     noteNumber = note;
     velocityGain = velocity / 127.0f;
-
-    float freq = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
-    sineOsc.setFrequency(freq, true);
-    squareOsc.setFrequency(freq, true);
-    sawOsc.setFrequency(freq, true);
-    triOsc.setFrequency(freq, true);
+    baseFreq = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
 
     sineOsc.reset();
     squareOsc.reset();
     sawOsc.reset();
     triOsc.reset();
     filter.reset();
+    // Pitch and filter are set from the smoothed values on the first rendered sample.
+    appliedFreq = appliedCutoff = appliedResonance = -1.0f;
 
-    updateADSR();
+    applyEnvelope();
     held = true;
     adsr.noteOn();
 }
@@ -61,30 +60,76 @@ void Voice::stopNote() {
     adsr.noteOff();
 }
 
-void Voice::captureAndRelease(Waveform waveform, double frequency,
-                               float filterCutoff, float filterResonance,
-                               float masterLevel) {
+// Envelope times change the slope of the running stage, never the envelope's value, so a new
+// attack / decay / release time applies at once without a click (and without smoothing: a
+// smoothed time would only arrive later). The sustain level is a value: the processor ramps it
+// (SynthParamSmoother) and render() applies it per sample.
+//
+// Not applied during the release stage: juce::ADSR::noteOff sets the release rate from the
+// level the note was released at (so it reaches 0 after releaseMs), and setParameters would
+// replace it with sustain / releaseMs, which is 0 at sustain 0 (the note was cut on the next
+// block) and gives the wrong release length for a note released during its attack or decay. A
+// voice in its release picks the settings up on its next note.
+void Voice::setEnvelope(const EnvelopeSettings& e) {
+    if (e == envelope) return;
+    envelope = e;
+    if (held || noteNumber < 0) applyEnvelope();
+}
+
+void Voice::applyEnvelope(bool force) {
+    if (!force && envelope == appliedEnvelope) return;
+    juce::ADSR::Parameters p {
+        envelope.attackMs * 0.001f,
+        envelope.decayMs * 0.001f,
+        envelope.sustain,
+        envelope.releaseMs * 0.001f
+    };
+    adsr.setParameters(p);
+    appliedEnvelope = envelope;
+}
+
+void Voice::setFrequency(float hz) {
+    // force = true: the oscillators' own 50 ms frequency smoothing is bypassed (pitch is
+    // smoothed by the caller), so a new note starts exactly at its pitch.
+    sineOsc.setFrequency(hz, true);
+    squareOsc.setFrequency(hz, true);
+    sawOsc.setFrequency(hz, true);
+    triOsc.setFrequency(hz, true);
+    appliedFreq = hz;
+}
+
+void Voice::setFilter(float cutoffHz, float resonance) {
+    if (cutoffHz != appliedCutoff) {
+        filter.setCutoffFrequency(cutoffHz);
+        appliedCutoff = cutoffHz;
+    }
+    if (resonance != appliedResonance) {
+        filter.setResonance(0.707f + resonance * 9.293f);
+        appliedResonance = resonance;
+    }
+}
+
+float Voice::nextOscSample(Waveform waveform) {
+    switch (waveform) {
+        case Waveform::Sine:     return sineOsc.processSample(0.0f);
+        case Waveform::Square:   return squareOsc.processSample(0.0f) * 0.7f;
+        case Waveform::Saw:      return sawOsc.processSample(0.0f) * 0.6f;
+        case Waveform::Triangle: return triOsc.processSample(0.0f) * 0.8f;
+    }
+    return 0.0f;
+}
+
+void Voice::captureAndRelease(Waveform waveform, float filterCutoff, float filterResonance,
+                              float masterLevel) {
     fadeOutTailLength = FADE_OUT_SAMPLES;
     fadeOutTailPos = 0;
     std::memset(fadeOutTail, 0, sizeof(fadeOutTail));
 
-    // Apply current filter params before rendering fade-out
-    float mappedQ = 0.707f + filterResonance * 9.293f;
-    filter.setCutoffFrequency(filterCutoff);
-    filter.setResonance(mappedQ);
+    setFilter(filterCutoff, filterResonance);
 
     for (int i = 0; i < FADE_OUT_SAMPLES; i++) {
         float envGain = adsr.getNextSample();
-
-        float sample = 0.0f;
-        switch (waveform) {
-            case Waveform::Sine:    sample = sineOsc.processSample(0.0f); break;
-            case Waveform::Square:  sample = squareOsc.processSample(0.0f) * 0.7f; break;
-            case Waveform::Saw:     sample = sawOsc.processSample(0.0f) * 0.6f; break;
-            case Waveform::Triangle: sample = triOsc.processSample(0.0f) * 0.8f; break;
-        }
-
-        float filtered = filter.processSample(0, sample);
+        float filtered = filter.processSample(0, nextOscSample(waveform));
         float fadeGain = 1.0f - ((float)i / (float)FADE_OUT_SAMPLES);
         fadeOutTail[i] = filtered * envGain * velocityGain * masterLevel * fadeGain;
     }
@@ -98,63 +143,29 @@ bool Voice::isActive() const {
     return noteNumber >= 0 && adsr.isActive();
 }
 
-void Voice::updateADSR() {
-    juce::ADSR::Parameters p {
-        attackMs.load() * 0.001f,
-        decayMs.load() * 0.001f,
-        sustainLevel.load(),
-        releaseMs.load() * 0.001f
-    };
-    adsr.setParameters(p);
-}
-
-void Voice::renderBlock(float* buffer, int numSamples,
-                        Waveform waveform, double frequency,
-                        float filterCutoff, float filterResonance,
-                        float masterLevel) {
+void Voice::render(float* out, int n, Waveform waveform,
+                   const float* cutoffHz, const float* resonance, const float* pitchRatio,
+                   const float* level, const float* sustain) {
     if (!prepared || !isActive()) return;
 
-    float freqF = (float)frequency;
-    if (freqF > 0.0f) {
-        sineOsc.setFrequency(freqF, true);
-        squareOsc.setFrequency(freqF, true);
-        sawOsc.setFrequency(freqF, true);
-        triOsc.setFrequency(freqF, true);
-    }
+    for (int i = 0; i < n; i++) {
+        if (sustain[i] != envelope.sustain) {
+            envelope.sustain = sustain[i];
+            if (held) applyEnvelope();
+        }
 
-    float mappedQ = 0.707f + filterResonance * 9.293f;
-    filter.setCutoffFrequency(filterCutoff);
-    filter.setResonance(mappedQ);
-
-    updateADSR();
-
-    for (int i = 0; i < numSamples; i++) {
         float envGain = adsr.getNextSample();
         if (envGain < 0.00001f && !adsr.isActive()) {
             noteNumber = -1;
             return;
         }
 
-        float sample = 0.0f;
-        switch (waveform) {
-            case Waveform::Sine:
-                sample = sineOsc.processSample(0.0f);
-                break;
-            case Waveform::Square:
-                sample = squareOsc.processSample(0.0f) * 0.7f;
-                break;
-            case Waveform::Saw:
-                sample = sawOsc.processSample(0.0f) * 0.6f;
-                break;
-            case Waveform::Triangle:
-                sample = triOsc.processSample(0.0f) * 0.8f;
-                break;
-        }
+        const float freq = baseFreq * pitchRatio[i];
+        if (freq != appliedFreq) setFrequency(freq);
+        setFilter(cutoffHz[i], resonance[i]);
 
-        float filtered = filter.processSample(0, sample);
-        float out = filtered * envGain * velocityGain * masterLevel;
-
+        float filtered = filter.processSample(0, nextOscSample(waveform));
+        out[i] += filtered * envGain * velocityGain * level[i];
         currentLevel = envGain * velocityGain;
-        buffer[i] += out;
     }
 }

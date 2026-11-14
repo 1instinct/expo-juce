@@ -9,10 +9,20 @@ PolySynthProcessor::PolySynthProcessor()
 }
 
 void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+    const SynthParamTargets t = loadTargets();
+    const EnvelopeSettings env { attackMs.load(), decayMs.load(), t.sustain, releaseMs.load() };
     for (int i = 0; i < MAX_VOICES; i++) {
+        voices[i].setEnvelope(env);
         voices[i].prepare(sampleRate, samplesPerBlock);
     }
     drumMachine.prepare(sampleRate);
+    smoother.prepare(sampleRate, t);
+    snapParams.store(false);
+}
+
+SynthParamTargets PolySynthProcessor::loadTargets() const {
+    return { filterCutoff.load(), filterResonance.load(), detuneCents.load(), masterLevel.load(),
+             sustainLevel.load() };
 }
 
 void PolySynthProcessor::releaseResources() {}
@@ -23,6 +33,16 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 
     const int numSamples = buffer.getNumSamples();
     const double sr = getSampleRate();
+
+    // Parameter targets for this block: ramped to (or jumped to after applySettings). The
+    // envelope times and the current sustain level go to every voice before any note starts.
+    if (snapParams.exchange(false)) smoother.snap(loadTargets());
+    else smoother.setTargets(loadTargets());
+    {
+        const EnvelopeSettings env { attackMs.load(), decayMs.load(), smoother.currentSustain(),
+                                     releaseMs.load() };
+        for (int v = 0; v < MAX_VOICES; v++) voices[v].setEnvelope(env);
+    }
 
     // Transport first, so the block-start beat / bpm / play state describe this block here as
     // they do for the effects and aux processors downstream (TransportEngine::getBlockStartBeat).
@@ -103,10 +123,6 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     });
 
     const Waveform wf = static_cast<Waveform>(waveform.load());
-    const float cutoff = filterCutoff.load();
-    const float reso = filterResonance.load();
-    const float detune = detuneCents.load();
-    const float master = masterLevel.load();
 
     float* monoBuffer = buffer.getWritePointer(0);
 
@@ -141,12 +157,12 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
             takeSeq = s < a || (s == a && !seqOutputs[si].on && arpEvents[ai].on);
         }
         const int at = std::clamp(takeSeq ? seqOutputs[si].offset : arpEvents[ai].sampleOffset, pos, numSamples);
-        if (at > pos) renderVoices(monoBuffer + pos, at - pos, wf, detune, cutoff, reso, master);
+        if (at > pos) renderVoices(monoBuffer + pos, at - pos, wf);
         pos = at;
         if (takeSeq) applySequenceOutput(seqOutputs[si++]);
         else applyArpEvent(arpEvents[ai++]);
     }
-    if (pos < numSamples) renderVoices(monoBuffer + pos, numSamples - pos, wf, detune, cutoff, reso, master);
+    if (pos < numSamples) renderVoices(monoBuffer + pos, numSamples - pos, wf);
 
     // Synth-only peak (diag.peak), then the drum part on top (with no drum sounding it does not
     // touch the buffer), split at the sequence's drum hits so each starts on its own sample.
@@ -182,19 +198,21 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
 }
 
-// Audio thread: every active voice over `numSamples` samples into `mono` (summed).
-void PolySynthProcessor::renderVoices(float* mono, int numSamples, Waveform wf, float detune, float cutoff,
-                                      float reso, float master) {
-    for (int v = 0; v < MAX_VOICES; v++) {
-        if (!voices[v].isActive()) continue;
-
-        const int note = voices[v].getNoteNumber();
-        double freq = 440.0 * std::pow(2.0, (note - 69) / 12.0);
-        if (std::fabs(detune) > 0.01f) {
-            freq *= std::pow(2.0, (double)detune / 1200.0);
+// Audio thread: every active voice over `numSamples` samples into `mono` (summed), in chunks of
+// up to SynthParamSmoother::kChunk samples: the smoother writes one value per sample per
+// parameter and every voice renders the chunk with them. The segments of a block cover it exactly,
+// so the smoother advances by the block's length; it runs with no voice active too, so a ramp
+// takes the same time whether or not a note is sounding, and a voice started at an event offset
+// begins with the values at that sample.
+void PolySynthProcessor::renderVoices(float* mono, int numSamples, Waveform wf) {
+    for (int start = 0; start < numSamples; start += SynthParamSmoother::kChunk) {
+        const int n = std::min(SynthParamSmoother::kChunk, numSamples - start);
+        smoother.next(n);
+        for (int v = 0; v < MAX_VOICES; v++) {
+            if (!voices[v].isActive()) continue;
+            voices[v].render(mono + start, n, wf, smoother.cutoff, smoother.reso, smoother.ratio,
+                             smoother.level, smoother.sustain);
         }
-
-        voices[v].renderBlock(mono, numSamples, wf, freq, cutoff, reso, master);
     }
 }
 
@@ -205,9 +223,8 @@ void PolySynthProcessor::applyArpEvent(const ArpEvent& event) {
     if (event.on) {
         allocator.noteOn(event.note, (float)std::clamp(event.velocity, 0, 127), voices,
                          static_cast<Waveform>(waveform.load()),
-                         (double)detuneCents.load(),
-                         filterCutoff.load(), filterResonance.load(),
-                         masterLevel.load(), 0, VoiceSource::Arp);
+                         smoother.currentCutoff(), smoother.currentResonance(),
+                         smoother.currentLevel(), 0, VoiceSource::Arp);
         queue->lastNoteStarted.store(event.note, std::memory_order_relaxed);
         return;
     }
@@ -225,9 +242,8 @@ void PolySynthProcessor::applySequenceOutput(const seqplay::Output& out) {
     if (out.on) {
         allocator.noteOn(out.note, (float)std::clamp((int)out.velocity, 1, 127), voices,
                          static_cast<Waveform>(waveform.load()),
-                         (double)detuneCents.load(),
-                         filterCutoff.load(), filterResonance.load(),
-                         masterLevel.load(), 0, VoiceSource::Sequence);
+                         smoother.currentCutoff(), smoother.currentResonance(),
+                         smoother.currentLevel(), 0, VoiceSource::Sequence);
         queue->lastNoteStarted.store(out.note, std::memory_order_relaxed);
         return;
     }
@@ -249,9 +265,8 @@ void PolySynthProcessor::startQueuedNote(const NoteEvent& event) {
     const int clampedVel = std::clamp(event.velocity, 0, 127);
     allocator.noteOn(clampedNote, (float)clampedVel, voices,
                      static_cast<Waveform>(waveform.load()),
-                     (double)detuneCents.load(),
-                     filterCutoff.load(), filterResonance.load(),
-                     masterLevel.load(), event.seq);
+                     smoother.currentCutoff(), smoother.currentResonance(),
+                     smoother.currentLevel(), event.seq);
     queue->lastNoteStarted.store(clampedNote, std::memory_order_relaxed);
     recordNoteLatency(event);
 }
@@ -286,47 +301,25 @@ void PolySynthProcessor::recordNoteLatency(const NoteEvent& event) {
 
 void PolySynthProcessor::setWaveform(Waveform wf) { waveform.store(static_cast<int>(wf)); }
 
-void PolySynthProcessor::setFilterCutoff(double hz) {
-    filterCutoff.store((float)std::clamp(hz, 20.0, 20000.0));
+// Non-finite values are ignored: a NaN target would stay in the smoother's ramp.
+static bool storeClamped(std::atomic<float>& dst, double v, double lo, double hi) {
+    if (!std::isfinite(v)) return false;
+    dst.store((float)std::clamp(v, lo, hi));
+    return true;
 }
 
-void PolySynthProcessor::setFilterResonance(double q) {
-    filterResonance.store((float)std::clamp(q, 0.0, 1.0));
-}
-
-void PolySynthProcessor::setAttack(double ms) {
-    float val = (float)std::clamp(ms, 1.0, 10000.0);
-    for (int i = 0; i < MAX_VOICES; i++) voices[i].attackMs.store(val);
-}
-
-void PolySynthProcessor::setDecay(double ms) {
-    float val = (float)std::clamp(ms, 1.0, 10000.0);
-    for (int i = 0; i < MAX_VOICES; i++) voices[i].decayMs.store(val);
-}
-
-void PolySynthProcessor::setSustain(double level) {
-    float val = (float)std::clamp(level, 0.0, 1.0);
-    for (int i = 0; i < MAX_VOICES; i++) voices[i].sustainLevel.store(val);
-}
-
-void PolySynthProcessor::setRelease(double ms) {
-    float val = (float)std::clamp(ms, 1.0, 10000.0);
-    for (int i = 0; i < MAX_VOICES; i++) voices[i].releaseMs.store(val);
-}
-
-void PolySynthProcessor::setDetune(double cents) {
-    detuneCents.store((float)std::clamp(cents, -1200.0, 1200.0));
-}
-
-void PolySynthProcessor::setMasterLevel(double level) {
-    masterLevel.store((float)std::clamp(level, 0.0, 1.0));
-}
+void PolySynthProcessor::setFilterCutoff(double hz) { storeClamped(filterCutoff, hz, 20.0, 20000.0); }
+void PolySynthProcessor::setFilterResonance(double q) { storeClamped(filterResonance, q, 0.0, 1.0); }
+void PolySynthProcessor::setAttack(double ms) { storeClamped(attackMs, ms, 1.0, 10000.0); }
+void PolySynthProcessor::setDecay(double ms) { storeClamped(decayMs, ms, 1.0, 10000.0); }
+void PolySynthProcessor::setSustain(double level) { storeClamped(sustainLevel, level, 0.0, 1.0); }
+void PolySynthProcessor::setRelease(double ms) { storeClamped(releaseMs, ms, 1.0, 10000.0); }
+void PolySynthProcessor::setDetune(double cents) { storeClamped(detuneCents, cents, -1200.0, 1200.0); }
+void PolySynthProcessor::setMasterLevel(double level) { storeClamped(masterLevel, level, 0.0, 1.0); }
 
 SynthSettings PolySynthProcessor::getSettings() const {
-    // The envelope is stored per voice but always set on all of them; voice 0 holds it.
     return { waveform.load(), filterCutoff.load(), filterResonance.load(),
-             voices[0].attackMs.load(), voices[0].decayMs.load(),
-             voices[0].sustainLevel.load(), voices[0].releaseMs.load(),
+             attackMs.load(), decayMs.load(), sustainLevel.load(), releaseMs.load(),
              detuneCents.load(), masterLevel.load(), arpeggiator.getSettings() };
 }
 
@@ -341,4 +334,5 @@ void PolySynthProcessor::applySettings(const SynthSettings& s) {
     setDetune(s.detuneCents);
     setMasterLevel(s.masterLevel);
     arpeggiator.setSettings(s.arp);
+    snapParams.store(true);
 }

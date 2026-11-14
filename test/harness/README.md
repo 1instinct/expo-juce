@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, seq, seqv, bg)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, seq, seqv, bg, sm, smv)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -183,6 +183,20 @@ Exit code non-zero on any failure.
   restart on foreground and after a remote play, the exclusive-session rule: never on entering the
   background stopped, kept after a lock-screen pause, never flipped by Play in the foreground).
   `mih` also checks the sink's refused hook (how a MIDI note wakes the engine from its idle stop).
+- Synth parameter smoothing (`ios/SynthParamSmoother.h`): `sm` (`SynthParamSmoother` turns a
+  cutoff step into a strictly increasing constant-ratio ramp of exactly 40 ms × sr samples that
+  ends on the target, over chunk sizes 64 / 37 / 1; ten steps at 28 Hz make one strictly
+  increasing sweep with no flat segment; level ramps linearly, detune by a constant pitch ratio,
+  `snap` jumps; through `PolySynthProcessor` in 128-sample blocks the smoothed cutoff follows the
+  same ramp, a master-level step to 0 fades a held sine over the ramp with no sample step larger
+  than the steady tone's and then outputs exact zeros, a sustain step ramps the held level,
+  `applySettings` jumps without a ramp, a note released during its decay at sustain 0 still fades
+  over its release time, and `processBlock` makes 0 allocations / frees).
+  `smv` (the same through the arpeggiator and the loop sequence, whose events split each
+  471-sample block into segments: a cutoff step follows the same ramp with arp events, sequence
+  events or none, within 1e-3 after every block, and ends on the target; an arp voice and a
+  sequence voice released at sustain 0 during their decay still fade over a 50 ms release and are
+  silent after it; finite output, 0 allocations).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

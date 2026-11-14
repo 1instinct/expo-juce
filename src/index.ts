@@ -141,7 +141,9 @@ export function allNotesOff(): void {
 }
 
 // ── Global Synth Params ──────────────────────────────────────────
-// Synchronous — all params are std::atomic
+// Synchronous — all params are std::atomic. Cutoff, resonance, detune, master level and
+// sustain ramp to the new value over 40 ms on the audio thread (no zipper noise when a
+// controller sends steps); attack / decay / release times and the waveform apply at once.
 
 export function setWaveform(waveform: 'sine' | 'square' | 'saw' | 'triangle'): void {
   ExpoJuceModule.setWaveform(waveform);

@@ -61,6 +61,7 @@ Pod::Spec.new do |s|
     "SequencePlayer.h",
     "BackgroundPolicy.h",
     "ExpoJuceMidiInput.h", # plain C, but its <stdint.h> include trips check:headers; native callers dlsym it
+    "SynthParamSmoother.h",
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)
