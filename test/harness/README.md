@@ -196,7 +196,10 @@ Exit code non-zero on any failure.
   471-sample block into segments: a cutoff step follows the same ramp with arp events, sequence
   events or none, within 1e-3 after every block, and ends on the target; an arp voice and a
   sequence voice released at sustain 0 during their decay still fade over a 50 ms release and are
-  silent after it; finite output, 0 allocations).
+  silent after it, also when attack / decay / release change during that release; non-finite
+  setter values change no setting; stealing 16 voices twice over with a detune ramp running stays
+  finite, and a voice started and stolen again before it renders leaves its tail at its own pitch;
+  finite output, 0 allocations).
 - `.gitattributes` keeps `*.sh` at LF, so `fetch_deps.sh` runs from a Windows checkout. A checkout made
   before that rule still has CRLF: `git checkout -- fetch_deps.sh` (or `sed -i 's/\r$//' fetch_deps.sh`), or copy
   an existing `build/sysroot` (with its `.done`). Inside a Windows `git worktree` WSL cannot follow the

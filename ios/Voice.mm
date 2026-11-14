@@ -30,8 +30,12 @@ void Voice::prepare(double sampleRate, int blockSize) {
     filter.prepare(spec);
     filter.setType(juce::dsp::StateVariableTPTFilter<float>::Type::lowpass);
 
+    // The ADSR's rates depend on the sample rate. A voice in its release keeps the rate its
+    // noteOff set (re-applying it now would cut a note released at sustain 0, see setEnvelope);
+    // it gets the new rates on its next note.
     adsr.setSampleRate(sampleRate);
-    applyEnvelope(true); // the rates depend on the sample rate
+    if (held || noteNumber < 0) applyEnvelope(true);
+    else appliedEnvelope.attackMs = -1.0f; // matches no envelope: applied on the next note
     cachedSampleRate = sampleRate;
     appliedFreq = appliedCutoff = appliedResonance = -1.0f;
     prepared = true;
@@ -47,8 +51,11 @@ void Voice::startNote(int note, float velocity) {
     sawOsc.reset();
     triOsc.reset();
     filter.reset();
-    // Pitch and filter are set from the smoothed values on the first rendered sample.
-    appliedFreq = appliedCutoff = appliedResonance = -1.0f;
+    // The pitch starts with this voice's last pitch ratio, so a voice stolen again before it
+    // renders leaves a tail at its own pitch; the first rendered sample sets the smoothed ratio
+    // (and the filter) of that sample.
+    setFrequency(baseFreq * lastPitchRatio);
+    appliedCutoff = appliedResonance = -1.0f;
 
     applyEnvelope();
     held = true;
@@ -161,7 +168,10 @@ void Voice::render(float* out, int n, Waveform waveform,
         }
 
         const float freq = baseFreq * pitchRatio[i];
-        if (freq != appliedFreq) setFrequency(freq);
+        if (freq != appliedFreq) {
+            setFrequency(freq);
+            lastPitchRatio = pitchRatio[i];
+        }
         setFilter(cutoffHz[i], resonance[i]);
 
         float filtered = filter.processSample(0, nextOscSample(waveform));

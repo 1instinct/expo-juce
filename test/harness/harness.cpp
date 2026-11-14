@@ -5643,7 +5643,10 @@ static bool runSequenceVoices() {
 // starts and stops voices at offsets inside 471-sample blocks follows the same ramp as with no
 // events (after every block, within 1e-3 of 200 × 40^(done / L), on 8000 Hz after it), and the
 // output stays finite. A voice the arp or the sequence releases at sustain 0 (during its decay)
-// still fades over its release time and is silent after it. 0 allocations in every processBlock.
+// still fades over its release time and is silent after it, also when the envelope times change
+// during that release. Non-finite setter values change nothing. Stealing with a detune ramp
+// running stays finite, and a voice stolen again before it renders leaves a tail at its own
+// pitch. 0 allocations in every processBlock.
 static bool runSynthSmoothingVoices() {
     constexpr double sr = 48000.0;
     const int L = (int)std::floor(SynthParamSmoother::kRampSeconds * sr);
@@ -5760,13 +5763,90 @@ static bool runSynthSmoothingVoices() {
         check(seqMid > 0.01f, "sequence voice released at sustain 0 cut instead of fading");
         check(seqAfter == 0.0f, "sequence voice not silent after its release");
     }
+    // 3. Envelope times changed while a note released at sustain 0 is fading (attack, decay and
+    //    release, which reach every voice each block): the release keeps the rate its noteOff set.
+    float timesMid = 0.0f;
+    {
+        Rig rig(sr);
+        envRig(rig);
+        rig.synth.noteOn(69, 127);
+        std::vector<float> out;
+        render(rig, 2400, &out);
+        rig.synth.noteOff(69);
+        render(rig, 471, &out);
+        rig.synth.setAttack(5.0); rig.synth.setDecay(20.0); rig.synth.setRelease(80.0);
+        render(rig, 2400, &out);
+        timesMid = peakIn(out, 1100 - 471, 1300 - 471);
+        check(timesMid > 0.01f, "release at sustain 0 cut by an envelope time change");
+        check(rig.synth.diag.activeVoices.load() == 0, "release at sustain 0 longer than its 50 ms after a time change");
+    }
+    // 4. Non-finite values are ignored: the settings and the sound stay as they were.
+    {
+        Rig rig(sr);
+        rig.synth.setFilterCutoff(1000.0);
+        rig.synth.noteOn(57, 127);
+        std::vector<float> out;
+        render(rig, 4710, &out);
+        const SynthSettings before = rig.synth.getSettings();
+        const double nan = std::numeric_limits<double>::quiet_NaN(), inf = std::numeric_limits<double>::infinity();
+        rig.synth.setFilterCutoff(nan); rig.synth.setFilterResonance(inf); rig.synth.setDetune(-inf);
+        rig.synth.setMasterLevel(nan); rig.synth.setSustain(inf); rig.synth.setAttack(nan);
+        rig.synth.setDecay(-inf); rig.synth.setRelease(nan);
+        const SynthSettings after = rig.synth.getSettings();
+        render(rig, 4710, &out);
+        const bool same = after.filterCutoff == before.filterCutoff && after.filterResonance == before.filterResonance
+            && after.detuneCents == before.detuneCents && after.masterLevel == before.masterLevel
+            && after.sustainLevel == before.sustainLevel && after.attackMs == before.attackMs
+            && after.decayMs == before.decayMs && after.releaseMs == before.releaseMs;
+        check(same, "a non-finite value changed a setting");
+        check(peakIn(out, 0, 4710) > 0.05f, "silent after non-finite values");
+    }
+    // 5. Stealing: 20 note-ons in one block on 16 voices, then 20 more, with a detune ramp
+    //    running; finite output, 16 voices. A voice started and stolen again before it renders
+    //    leaves its 96-sample tail at its own pitch (note 108 × the detune, about 4.4 kHz: ~18 sign
+    //    changes), not the previous note's (note 60, about 1).
+    int tailCrossings = -1;
+    {
+        Rig rig(sr);
+        rig.synth.setDetune(100.0);
+        render(rig, 471, nullptr);
+        rig.synth.setDetune(-100.0);
+        for (int n = 40; n < 60; ++n) rig.synth.noteOn(n, 100);
+        render(rig, 942, nullptr);
+        for (int n = 60; n < 80; ++n) rig.synth.noteOn(n, 100);
+        render(rig, 4710, nullptr);
+        check(rig.synth.diag.activeVoices.load() == MAX_VOICES, "steal: " + std::to_string(rig.synth.diag.activeVoices.load()) + " voices");
+
+        Voice v;
+        v.prepare(sr, 512);
+        float cut[64], res[64], ratio[64], lvl[64], sus[64], buf[64] = {};
+        const float r = std::exp2(100.0f / 1200.0f);
+        for (int i = 0; i < 64; ++i) { cut[i] = 20000.0f; res[i] = 0.0f; ratio[i] = r; lvl[i] = 1.0f; sus[i] = 1.0f; }
+        v.startNote(60, 127.0f);
+        v.render(buf, 64, Waveform::Sine, cut, res, ratio, lvl, sus);
+        v.captureAndRelease(Waveform::Sine, 20000.0f, 0.0f, 1.0f); // stolen: free again
+        v.startNote(108, 127.0f);                                    // started, then stolen at once
+        v.captureAndRelease(Waveform::Sine, 20000.0f, 0.0f, 1.0f);
+        tailCrossings = 0;
+        int sign = 0;
+        for (int i = 0; i < v.fadeOutTailLength; ++i) {
+            const float x = v.fadeOutTail[i];
+            const int s = x > 0.0f ? 1 : x < 0.0f ? -1 : 0;
+            if (s != 0 && sign != 0 && s != sign) ++tailCrossings;
+            if (s != 0) sign = s;
+        }
+        const double want = 2.0 * FADE_OUT_SAMPLES * 4186.01 * r / sr; // ~17.8
+        check(std::fabs(tailCrossings - want) <= 2.0, "double steal: tail has " + std::to_string(tailCrossings)
+              + " sign changes, want about " + std::to_string((int)std::lround(want)));
+    }
     check(nonFinite == 0, "non-finite output " + std::to_string(nonFinite));
     check(allocs == 0, "allocations " + std::to_string(allocs));
     const bool pass = failed == 0;
     std::printf("smv   smoothing with arp / sequence events inside blocks  %-4s cutoff ramp err none %.5f arp %.5f seq %.5f;"
-                " release@sus0 mid / after: arp %.3f / %.3f, seq %.3f / %.3f; %d failed checks%s\n",
+                " release@sus0 mid / after: arp %.3f / %.3f, seq %.3f / %.3f, times changed %.3f;"
+                " double-steal tail sign changes %d; %d failed checks%s\n",
                 pass ? "PASS" : "FAIL", worstErr[0], worstErr[1], worstErr[2], arpMid, arpAfter, seqMid, seqAfter,
-                failed, detail.c_str());
+                timesMid, tailCrossings, failed, detail.c_str());
     std::fflush(stdout);
     return pass;
 }

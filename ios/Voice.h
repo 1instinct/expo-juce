@@ -94,6 +94,7 @@ private:
     int noteNumber = -1;
     bool held = false;
     float baseFreq = 440.0f;
+    float lastPitchRatio = 1.0f;        // detune ratio of the last pitch rendered
     float velocityGain = 0.0f;
     float currentLevel = 0.0f;
     double cachedSampleRate = 44100.0;
