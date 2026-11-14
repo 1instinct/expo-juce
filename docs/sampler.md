@@ -20,6 +20,9 @@ attached to them. The API is in the README ([Sampler](../README.md#sampler-0100-
  beginBlock: acquire each slot's buffer (SamplerBank) + snapshot the slot parameters
  drained events ─► SamplerEngine::hit(slot) / noteOn(note) ─► 32 voices ─► Σ stereo × level (ramped) ─► + synth and drums ─► effects
  after the drain: releaseHeld (release marks of the queue, allNotesOff included)
+
+ setSequence (samplerHit / samplerKey) ─► SequencePlayer (audio thread, each block, against the transport)
+ its outputs, at their sample offsets ─► SamplerEngine::sequenceHit / sequenceNoteOn / sequenceRelease(tag) / sequenceStop
 ```
 
 - The synth and the drums are mono and copied to both channels; the sampler then adds its stereo
@@ -39,7 +42,8 @@ attached to them. The API is in the README ([Sampler](../README.md#sampler-0100-
   whose last sample is not 0, does not click. Everything before that is the sample untouched.
 - Releases: `samplerRelease(slot)` releases every gated voice a hit on the slot started, whoever
   hit it (the queue keeps one release mark per slot, not per caller), and `samplerNoteOff(note)`
-  every key voice of the note. A key note-on with velocity 0 is a note-off.
+  every key voice of the note; neither releases a voice the loop sequence started (0.10.0-rc.2,
+  see below). A key note-on with velocity 0 is a note-off.
 - Loops (gated slots only): from `loop.startMs` to `loop.endMs`, crossfaded over
   `min(5 ms, loop length / 3)`. Approaching the loop's end the voice fades to the audio just
   before the loop's start, then jumps there, so the seam is continuous. A loop that starts within
@@ -53,15 +57,63 @@ attached to them. The API is in the README ([Sampler](../README.md#sampler-0100-
   released earliest, else the oldest. A stolen voice, and every voice of a slot whose buffer
   changes (load, unload), stops reading its buffer at once and fades its last output out over 64
   samples.
-- Level and mute ramp per 256-sample chunk; the first block after `prepare` starts at the target.
+- Level and mute ramp linearly over 256 samples, carried across blocks (0.10.0-rc.2: also across
+  the pieces a block is rendered in when the loop sequence's sampler events split it; before, the
+  ramp took the first 256 samples of each block, or the whole block when shorter). With nothing
+  sounding, and in the first block after `prepare`, the level jumps to its target.
 
-## With the loop sequence and the background policy (0.9.0-rc.5)
+## With the loop sequence (0.10.0-rc.2)
 
-- The loop sequence player (`setSequence`) has note and drum events only: its notes start synth
-  voices (or feed the arpeggiator) and its drum hits the drum part. None reaches the sampler, a
-  pad in sampler mode hits the sampler directly, and a transport stop or jump releases only what
-  the sequence started, so sampler voices are left alone. A sampler part in a loop is played from
-  JS (`samplerHit` on the beat) until a sequence event kind for the sampler exists.
+The loop sequence player (`setSequence`, `ios/SequencePlayer.h`) plays two sampler event kinds
+next to its synth notes and drum hits:
+
+- `samplerHit` (`note` = slot 0–15): a pad hit at the slot's root note at `start`, released
+  `length` beats later (a gated slot stops there over its `releaseMs`; a one-shot slot ignores the
+  release and plays on).
+- `samplerKey` (`note` 0–127): a key note on every loaded slot whose zone holds it at `start`,
+  off `length` beats later.
+
+Both fire on the audio thread at their exact sample, like notes: `PolySynthProcessor` renders the
+sampler in segments split at the sequence's sampler events, so each starts (or releases) on its
+own sample, inside the block and across block boundaries and the loop's wrap. They never go
+through the arpeggiator. No lock, allocation or wait is added on the audio thread.
+
+Holds. Every voice records its source: live (`samplerHit` / `samplerNoteOn` through the note
+queue, from a pad, JS or MIDI, with the queue's sequence number) or the sequence (with a tag the
+player gives each start; no queue sequence number). The two never release each other:
+
+| What | Live voices | The sequence's voices |
+|---|---|---|
+| `samplerRelease(slot)` / `samplerNoteOff(note)` (the queue's release marks) | every gated voice of the slot / key, whoever hit it | untouched |
+| The sequence's release (end of `length`, an event gone from a new sequence) | untouched | the voices of that one start (by tag; overlapping hits on one slot each end on their own) |
+| The sequence stops: transport stop, jump, loop-length change, mute, `clearSequence`, `allNotesOff` | untouched (`allNotesOff` still releases gated live voices, as before) | all end: gated over `releaseMs`, one-shots over 5 ms |
+| Interruption cut, keepAlive-off silence (`pushSamplerCut` / `pushSamplerSilence`) | end (as in 0.10.0-rc.1) | end the same way |
+| Choke groups, polyphony / stealing, `level` / `mute`, a slot's load / unload | shared | shared |
+
+So a live pad hitting a slot the sequence holds starts a second voice on that slot (the two layer;
+a choke group still fades the other one). `samplerRelease` on that slot ends the live voice and
+leaves the sequence's playing until its length ends; the sequence's release ends its own voice
+and leaves the live one held until `samplerRelease`. The pad view's sampler mode is live.
+
+A new sequence (`setSequence` while playing) only releases: a gated hold whose event (same start,
+kind and slot / key) is gone is released, one whose event is still there keeps sounding with the
+new length, and a one-shot it started plays on (as a drum hit does). A stop after that still ends it.
+
+`onSequenceNotes` reports `samplerHit` / `samplerKey` starts and releases with their `kind` (a
+release per start; drum hits report starts only), so an app can light its pads.
+
+Internally the player emits a `SamplerStop` output (never in a sequence, never reported) whenever
+it releases everything after having started a sampler event; the synth applies it as
+`SamplerEngine::sequenceStop`. The note queue's marks (`allNotesOff`, the silence and the cut) each
+take a sequence number of their own since 0.10.0-rc.2, so each push of one is applied even when
+nothing was queued since the previous one: the sequence's voices carry no queue number, and
+before, a second interruption with only the sequence playing left them sounding.
+
+## The background policy (0.9.0-rc.5)
+
+- The idle stop: a loop that plays only sampler events counts as busy like any other (the
+  transport plays, the player's holds count in `sequenceNotes` and its voices in
+  `voicesSounding`), and Now Playing follows the transport the same way.
 - Background policy: sounding sampler voices count as busy for the idle stop
   (`voicesSounding` = synth + drums + sampler), so the device is not closed under a one-shot.
   The counts are the last block's, so they count only while the device runs (0.10.0-rc.1).
@@ -141,5 +193,7 @@ timing), `sml` (WAV and MP3 loads, supersede, too long, memory cap, hand-off), `
 while rendering, no allocation on the audio thread), `smq` (through `PolySynthProcessor` and the
 note queue, arpeggiator off and on, `allNotesOff`, the silence mark, a sequence playing alongside), `smrt`
 (the silence mark racing the drain, the interruption cut, discarding what was queued while the
-device was stopped) and `smd` (`src/samplerDefaults.ts` matches the native defaults). The Objective-C++ / Swift glue and the pad's sampler mode are compiled first by
+device was stopped), `seqsm` (the loop sequence's sampler events: offsets, release, stop / jump /
+swap / loop length / clear / allNotesOff, live and sequence holds on one slot, mute, smoothing, the
+cut / silence / discard paths, validation, a sampler-only loop) and `smd` (`src/samplerDefaults.ts` matches the native defaults). The Objective-C++ / Swift glue and the pad's sampler mode are compiled first by
 the iOS build.

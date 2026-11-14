@@ -205,11 +205,13 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 
 // Loop sequence (SequencePlayer.h, 0.9.0-rc.5): played on the audio thread against the transport.
 // data: `count` numbers, 6 per event: start (beats, 0 <= start < loopBeats), length (beats > 0;
-// drums: ignored), note (0–127, or the drum voice 0–8), velocity (1–127), kind (0 note, 1 drum),
-// skipBefore (absolute beat, NaN = none). fromBeat / endBeat: absolute beats; nothing fires before
-// fromBeat or at / after endBeat (-inf / +inf = no bound). Any thread but the audio thread; the
-// new sequence replaces the old one atomically. NO (nothing changes): count not a multiple of 6,
-// more than 8192 events, a bad loop length with events.
+// drums: ignored), note (0–127, the drum voice 0–8 or the sampler slot 0–15), velocity (1–127),
+// kind (0 note, 1 drum, 2 sampler pad hit, 3 sampler key note; 0.10.0-rc.2), skipBefore (absolute
+// beat, NaN = none). fromBeat / endBeat: absolute beats; nothing fires before fromBeat or at / after
+// endBeat (-inf / +inf = no bound). Any thread but the audio thread; the new sequence replaces the
+// old one atomically. NO (nothing changes): count not a multiple of 6, more than 8192 events, a bad
+// loop length with events, an unknown kind, a sampler slot outside 0–15 or a sampler key outside
+// 0–127 (diagnostics sequence.rejectedEvent / rejectReason name it).
 - (BOOL)setSequenceData:(const double *)data
                   count:(NSInteger)count
               loopBeats:(double)loopBeats

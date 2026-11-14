@@ -423,6 +423,16 @@ static void emitEngineEvent(NSString *name, NSDictionary<NSString *, id> *body) 
     });
 }
 
+// The JS name of a sequence event kind (SequenceEvent.kind).
+static NSString *sequenceKindName(seqplay::EventKind kind) {
+    switch (kind) {
+        case seqplay::EventKind::Drum: return @"drum";
+        case seqplay::EventKind::SamplerHit: return @"samplerHit";
+        case seqplay::EventKind::SamplerKey: return @"samplerKey";
+        default: return @"note";
+    }
+}
+
 // engineEventQueue: the notes the sequence fired since the last drain, as one onSequenceNotes batch.
 static void drainSequenceNotes() {
     @autoreleasepool {
@@ -430,7 +440,7 @@ static void drainSequenceNotes() {
         sSequenceLog.drain([&](const seqplay::NoteLog::Entry& e) {
             [notes addObject:@{
                 @"note": @(e.note),
-                @"kind": e.kind == seqplay::EventKind::Drum ? @"drum" : @"note",
+                @"kind": sequenceKindName(e.kind),
                 @"on": @(e.on ? YES : NO),
                 @"atBeat": @(e.atBeat),
             }];
@@ -1841,6 +1851,8 @@ static int mainThreadMaxFramesPerSecond() {
         @"lateFires": @((double)sSequence.lateFires.load(relaxed)),
         @"dropped": @((double)sSequence.dropped.load(relaxed)),
         @"invalidEvents": @(sSequence.lastInvalidCount()),
+        @"rejectedEvent": @(sSequence.lastRejectedEvent()),
+        @"rejectReason": @(seqplay::rejectText(sSequence.lastReject())),
         @"version": @((double)sSequence.version()),
         @"listening": @(sSequenceLog.listening.load(relaxed) ? YES : NO),
         @"notesLost": @((double)sSequenceLog.lost.load(relaxed)),
@@ -2627,10 +2639,18 @@ static bool applySamplerParams(int slot, NSDictionary<NSString *, id> *params) {
         seqplay::Event& e = parsed[(size_t)i];
         e.start = f[0];
         e.length = f[1];
-        // Out-of-range numbers become values sanitizeEvent rejects (255), never a wrapped note.
+        // Kinds: 0 note, 1 drum, 2 sampler pad hit, 3 sampler key note; anything else refuses the
+        // whole sequence (rejectReason), as does a sampler slot / key that is not an integer in range.
+        seqplay::EventKind kind = (seqplay::EventKind)255;
+        if (f[4] == 0.0) kind = seqplay::EventKind::Note;
+        else if (f[4] == 1.0) kind = seqplay::EventKind::Drum;
+        else if (f[4] == 2.0) kind = seqplay::EventKind::SamplerHit;
+        else if (f[4] == 3.0) kind = seqplay::EventKind::SamplerKey;
+        e.kind = kind;
+        // Out-of-range numbers become values sanitizeEvent / rejectReason refuse (255), never a wrapped note.
         e.note = (std::isfinite(f[2]) && f[2] >= 0.0 && f[2] <= 127.0) ? (uint8_t)std::lround(f[2]) : (uint8_t)255;
+        if (seqplay::isSamplerKind(kind) && std::isfinite(f[2]) && f[2] != std::floor(f[2])) e.note = 255;
         e.velocity = std::isfinite(f[3]) ? (uint8_t)std::clamp(std::lround(f[3]), 1L, 127L) : (uint8_t)100;
-        e.kind = f[4] == 1.0 ? seqplay::EventKind::Drum : (f[4] == 0.0 ? seqplay::EventKind::Note : (seqplay::EventKind)255);
         e.skipBefore = std::isnan(f[5]) ? -std::numeric_limits<double>::infinity() : f[5];
     }
     const seqplay::SetResult result = sSequence.set(parsed.data(), (int)events, loopBeats, fromBeat, endBeat);

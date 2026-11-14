@@ -146,9 +146,12 @@ public:
     // the audio thread drains only after it applied the mark (pushed while it drained) never
     // starts (PolySynthProcessor::startSamplerEvent), so the mark cannot be spent before an event
     // it covers is in the ring. Taken under the producers' lock, so it covers whole pushes only.
+    // Like every mark (0.10.0-rc.2), it takes a sequence number of its own, so it moves even when
+    // nothing was pushed since the last one: the consumer sees each push of it, and voices the loop
+    // sequence started (no sequence number, seq 0) are covered by every one.
     void pushSamplerSilence() {
         SpinGuard guard(producerLock);
-        raise(samplerSilencedUpTo, lastSeq.load(std::memory_order_relaxed));
+        raise(samplerSilencedUpTo, takeMarkSeq());
     }
 
     // pushSamplerSilence with no fade (0.10.0-rc.1): the voices it covers stop at once and every
@@ -158,7 +161,7 @@ public:
     // too, so everything pushSamplerSilence promises holds.
     void pushSamplerCut() {
         SpinGuard guard(producerLock);
-        const uint64_t seq = lastSeq.load(std::memory_order_relaxed);
+        const uint64_t seq = takeMarkSeq();
         raise(samplerSilencedUpTo, seq);
         raise(samplerCutUpTo, seq);
     }
@@ -180,9 +183,12 @@ public:
         raise(releasedUpTo[note], lastOnSeq[note].load(std::memory_order_acquire));
     }
 
-    // Releases every note-on pushed so far.
+    // Releases every note-on pushed so far. Takes a sequence number of its own (0.10.0-rc.2), so
+    // the mark moves even with nothing pushed since the last allNotesOff: the consumer then still
+    // releases what the loop sequence holds and clears the arpeggiator's latched list.
     void pushAllNotesOff() {
-        raise(allReleasedUpTo, lastSeq.load(std::memory_order_acquire));
+        SpinGuard guard(producerLock);
+        raise(allReleasedUpTo, takeMarkSeq());
     }
 
     // ── Consumer (the audio thread) ──
@@ -314,6 +320,14 @@ private:
         pushedCount.fetch_add(1, std::memory_order_relaxed); // under the lock, before publishing (requestDiscard)
         writePos.store(next, std::memory_order_release);
         return true;
+    }
+
+    // Under producerLock: a new sequence number for a mark (above every event pushed so far, below
+    // every event pushed later). No event carries it.
+    uint64_t takeMarkSeq() {
+        const uint64_t seq = lastSeq.load(std::memory_order_relaxed) + 1;
+        lastSeq.store(seq, std::memory_order_release);
+        return seq;
     }
 
     static void raise(std::atomic<uint64_t>& mark, uint64_t value) {

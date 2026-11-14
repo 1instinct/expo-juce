@@ -429,8 +429,13 @@ public class ExpoJuceModule: Module {
       return true
     }
 
-    // data: 6 numbers per event (start, length, note, velocity, kind 0 note / 1 drum, skipBefore or
-    // NaN for none); fromBeat / endBeat: -Infinity / Infinity for no bound (JSI passes NaN and the
+    // Lets JS detect a binary whose sequence player plays sampler events (0.10.0-rc.2).
+    Function("hasSequenceSampler") { () -> Bool in
+      return true
+    }
+
+    // data: 6 numbers per event (start, length, note, velocity, kind 0 note / 1 drum / 2 sampler pad
+    // hit / 3 sampler key note, skipBefore or NaN for none); fromBeat / endBeat: -Infinity / Infinity for no bound (JSI passes NaN and the
     // infinities as numbers). false (nothing changes) for a bad array, over 8192 events or a bad loop.
     Function("setSequence") { (data: [Double], loopBeats: Double, fromBeat: Double, endBeat: Double) -> Bool in
       return data.withUnsafeBufferPointer { buffer in
