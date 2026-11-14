@@ -14,6 +14,9 @@ PolySynthProcessor::~PolySynthProcessor() {
 }
 
 void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+    // Cleared before the targets are read: an applySettings landing after this line sets it again
+    // and its jump is still taken by the next block.
+    snapParams.store(false);
     const SynthParamTargets t = loadTargets();
     const EnvelopeSettings env { attackMs.load(), decayMs.load(), t.sustain, releaseMs.load() };
     for (int i = 0; i < MAX_VOICES; i++) {
@@ -24,7 +27,6 @@ void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     samplerEngine.prepare(sampleRate, samplesPerBlock);
     if (SamplerBufferSource* source = samplerEngine.bufferSource()) source->requestRate(sampleRate);
     smoother.prepare(sampleRate, t);
-    snapParams.store(false);
 }
 
 SynthParamTargets PolySynthProcessor::loadTargets() const {

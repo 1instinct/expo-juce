@@ -5855,15 +5855,15 @@ static bool runSynthSmoothingVoices() {
     //    first sample of the block after the hit.
     double samplerDiff = -1.0;
     {
-        std::vector<float> L(24000), R(24000);
+        std::vector<float> srcL(24000), srcR(24000);
         for (int i = 0; i < 24000; ++i) {
-            L[(size_t)i] = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi * 997.0 * i / sr);
-            R[(size_t)i] = 0.25f * (float)std::cos(2.0 * juce::MathConstants<double>::pi * 331.0 * i / sr);
+            srcL[(size_t)i] = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi * 997.0 * i / sr);
+            srcR[(size_t)i] = 0.25f * (float)std::cos(2.0 * juce::MathConstants<double>::pi * 331.0 * i / sr);
         }
         auto run = [&](bool synthBusy, bool hit, std::vector<float>& outL, std::vector<float>& outR) {
             SamplerBank bank;
             std::string error;
-            bank.install(3, SamplerBank::fromAudio(L.data(), R.data(), 24000, sr), bank.beginLoad(3), error);
+            bank.install(3, SamplerBank::fromAudio(srcL.data(), srcR.data(), 24000, sr), bank.beginLoad(3), error);
             TransportEngine transport;
             PolySynthProcessor synth;
             synth.setTransport(&transport);
