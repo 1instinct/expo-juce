@@ -156,7 +156,9 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // before setup and survive rebuilds. samplerHit (pads: the slot at its root) / samplerNoteOn (keys:
 // every loaded slot whose zone holds the note): velocity clamped to 1–127; any thread, lock-free,
 // through the note queue; dropped while the engine is not ready, like noteOn. samplerRelease /
-// samplerNoteOff are always recorded (like noteOff). Out-of-range slot / note: ignored.
+// samplerNoteOff (and samplerNoteOn with velocity 0, a note-off) are always recorded (like
+// noteOff). Out-of-range slot / note: ignored. samplerRelease releases every gated voice that a
+// hit on the slot started, whoever hit it (two pads on one slot share the release).
 - (void)samplerHit:(int)slot velocity:(int)velocity;
 // samplerHit from a native touch (JucePadView in sampler mode); touchTimestamp as for noteOn.
 - (void)samplerHit:(int)slot velocity:(int)velocity touchTimestamp:(double)touchTimestamp
@@ -174,12 +176,15 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // { level, mute, polyphony, slots: [16 × { loaded, frames, durationMs, ...params }] } as stored.
 - (NSDictionary<NSString *, id> *)samplerState;
 // Decodes `uri` (file:// URL or absolute path) on a background queue at the device rate and swaps
-// it into `slot`. A later load / unload of the slot supersedes it (ERR_SAMPLER_SUPERSEDED).
-// `completion` runs on that background queue: { frames, sampleRate, channels, durationMs } on
-// success, else errorCode (ERR_SAMPLER_SLOT / _FILE / _FORMAT / _TOO_LONG / _MEMORY /
-// _SUPERSEDED) + message.
+// it into `slot`. `params` (partial, as setSamplerSlot; nil = none) are applied right before the
+// sample is published, and only if it is, so a failed or superseded load leaves the slot's
+// current parameters intact. A later load / unload of the slot supersedes it
+// (ERR_SAMPLER_SUPERSEDED). `completion` runs on that background queue: { frames, sampleRate,
+// channels, durationMs } on success, else errorCode (ERR_SAMPLER_SLOT / _FILE / _FORMAT /
+// _TOO_LONG / _MEMORY / _SUPERSEDED) + message.
 - (void)loadSamplerSlot:(int)slot
                     uri:(NSString *)uri
+                 params:(NSDictionary<NSString *, id> *)params
              completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode,
                                   NSString *errorMessage))completion;
 - (BOOL)unloadSamplerSlot:(int)slot; // NO: slot out of range

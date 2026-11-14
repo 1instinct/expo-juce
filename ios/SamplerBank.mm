@@ -133,7 +133,10 @@ std::unique_ptr<SamplerSample> SamplerBank::decode(const std::string& path, doub
                 return nullptr;
             }
             const int n = (int)std::min<int64_t>(kChunk, frames - done);
-            reader->read(dest, (int)done, n, done, true, channels > 1);
+            if (!reader->read(dest, (int)done, n, done, true, channels > 1)) {
+                error = "ERR_SAMPLER_FILE: read failed at frame " + std::to_string(done) + " of " + std::to_string(frames);
+                return nullptr;
+            }
             if (channels == 1) dest->copyFrom(1, (int)done, *dest, 0, (int)done, n);
             done += n;
         }
@@ -198,7 +201,14 @@ int64_t SamplerBank::residentBytesLocked(int skipSlot) const {
     return total;
 }
 
-bool SamplerBank::load(int slot, uint64_t gen, const std::string& path, SamplerLoadInfo& info, std::string& error) {
+int64_t SamplerBank::retiredBytesLocked() const {
+    int64_t total = 0;
+    for (const SamplerSample* s : retired) total += s->bytes();
+    return total;
+}
+
+bool SamplerBank::load(int slot, uint64_t gen, const std::string& path, SamplerLoadInfo& info, std::string& error,
+                       const BeforePublish& beforePublish) {
     if (slot < 0 || slot >= kSamplerSlots) {
         error = slotError(slot);
         return false;
@@ -207,17 +217,19 @@ bool SamplerBank::load(int slot, uint64_t gen, const std::string& path, SamplerL
         error = kSuperseded;
         return false;
     }
+    collect(); // frees what it can now, so stale retired samples do not shrink the budget (never blocks)
     int64_t budget;
     {
         std::lock_guard<std::mutex> lock(mutex);
-        budget = std::max<int64_t>(0, memoryCapBytes() - residentBytesLocked(slot));
+        budget = std::max<int64_t>(0, memoryCapBytes() - residentBytesLocked(slot) - retiredBytesLocked());
     }
     auto sample = decode(path, wantedSampleRate(), [this, slot, gen] { return !isCurrent(slot, gen); }, budget, info, error);
     if (!sample) return false;
-    return install(slot, std::move(sample), gen, error);
+    return install(slot, std::move(sample), gen, error, beforePublish);
 }
 
-bool SamplerBank::install(int slot, std::unique_ptr<SamplerSample> sample, uint64_t gen, std::string& error) {
+bool SamplerBank::install(int slot, std::unique_ptr<SamplerSample> sample, uint64_t gen, std::string& error,
+                          const BeforePublish& beforePublish) {
     if (slot < 0 || slot >= kSamplerSlots) {
         error = slotError(slot);
         return false;
@@ -226,19 +238,22 @@ bool SamplerBank::install(int slot, std::unique_ptr<SamplerSample> sample, uint6
         error = "ERR_SAMPLER_FORMAT: empty audio";
         return false;
     }
+    collect(); // retired samples the reader has let go of no longer count against the cap
     std::lock_guard<std::mutex> lock(mutex);
     if (!isCurrent(slot, gen)) {
         error = kSuperseded;
         return false;
     }
-    const int64_t others = residentBytesLocked(slot);
+    const int64_t others = residentBytesLocked(slot) + retiredBytesLocked();
     const int64_t cap = memoryCapBytes();
     if (others + sample->bytes() > cap) {
-        error = "ERR_SAMPLER_MEMORY: needs " + megabytes(sample->bytes()) + "; the other slots hold " + megabytes(others)
+        error = "ERR_SAMPLER_MEMORY: needs " + megabytes(sample->bytes()) + "; the other slots and samples not yet freed hold " + megabytes(others)
               + " of the " + megabytes(cap) + " cap";
         return false;
     }
     const int channels = sample->channels;
+    reserveRetiredLocked(); // before beforePublish: if growing throws, nothing has changed
+    if (beforePublish) beforePublish();
     publishLocked(slot, std::move(sample), channels);
     return true;
 }
@@ -247,12 +262,19 @@ bool SamplerBank::unload(int slot) {
     if (slot < 0 || slot >= kSamplerSlots) return false;
     generation[slot].fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(mutex);
+    reserveRetiredLocked();
     publishLocked(slot, nullptr, 0);
     return true;
 }
 
 void SamplerBank::unloadAll() {
     for (int s = 0; s < kSamplerSlots; ++s) unload(s);
+}
+
+// Room for one more retired sample, so publishLocked's push_back never allocates (or throws) after
+// its exchange.
+void SamplerBank::reserveRetiredLocked() {
+    if (retired.size() == retired.capacity()) retired.reserve(retired.capacity() * 2 + 2 * kSamplerSlots);
 }
 
 void SamplerBank::publishLocked(int slot, std::unique_ptr<SamplerSample> next, int channels) {
@@ -267,7 +289,7 @@ void SamplerBank::publishLocked(int slot, std::unique_ptr<SamplerSample> next, i
     }
     infos[slot] = info;
     SamplerSample* old = published[slot].exchange(next.release(), std::memory_order_seq_cst);
-    if (old != nullptr) retired.push_back(old);
+    if (old != nullptr) retired.push_back(old); // capacity reserved by the caller
 }
 
 int SamplerBank::collect() {
@@ -287,6 +309,11 @@ int SamplerBank::collect() {
     });
     retired.erase(it, retired.end());
     return (int)retired.size();
+}
+
+int64_t SamplerBank::retiredBytes() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return retiredBytesLocked();
 }
 
 int64_t SamplerBank::residentBytes() const {

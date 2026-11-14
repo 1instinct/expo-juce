@@ -34,6 +34,12 @@ attached to them. The API is in the README ([Sampler](../README.md#sampler-0100-
 - Envelope: linear attack from 0 over `attackMs`, hold, linear release to exact 0 over
   `releaseMs` from wherever the level is. One-shot slots ignore releases and note-offs and play
   from `startMs` to `endMs`; gated slots (`oneShot: false`) play while held, then release.
+- End fade: a voice reaching `endMs` (or the sample's end) without looping fades linearly to 0
+  over its last 1 ms of output (at most half its length), so a sample trimmed mid-sound, or one
+  whose last sample is not 0, does not click. Everything before that is the sample untouched.
+- Releases: `samplerRelease(slot)` releases every gated voice a hit on the slot started, whoever
+  hit it (the queue keeps one release mark per slot, not per caller), and `samplerNoteOff(note)`
+  every key voice of the note. A key note-on with velocity 0 is a note-off.
 - Loops (gated slots only): from `loop.startMs` to `loop.endMs`, crossfaded over
   `min(5 ms, loop length / 3)`. Approaching the loop's end the voice fades to the audio just
   before the loop's start, then jumps there, so the seam is continuous. A loop that starts within
@@ -58,12 +64,16 @@ Like the backing track:
 2. The file is decoded in chunks of 65536 frames, converted to stereo (mono to both channels,
    the first two of more) and resampled to the device rate (non-cyclic Hermite). Before
    allocating, it refuses a sample over 60 s (`ERR_SAMPLER_TOO_LONG`), more than the 256 MB cap
-   minus the other slots, or more than the process may still allocate (`os_proc_available_memory`;
-   `ERR_SAMPLER_MEMORY`). A later load or unload of the slot is noticed between chunks and before
+   minus the other slots and the retired samples not yet freed, or more than the process may still
+   allocate (`os_proc_available_memory`; `ERR_SAMPLER_MEMORY`). A short read fails with
+   `ERR_SAMPLER_FILE`. A later load or unload of the slot is noticed between chunks and before
    publishing (`ERR_SAMPLER_SUPERSEDED`).
-3. The new buffer is published by an atomic pointer swap. The audio thread acknowledges the
-   buffer it reads at the start of every block (a hazard pointer, re-validated against the
-   published one). The replaced buffer goes to a retired list.
+3. Under the bank's lock, after the generation and the cap are checked again, the load's
+   parameters (if any) are written to the slot, then the new buffer is published by an atomic
+   pointer swap. A load that fails or is superseded never touches the slot's parameters. The audio
+   thread acknowledges the buffer it reads at the start of every block (a hazard pointer,
+   re-validated against the published one). The replaced buffer goes to a retired list, whose
+   capacity is grown before the swap, so the swap is never followed by an allocation.
 4. The main thread frees retired buffers the audio thread no longer marks (`collect`), retrying
    every 100 ms while one is still in use.
 
@@ -86,7 +96,11 @@ voices.
 - 32 voices, all looping and pitched, stereo, at 48 kHz / 128 frames: about 23 µs per block on a
   desktop x86 core (harness case `smb`, 0.009 × realtime, budget 60 µs), no allocations. A phone
   core is a few times slower, still a small part of the 2.7 ms block.
-- Sample memory: 8 bytes per frame (stereo float): one minute at 48 kHz is about 23 MB.
+- Sample memory: 8 bytes per frame (stereo float): one minute at 48 kHz is about 23 MB. Retired
+  samples count against the cap until freed; only the sample being replaced is left out, so the
+  peak is the cap plus that one sample (60 s at most) until the main thread frees it.
+- `PolySynthProcessor::processBlock` runs with flush-to-zero (`juce::ScopedNoDenormals`), so
+  decaying envelopes and filters never hit denormals.
 
 ## Verified where
 

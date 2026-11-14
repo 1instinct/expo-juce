@@ -11,12 +11,13 @@
   one-shot or gated, gain, pan, tune and fine tune, linear attack / release, velocity
   sensitivity and choke groups 1–8. Pitch by playback rate with 4-point Hermite interpolation.
   Voice stealing takes the voice released earliest, else the oldest; stolen voices fade over 64
-  samples. Sampler-wide `level`, `mute` and `polyphony` (1–32). See `docs/sampler.md`.
+  samples, and a sound reaching its end fades over its last 1 ms. Sampler-wide `level`, `mute` and `polyphony` (1–32). See `docs/sampler.md`.
 - `loadSamplerSlot(slot, uri, params?)`: decodes a local file (WAV, AIFF, FLAC, MP3, CoreAudio
   formats) and resamples it to the device rate on a loader queue, then publishes it by an atomic
   pointer swap with a hazard pointer, like the backing track; replaced samples are freed on the
   main thread once the audio thread has moved past them. Up to 60 s per sample and 256 MB across
-  slots. A later load or unload of the slot supersedes a load in flight. Resolves with
+  slots, counting replaced samples not yet freed. `params` are applied right before the sample is
+  published, and only if it is. A later load or unload of the slot supersedes a load in flight. Resolves with
   `{ frames, sampleRate, channels, durationMs }`; rejects with `ERR_SAMPLER_SLOT`,
   `ERR_SAMPLER_FILE`, `_FORMAT`, `_TOO_LONG`, `_MEMORY` or `_SUPERSEDED`.
 - `hasSampler`, `unloadSamplerSlot`, `setSamplerSlot`, `setSampler`, `getSamplerState`, and the
@@ -26,7 +27,9 @@
 - `JucePadView` `mode="sampler"`: every touch-down hits slot `note` (a second finger retriggers);
   the last touch-up releases it.
 - The note queue carries sampler pad hits and key note-ons with their own release marks;
-  `allNotesOff` releases them too.
+  `allNotesOff` releases them too. A slot's release is per slot (it releases every holder), and a
+  key note-on with velocity 0 is a note-off.
+- `PolySynthProcessor::processBlock` runs with flush-to-zero (`juce::ScopedNoDenormals`).
 - Diagnostics: `samplerHits`, `samplerVoices`, `samplerPeak`, `samplerBytes`.
 - Harness cases `sm`, `smb` (32 voices: about 23 µs per 128-frame block at 48 kHz on a desktop
   core, budget 60), `sml`, `sms`, `smq`, `smd`.

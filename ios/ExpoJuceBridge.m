@@ -143,8 +143,9 @@
 + (NSDictionary<NSString *, id> *)getSamplerState { return [[ExpoJuceAudioEngine sharedInstance] samplerState]; }
 + (void)loadSamplerSlot:(int)slot
                     uri:(NSString *)uri
+                 params:(NSDictionary<NSString *, id> *)params
              completion:(void (^)(NSDictionary<NSString *, id> *, NSString *, NSString *))completion {
-    [[ExpoJuceAudioEngine sharedInstance] loadSamplerSlot:slot uri:uri completion:completion];
+    [[ExpoJuceAudioEngine sharedInstance] loadSamplerSlot:slot uri:uri params:params completion:completion];
 }
 + (BOOL)unloadSamplerSlot:(int)slot { return [[ExpoJuceAudioEngine sharedInstance] unloadSamplerSlot:slot]; }
 

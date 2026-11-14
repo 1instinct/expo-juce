@@ -375,16 +375,21 @@ if (ExpoJuce.hasSampler()) {
 - `loadSamplerSlot(slot, uri, params?)`: a local file (`file://` URI or absolute path; WAV, AIFF,
   FLAC, MP3, plus CoreAudio formats such as M4A) decoded and resampled to the device rate off the
   audio thread, then swapped in; voices still playing the slot's previous sample fade out over 64
-  samples. `params` (partial) apply at once. Limits: 60 s per sample, 256 MB across all slots (the
-  slot being replaced does not count), and the memory the process may still allocate. A later
+  samples. `params` (partial) are applied right before the new sample is published, and only if
+  it is (a failed or superseded load leaves the slot's parameters as they were). Limits: 60 s per
+  sample, 256 MB across all slots (replaced samples not yet freed count; the slot being replaced
+  does not), and the memory the process may still allocate. A later
   load or `unloadSamplerSlot` of the same slot supersedes a load in flight. Rejects with
   `ERR_SAMPLER_SLOT`, `ERR_SAMPLER_FILE`, `_FORMAT`, `_TOO_LONG`, `_MEMORY`, `_SUPERSEDED`, or
   `ERR_UNSUPPORTED` (no sampler in this binary).
 - `samplerHit(slot, velocity)` / `samplerRelease(slot)` (pads) and `samplerNoteOn(note, velocity)` /
   `samplerNoteOff(note)` (keys): any thread, lock-free, through the same queue as `noteOn`. A
   one-shot slot plays to its end and ignores releases; a gated slot (`oneShot: false`) plays while
-  held, then releases. Velocity is clamped to 1–127; an out-of-range slot or note is ignored;
-  hits are dropped while the engine is not set up. `allNotesOff()` releases the sampler too.
+  held, then releases. A sound reaching its end fades over its last 1 ms (no click). Velocity is
+  clamped to 1–127 (`samplerNoteOn` with velocity 0 is a note-off); an out-of-range slot or note
+  is ignored; hits are dropped while the engine is not set up. `allNotesOff()` releases the
+  sampler too. `samplerRelease(slot)` is per slot, not per caller: it releases every gated sound a
+  hit on the slot started, including another pad's.
 - `setSamplerSlot(slot, params)` (`SamplerSlotParams`; omitted and unknown keys unchanged,
   numbers clamped; `false` for a slot outside 0–15) and `setSampler({ level, mute, polyphony })`.
   Defaults: `SAMPLER_SLOT_DEFAULTS`, `SAMPLER_DEFAULTS`; `SAMPLER_SLOT_COUNT` (16) and

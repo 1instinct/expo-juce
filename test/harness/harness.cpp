@@ -41,6 +41,12 @@
 // JUCE's HeapBlock both end up here); while tCountAllocs is set on a thread, every allocation it
 // makes is counted. The fake device sets it around each GraphPlayer IO callback, so any
 // allocation anywhere inside the render (GraphPlayer, AudioProcessorGraph, synth) shows up.
+// A sanitizer build (-DHARNESS_SANITIZE=address|thread|…) leaves malloc to the sanitizer: the
+// counters then stay 0, and that build checks memory errors and races instead.
+static thread_local bool tCountAllocs = false;
+static std::atomic<uint64_t> gRenderAllocs{0};
+static std::atomic<uint64_t> gRenderFrees{0}; // frees inside counted render calls (must be 0 too)
+#ifndef HARNESS_NO_MALLOC_INTERPOSE
 extern "C" {
 void* __libc_malloc(size_t);
 void* __libc_calloc(size_t, size_t);
@@ -48,9 +54,6 @@ void* __libc_realloc(void*, size_t);
 void* __libc_memalign(size_t, size_t);
 void __libc_free(void*);
 }
-static thread_local bool tCountAllocs = false;
-static std::atomic<uint64_t> gRenderAllocs{0};
-static std::atomic<uint64_t> gRenderFrees{0}; // frees inside counted render calls (must be 0 too)
 static inline void countAlloc() {
     if (tCountAllocs) gRenderAllocs.fetch_add(1, std::memory_order_relaxed);
 }
@@ -72,6 +75,7 @@ void free(void* p) {
     __libc_free(p);
 }
 }
+#endif // HARNESS_NO_MALLOC_INTERPOSE
 
 //==============================================================================
 // BackingTrack::acquire() test seam (CMake defines BACKING_TRACK_ACQUIRE_HOOK as this name). A

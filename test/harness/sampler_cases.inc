@@ -105,7 +105,8 @@ static bool runSamplerCore() {
     std::printf("sm    sampler voice core (ios/SamplerEngine.h)\n");
 
     // sm_hit_root_plays_identity: a hit at the root, unity gain, no attack, plays the buffer
-    // sample for sample on both channels, then exact zeros and the voice ends.
+    // sample for sample on both channels up to the end fade (the last 1 ms, 48 samples at 48 kHz,
+    // ramps linearly towards 0: (end - pos) / 48), then exact zeros and the voice ends.
     {
         Checks c;
         auto s = makeSample(1000, sr, [](int i) { return noise(i, 1); }, [](int i) { return noise(i, 2); });
@@ -116,7 +117,13 @@ static bool runSamplerCore() {
         std::vector<float> l, r;
         render(e, 1300, 128, l, r, [&](int done) { if (done == 0) e.hit(3, 127); });
         int wrong = 0;
-        for (int i = 0; i < 1000; ++i) wrong += (l[(size_t)i] != s->L[(size_t)i] || r[(size_t)i] != s->R[(size_t)i]) ? 1 : 0;
+        const int fade = SamplerEngine::endFadeSamples(sr);
+        c(fade == 48, "end fade 1 ms = 48 samples at 48 kHz: " + std::to_string(fade));
+        for (int i = 0; i < 1000 - fade; ++i) wrong += (l[(size_t)i] != s->L[(size_t)i] || r[(size_t)i] != s->R[(size_t)i]) ? 1 : 0;
+        for (int i = 1000 - fade; i < 1000; ++i) {
+            const float g = (float)(1000 - i) / (float)fade;
+            wrong += (std::fabs(l[(size_t)i] - s->L[(size_t)i] * g) > 1e-6f || std::fabs(r[(size_t)i] - s->R[(size_t)i] * g) > 1e-6f) ? 1 : 0;
+        }
         int tail = 0;
         for (int i = 1000; i < 1300; ++i) tail += (l[(size_t)i] != 0.0f || r[(size_t)i] != 0.0f) ? 1 : 0;
         c(wrong == 0, std::to_string(wrong) + " samples differ from the buffer");
@@ -124,6 +131,42 @@ static bool runSamplerCore() {
         c(e.activeVoiceCount() == 0, "voice ends at the buffer's end");
         c(e.diag.hits.load() == 1, "hit counted");
         failedCases += report("sm_hit_root_plays_identity", c, std::to_string(wrong) + " of 1000 differ") ? 0 : 1;
+    }
+
+    // sm_end_fade_no_click: a one-shot stopping on a loud sample (DC 0.5 trimmed by endMs, at the
+    // root and an octave up) ends with no step above the 1 ms fade's (0.5 / 48); a sample shorter
+    // than two fades fades over half its length; then exact zeros.
+    {
+        Checks c;
+        auto s = makeSample(4800, sr, [](int) { return 0.5f; });
+        auto tiny = makeSample(40, sr, [](int) { return 0.5f; });
+        const float allowed = 0.5f / 48.0f * 1.01f;
+        for (int semis : { 0, 12 }) {
+            SamplerEngine e;
+            prep(e, sr);
+            e.setSlotBuffer(0, &s->view);
+            SamplerSlotParams p; // attack 1 ms: no step at the start either
+            p.endMs = 50.0f;     // 2400 of the 4800 frames
+            p.tuneSemis = (float)semis;
+            e.setSlotParams(0, p);
+            std::vector<float> l, r;
+            render(e, 3000, 128, l, r, [&](int done) { if (done == 0) e.hit(0, 127); });
+            const int end = semis == 0 ? 2400 : 1200;
+            const float step = maxStep(l, 1, 3000);
+            c(step <= allowed, "tune " + std::to_string(semis) + ": max step " + std::to_string(step));
+            c(l[(size_t)end - 100] == 0.5f && l[(size_t)end] == 0.0f && l[(size_t)end - 1] > 0.0f,
+              "tune " + std::to_string(semis) + ": full level before the fade, sounding to the end, 0 after");
+            c(e.activeVoiceCount() == 0, "voice ended");
+        }
+        SamplerEngine e;
+        prep(e, sr);
+        e.setSlotBuffer(1, &tiny->view);
+        e.setSlotParams(1, plain());
+        std::vector<float> l, r;
+        render(e, 128, 128, l, r, [&](int done) { if (done == 0) e.hit(1, 127); });
+        c(l[39] > 0.0f && l[39] <= 0.5f / 20.0f + 1e-6f && l[40] == 0.0f && maxStep(l, 21, 41) <= 0.5f / 20.0f * 1.01f,
+          "40-frame sample fades over its last 20: last " + std::to_string(l[39]));
+        failedCases += report("sm_end_fade_no_click", c) ? 0 : 1;
     }
 
     // sm_pitch_octave_halves_length: +12 halves the length, -12 doubles it, tune +12 on a hit
@@ -176,7 +219,7 @@ static bool runSamplerCore() {
             if (done == 256) { e.noteOff(60); e.release(0); }
         });
         c(lastNonZero(l) == 6000, "plays to the end: last sound at " + std::to_string(lastNonZero(l)));
-        c(std::fabs(l[5990] - 1.0f) < 1e-6f, "both voices still at full level near the end: " + std::to_string(l[5990]));
+        c(std::fabs(l[5940] - 1.0f) < 1e-6f, "both voices still at full level before the end fade: " + std::to_string(l[5940]));
         failedCases += report("sm_oneshot_ignores_noteoff", c) ? 0 : 1;
     }
 
@@ -699,6 +742,79 @@ static bool runSamplerLoader() {
         failedCases += report("sml_memory_cap", c, capError) ? 0 : 1;
     }
 
+    // sml_memory_cap_counts_retired: a replaced sample the reader still holds counts against the
+    // cap until collect() frees it (so the peak stays the cap plus the one sample being replaced).
+    {
+        Checks c;
+        SamplerBank bank;
+        bank.setMemoryCapBytes(1024 * 1024);
+        std::vector<float> x(60000, 0.1f);
+        std::string error;
+        auto make = [&] { return SamplerBank::fromAudio(x.data(), x.data(), 60000, 48000.0); }; // 480000 bytes
+        c(bank.install(0, make(), bank.beginLoad(0), error), "slot 0: " + error);
+        c(bank.acquireSlot(0) != nullptr, "reader holds slot 0");
+        bank.unload(0);
+        c(bank.collect() == 1 && bank.retiredBytes() == 480000 && bank.residentBytes() == 0, "retired, still held");
+        c(bank.install(1, make(), bank.beginLoad(1), error), "slot 1 fits beside the retired one: " + error);
+        c(!bank.install(2, make(), bank.beginLoad(2), error) && codeOf(error) == "ERR_SAMPLER_MEMORY",
+          "slot 2 refused while the retired one is not freed: " + error);
+        bank.releaseReader();
+        c(bank.collect() == 0 && bank.retiredBytes() == 0, "freed once the reader lets go");
+        c(bank.install(2, make(), bank.beginLoad(2), error), "then slot 2 fits: " + error);
+        bank.unloadAll();
+        bank.collect();
+        c(SamplerSample::live.load() == 0, "all freed");
+        failedCases += report("sml_memory_cap_counts_retired", c) ? 0 : 1;
+    }
+
+    // sml_params_applied_on_publish: load's beforePublish runs once, under the bank's lock, right
+    // before the new sample is published (the reader still sees the old one inside it), and never
+    // for a superseded, failed or over-the-cap load, so the old sample's parameters stay intact.
+    {
+        Checks c;
+        SamplerBank bank;
+        SamplerParamStore store;
+        juce::AudioBuffer<float> a(1, 4800);
+        for (int i = 0; i < 4800; ++i) a.setSample(0, i, noise(i, 11));
+        const std::string path = writeWav(a, 48000.0, "ej-sampler-params.wav", 1);
+        SamplerLoadInfo info;
+        std::string error;
+        SamplerSlotParams oldParams;
+        oldParams.rootNote = 40;
+        store.setSlot(4, oldParams);
+        SamplerSlotParams newParams;
+        newParams.rootNote = 72;
+        newParams.oneShot = false;
+        int calls = 0;
+        const SampleBuffer* seenInside = nullptr;
+        auto apply = [&] {
+            ++calls;
+            seenInside = bank.acquireSlot(4);
+            store.setSlot(4, newParams);
+        };
+        const uint64_t stale = bank.beginLoad(4);
+        bank.beginLoad(4);
+        c(!bank.load(4, stale, path, info, error, apply) && codeOf(error) == "ERR_SAMPLER_SUPERSEDED", "superseded: " + error);
+        c(!bank.load(4, bank.beginLoad(4), "/nonexistent/y.wav", info, error, apply) && codeOf(error) == "ERR_SAMPLER_FILE",
+          "missing file: " + error);
+        bank.setMemoryCapBytes(1000);
+        c(!bank.load(4, bank.beginLoad(4), path, info, error, apply) && codeOf(error) == "ERR_SAMPLER_MEMORY", "over the cap: " + error);
+        c(!bank.install(4, SamplerBank::fromAudio(a.getReadPointer(0), a.getReadPointer(0), 4800, 48000.0), bank.beginLoad(4), error, apply)
+              && codeOf(error) == "ERR_SAMPLER_MEMORY", "install over the cap: " + error);
+        bank.setMemoryCapBytes(SamplerBank::kDefaultMemoryCapBytes);
+        c(calls == 0 && store.slot(4).rootNote == 40 && store.slot(4).oneShot, "failed loads leave the old parameters");
+        c(bank.load(4, bank.beginLoad(4), path, info, error, apply), "loads: " + error);
+        c(calls == 1 && store.slot(4).rootNote == 72 && !store.slot(4).oneShot, "parameters applied once on publish");
+        c(seenInside == nullptr, "applied before the sample is published");
+        const SampleBuffer* now = bank.acquireSlot(4);
+        c(now != nullptr && now->frames == 4800, "then published");
+        bank.releaseReader();
+        bank.unloadAll();
+        bank.collect();
+        juce::File(juce::String(path)).deleteFile();
+        failedCases += report("sml_params_applied_on_publish", c) ? 0 : 1;
+    }
+
     // sml_handoff_keeps_buffer_in_use: the buffer the reader acquired survives collect() after it
     // is replaced, and is freed once the reader has moved to the new one; releaseReader lets go.
     {
@@ -889,6 +1005,14 @@ static bool runSamplerInSynth() {
             queue.pushSamplerNoteOff(60);
             for (int i = 0; i < 3; ++i) block(synth, buf, 128);
             c(voicesOn(synth, 6) == 0, "key note-off releases it" + tag);
+            // A key note-on with velocity 0 is a note-off (MIDI running-status convention).
+            queue.pushSamplerNoteOn(60, 127);
+            block(synth, buf, 128);
+            const uint32_t beforeZero = queue.samplerEventsQueued.load();
+            queue.pushSamplerNoteOn(60, 0);
+            for (int i = 0; i < 3; ++i) block(synth, buf, 128);
+            c(voicesOn(synth, 6) == 0 && queue.samplerEventsQueued.load() == beforeZero,
+              "note-on velocity 0 releases the note, queues nothing" + tag);
             // Pad on a gated slot: hit, then release(slot).
             synth.samplerHit(6, 100);
             block(synth, buf, 128);

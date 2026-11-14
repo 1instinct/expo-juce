@@ -25,6 +25,9 @@ void PolySynthProcessor::releaseResources() {}
 
 void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                        juce::MidiBuffer& /*midiMessages*/) {
+    // Flush-to-zero for the voices, drums and sampler (decaying envelopes and filters would
+    // otherwise run into denormals); restored when the block returns.
+    juce::ScopedNoDenormals noDenormals;
     buffer.clear();
 
     const int numSamples = buffer.getNumSamples();

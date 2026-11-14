@@ -122,11 +122,13 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 + (BOOL)setSamplerSlot:(int)slot params:(NSDictionary<NSString *, id> *)params NS_SWIFT_NAME(setSamplerSlot(_:params:));
 + (BOOL)setSampler:(NSDictionary<NSString *, id> *)settings NS_SWIFT_NAME(setSampler(_:));
 + (NSDictionary<NSString *, id> *)getSamplerState NS_SWIFT_NAME(getSamplerState());
+// `params` (partial, nil = none) are applied right before the sample is published, only if it is.
 + (void)loadSamplerSlot:(int)slot
                     uri:(NSString *)uri
+                 params:(nullable NSDictionary<NSString *, id> *)params
              completion:(void (^)(NSDictionary<NSString *, id> *_Nullable result, NSString *_Nullable errorCode,
                                   NSString *_Nullable errorMessage))completion
-    NS_SWIFT_NAME(loadSamplerSlot(_:uri:completion:));
+    NS_SWIFT_NAME(loadSamplerSlot(_:uri:params:completion:));
 + (BOOL)unloadSamplerSlot:(int)slot NS_SWIFT_NAME(unloadSamplerSlot(_:));
 
 // ── Transport ────────────────────────────────────────────────────

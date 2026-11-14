@@ -440,8 +440,11 @@ export function hasSampler(): boolean {
 /**
  * Decodes a local audio file (file:// URI or absolute path; WAV, AIFF, FLAC, MP3, plus CoreAudio
  * formats such as M4A) off the audio thread at the device rate and swaps it into `slot` (0-15);
- * voices still playing the slot's previous sample fade out. `params` (partial) apply to the slot
- * at once; omitted keys keep their values. Up to 60 s per sample and 256 MB across slots. A later
+ * voices still playing the slot's previous sample fade out. `params` (partial; omitted keys keep
+ * their values) are applied right before the new sample is published, and only if it is: the sample
+ * plays with them from its first hit, and a load that fails or is superseded leaves the slot's
+ * current parameters intact. Up to 60 s per sample and 256 MB across slots (samples replaced but
+ * not yet freed count until the audio thread lets go of them). A later
  * load or unload of the same slot supersedes a load in flight. Rejects with ERR_SAMPLER_SLOT,
  * ERR_SAMPLER_FILE, _FORMAT, _TOO_LONG, _MEMORY, _SUPERSEDED, or ERR_UNSUPPORTED (no sampler).
  */
@@ -496,17 +499,28 @@ export function samplerHit(slot: number, velocity: number): void {
   ExpoJuceModule.samplerHit(slot, velocity127(velocity));
 }
 
-/** Pads: releases the voices `slot`'s hits started (gated slots; one-shot slots ignore it). */
+/**
+ * Pads: releases every voice a hit on `slot` started, whoever hit it (gated slots; one-shot slots
+ * ignore it). The release is per slot, not per caller: two pads (or a pad and `samplerHit`) on the
+ * same slot share it, so the first release ends the other's held sound too.
+ */
 export function samplerRelease(slot: number): void {
   if (typeof ExpoJuceModule?.samplerRelease !== 'function') return;
   if (!isSamplerSlot(slot)) return;
   ExpoJuceModule.samplerRelease(slot);
 }
 
-/** Keys: plays `note` (0-127) on every loaded slot whose key zone holds it, velocity 1-127. */
+/**
+ * Keys: plays `note` (0-127) on every loaded slot whose key zone holds it, velocity 1-127.
+ * Velocity 0 (after rounding) is a note-off, as in MIDI.
+ */
 export function samplerNoteOn(note: number, velocity: number): void {
   if (typeof ExpoJuceModule?.samplerNoteOn !== 'function') return;
   if (!isMidiNote(note) || !Number.isFinite(velocity)) return;
+  if (Math.round(velocity) <= 0) {
+    samplerNoteOff(note);
+    return;
+  }
   ExpoJuceModule.samplerNoteOn(note, velocity127(velocity));
 }
 

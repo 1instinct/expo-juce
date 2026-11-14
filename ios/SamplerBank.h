@@ -16,8 +16,9 @@
 //
 // Loads: one generation counter per slot. beginLoad() takes a generation; a later beginLoad or
 // unload of that slot supersedes it (checked between decode chunks and before publishing).
-// Limits: kMaxSampleSeconds per sample and memoryCapBytes() (256 MB by default) across all slots
-// (the slot being replaced does not count), plus the process's available memory.
+// Limits: kMaxSampleSeconds per sample and memoryCapBytes() (256 MB by default) across all slots,
+// counting retired samples not yet freed but not the sample being replaced (so the peak is the cap
+// plus that one sample until collect() frees it), plus the process's available memory.
 // Errors are "ERR_SAMPLER_<KIND>: message": _SLOT, _FILE, _FORMAT, _TOO_LONG, _MEMORY, _SUPERSEDED.
 
 #include "JuceConfig.h"
@@ -78,7 +79,7 @@ public:
     static void setAvailableMemoryProvider(std::function<int64_t()> provider);
     static int64_t availableMemory();
 
-    SamplerBank() = default;
+    SamplerBank() { retired.reserve(2 * kSamplerSlots); }
     ~SamplerBank() override;
     SamplerBank(const SamplerBank&) = delete;
     SamplerBank& operator=(const SamplerBank&) = delete;
@@ -96,12 +97,19 @@ public:
     // A sample from audio already in memory (copied; R may equal L). Control side.
     static std::unique_ptr<SamplerSample> fromAudio(const float* L, const float* R, int frames, double rate);
 
+    // Runs under the bank's lock right before a sample is published, and only then (not for a load
+    // that fails or is superseded): the place to apply the slot's new parameters, so the old
+    // sample's stay intact otherwise. Must not call back into the bank.
+    using BeforePublish = std::function<void()>;
+
     uint64_t beginLoad(int slot);
     bool isCurrent(int slot, uint64_t gen) const;
     // decode() at the wanted rate within what the cap leaves, then install(). Blocking: a loader thread.
-    bool load(int slot, uint64_t gen, const std::string& path, SamplerLoadInfo& info, std::string& error);
+    bool load(int slot, uint64_t gen, const std::string& path, SamplerLoadInfo& info, std::string& error,
+              const BeforePublish& beforePublish = {});
     // Publishes `sample` in `slot` unless `gen` was superseded or the cap would be exceeded.
-    bool install(int slot, std::unique_ptr<SamplerSample> sample, uint64_t gen, std::string& error);
+    bool install(int slot, std::unique_ptr<SamplerSample> sample, uint64_t gen, std::string& error,
+                 const BeforePublish& beforePublish = {});
     // Empties the slot (supersedes a load in flight). false: slot out of range.
     bool unload(int slot);
     void unloadAll();
@@ -111,6 +119,7 @@ public:
     int collect();
 
     int64_t residentBytes() const;       // published samples, all slots
+    int64_t retiredBytes() const;        // replaced samples not yet freed by collect()
     void setMemoryCapBytes(int64_t bytes);
     int64_t memoryCapBytes() const { return memoryCap.load(std::memory_order_relaxed); }
 
@@ -142,6 +151,8 @@ public:
 private:
     void publishLocked(int slot, std::unique_ptr<SamplerSample> next, int channels);
     int64_t residentBytesLocked(int skipSlot) const;
+    int64_t retiredBytesLocked() const;
+    void reserveRetiredLocked();
 
     std::atomic<SamplerSample*> published[kSamplerSlots] = {};
     std::atomic<SamplerSample*> inUse[kSamplerSlots] = {};
@@ -150,6 +161,6 @@ private:
     std::atomic<int64_t> memoryCap{kDefaultMemoryCapBytes};
 
     mutable std::mutex mutex; // control side only, held for pointer / list updates (never a decode)
-    std::vector<SamplerSample*> retired;
+    std::vector<SamplerSample*> retired; // capacity grown before a publish, never by its push_back
     SamplerSlotInfo infos[kSamplerSlots];
 };

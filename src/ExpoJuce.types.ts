@@ -45,7 +45,8 @@ export type JucePadViewProps = {
    * hits drum voice `note` natively (one-shot, same velocity; `onNoteOn` per hit, `onNoteOff` when
    * the last touch lifts). `sampler` (0.10.0+): every touch-down hits sampler slot `note` at its
    * root note (a second finger retriggers) and the last touch-up releases the slot (a one-shot
-   * slot ignores the release and plays to its end). Changing the mode releases the pad. Binaries
+   * slot ignores the release and plays to its end). The release is per slot: it also ends a gated
+   * sound another pad or `samplerHit` started on the same slot. Changing the mode releases the pad. Binaries
    * older than 0.8.0 ignore the mode; binaries older than 0.10.0 treat `sampler` as `notes`.
    */
   mode?: PadMode;

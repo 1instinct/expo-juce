@@ -2117,6 +2117,10 @@ static NSString *backingTrackPath(NSString *uri) {
 - (void)samplerRelease:(int)slot { sNoteQueue.pushSamplerRelease(slot); }
 
 - (void)samplerNoteOn:(int)note velocity:(int)velocity {
+    if (velocity <= 0) { // a note-off (MIDI convention), recorded ready or not
+        sNoteQueue.pushSamplerNoteOff(note);
+        return;
+    }
     if (!sAcceptingNotes.load(std::memory_order_acquire)) return;
     sNoteQueue.pushSamplerNoteOn(note, velocity);
 }
@@ -2128,12 +2132,8 @@ static NSNumber *boolFrom(NSDictionary<NSString *, id> *options, NSString *key) 
     return [value isKindOfClass:[NSNumber class]] ? (NSNumber *)value : nil;
 }
 
-- (BOOL)setSamplerSlot:(int)slot params:(NSDictionary<NSString *, id> *)params {
-    if (slot < 0 || slot >= kSamplerSlots) return NO;
-    if (params.count == 0) return YES;
-    // Read-modify-write of the stored slot. Two writers racing on one slot each keep their own
-    // keys only if they do not overlap (the store's writer lock covers each write, not the merge).
-    SamplerSlotParams p = sSamplerParams.slot(slot);
+// The JS keys of `params` merged into `p` (keys: see the header); others unchanged.
+static void mergeSamplerParams(SamplerSlotParams& p, NSDictionary<NSString *, id> *params) {
     if (NSNumber *v = numberFrom(params, @"rootNote")) p.rootNote = (int)std::lround(std::clamp(v.doubleValue, 0.0, 127.0));
     if (NSNumber *v = numberFrom(params, @"lowNote")) p.lowNote = (int)std::lround(std::clamp(v.doubleValue, 0.0, 127.0));
     if (NSNumber *v = numberFrom(params, @"highNote")) p.highNote = (int)std::lround(std::clamp(v.doubleValue, 0.0, 127.0));
@@ -2161,7 +2161,20 @@ static NSNumber *boolFrom(NSDictionary<NSString *, id> *options, NSString *key) 
     } else if (loop == [NSNull null] || ([loop isKindOfClass:[NSNumber class]] && ![(NSNumber *)loop boolValue])) {
         p.loop = false;
     }
-    return sSamplerParams.setSlot(slot, p) ? YES : NO;
+}
+
+// Read-modify-write of the stored slot. Two writers racing on one slot each keep their own keys
+// only if they do not overlap (the store's writer lock covers each write, not the merge).
+static bool applySamplerParams(int slot, NSDictionary<NSString *, id> *params) {
+    SamplerSlotParams p = sSamplerParams.slot(slot);
+    mergeSamplerParams(p, params);
+    return sSamplerParams.setSlot(slot, p);
+}
+
+- (BOOL)setSamplerSlot:(int)slot params:(NSDictionary<NSString *, id> *)params {
+    if (slot < 0 || slot >= kSamplerSlots) return NO;
+    if (params.count == 0) return YES;
+    return applySamplerParams(slot, params) ? YES : NO;
 }
 
 - (BOOL)setSampler:(NSDictionary<NSString *, id> *)settings {
@@ -2210,6 +2223,7 @@ static NSNumber *boolFrom(NSDictionary<NSString *, id> *options, NSString *key) 
 
 - (void)loadSamplerSlot:(int)slot
                     uri:(NSString *)uri
+                 params:(NSDictionary<NSString *, id> *)params
              completion:(void (^)(NSDictionary<NSString *, id> *result, NSString *errorCode, NSString *errorMessage))completion {
     if (slot < 0 || slot >= kSamplerSlots) {
         completion(nil, @"ERR_SAMPLER_SLOT", [NSString stringWithFormat:@"slot %d is outside 0-%d", slot, kSamplerSlots - 1]);
@@ -2223,10 +2237,15 @@ static NSNumber *boolFrom(NSDictionary<NSString *, id> *options, NSString *key) 
     // A newer load or an unload of this slot supersedes this one (checked while decoding and before publishing).
     const uint64_t generation = sSamplerBank.beginLoad(slot);
     const std::string pathString = path.UTF8String;
+    NSDictionary<NSString *, id> *paramsCopy = params.count > 0 ? [params copy] : nil;
     dispatch_async(samplerQueue(), ^{
         std::string error;
         SamplerLoadInfo info;
-        const bool ok = sSamplerBank.load(slot, generation, pathString, info, error);
+        // The parameters are applied under the bank's lock right before the sample is published,
+        // and only if it is: a failed or superseded load leaves the slot's current ones intact.
+        SamplerBank::BeforePublish beforePublish;
+        if (paramsCopy != nil) beforePublish = [slot, paramsCopy] { applySamplerParams(slot, paramsCopy); };
+        const bool ok = sSamplerBank.load(slot, generation, pathString, info, error, beforePublish);
         [self scheduleSamplerCollect]; // the slot's previous sample, if one was replaced
         if (!ok) {
             NSString *full = [NSString stringWithUTF8String:error.c_str()] ?: @"ERR_SAMPLER_FILE: load failed";

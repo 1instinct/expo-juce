@@ -258,6 +258,12 @@ public:
     static constexpr int kDeclickSamples = 64;
     // render() works in chunks of at most this many frames (preallocated scratch).
     static constexpr int kChunk = 256;
+    // A voice reaching its end (non-looping) fades linearly to 0 over its last kEndFadeMs of
+    // output (at most half its length), so a sample trimmed mid-sound does not click.
+    static constexpr double kEndFadeMs = 1.0;
+    static int endFadeSamples(double sampleRate) {
+        return std::max(1, (int)std::lround(kEndFadeMs * sampleRate / 1000.0));
+    }
 
     // Written on the audio thread, read from any thread (relaxed).
     struct Diagnostics {
@@ -429,6 +435,7 @@ private:
         int frames = 0;
         double pos = 0.0, inc = 1.0, end = 0.0;
         double loopStart = 0.0, loopEnd = 0.0, loopLen = 0.0, xfade = 0.0;
+        double fadeFrames = 1.0, fadeInv = 1.0; // end fade, in buffer frames (non-looping voices)
         float gainL = 0.0f, gainR = 0.0f;
         float env = 0.0f, envStep = 0.0f; // attack: +step, release: -step
         int attackLeft = 0, releaseLeft = 0;
@@ -545,6 +552,13 @@ private:
         v.inc = std::exp2(semis / 12.0) * rate / sr;
         v.pos = (double)start;
         v.end = (double)end;
+        {
+            // The end fade covers kEndFadeMs of output, or half the voice when it is shorter.
+            const double outputLength = (double)(end - start) / v.inc;
+            const double fadeOut = std::max(1.0, std::min((double)endFadeSamples(sr), std::floor(outputLength / 2.0)));
+            v.fadeFrames = fadeOut * v.inc;
+            v.fadeInv = 1.0 / v.fadeFrames;
+        }
         v.loop = false;
         if (p.loop && !p.oneShot) {
             int64_t ls = std::clamp<int64_t>(std::llround(p.loopStartMs * perMs), 0, end - 1);
@@ -603,6 +617,14 @@ private:
                 const float a = (float)((v.pos - (v.loopEnd - v.xfade)) / v.xfade);
                 l += a * (l2 - l);
                 r += a * (r2 - r);
+            }
+            if (!v.loop) {
+                const double left = v.end - v.pos;
+                if (left < v.fadeFrames) {
+                    const float f = (float)(left * v.fadeInv);
+                    l *= f;
+                    r *= f;
+                }
             }
             const float outL = l * v.gainL * v.env, outR = r * v.gainR * v.env;
             scratchL[i] += outL;

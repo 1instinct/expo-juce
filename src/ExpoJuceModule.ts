@@ -86,7 +86,7 @@ export type ExpoJuceNativeModule = {
   setSamplerSlot?(slot: number, params: NativeSamplerSlotParams): boolean;
   setSampler?(settings: Partial<SamplerSettings>): boolean;
   samplerHit?(slot: number, velocity: number): void;
-  samplerRelease?(slot: number): void;
+  samplerRelease?(slot: number): void; // releases every holder of the slot (per slot, not per caller)
   samplerNoteOn?(note: number, velocity: number): void;
   samplerNoteOff?(note: number): void;
   getSamplerState?(): SamplerState;

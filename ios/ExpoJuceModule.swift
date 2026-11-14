@@ -320,16 +320,15 @@ public class ExpoJuceModule: Module {
       return true
     }
 
-    // Applies `params` (partial) to the slot first, so the sample plays with them from its first hit.
+    // `params` (partial) are applied right before the new sample is published, and only if it is:
+    // the sample plays with them from its first hit, and a failed or superseded load leaves the
+    // slot's current parameters intact.
     AsyncFunction("loadSamplerSlot") { (slot: Double, uri: String, params: [String: Any]?, promise: Promise) in
       guard ExpoJuceModule.isSamplerSlot(slot) else {
         promise.reject("ERR_SAMPLER_SLOT", "slot must be an integer 0-15")
         return
       }
-      if let params = params {
-        _ = ExpoJuceBridge.setSamplerSlot(Int32(slot), params: params)
-      }
-      ExpoJuceBridge.loadSamplerSlot(Int32(slot), uri: uri) { result, code, message in
+      ExpoJuceBridge.loadSamplerSlot(Int32(slot), uri: uri, params: params) { result, code, message in
         if let result = result {
           promise.resolve(result)
         } else {
@@ -365,7 +364,8 @@ public class ExpoJuceModule: Module {
 
     Function("samplerNoteOn") { (note: Double, velocity: Double) -> Void in
       guard ExpoJuceModule.isMidiNote(note), velocity.isFinite else { return }
-      ExpoJuceBridge.samplerNoteOn(Int32(note), velocity: Int32(min(max(velocity.rounded(), 1), 127)))
+      // Velocity 0 (after rounding) is a note-off, as in MIDI.
+      ExpoJuceBridge.samplerNoteOn(Int32(note), velocity: Int32(min(max(velocity.rounded(), 0), 127)))
     }
 
     Function("samplerNoteOff") { (note: Double) -> Void in

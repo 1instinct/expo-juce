@@ -109,8 +109,13 @@ public:
         if (slot < 0 || slot > kMaxSamplerSlot) return false;
         return pushSampler(NoteEventKind::SamplerHit, slot, velocity, samplerSlotLastSeq[slot], touchTicks, entryTicks);
     }
+    // A key note-on with velocity 0 (or less) is a note-off, as in MIDI: nothing is queued.
     bool pushSamplerNoteOn(int note, int velocity, juce::int64 touchTicks = 0, juce::int64 entryTicks = 0) {
         if (note < 0 || note > 127) return false;
+        if (velocity <= 0) {
+            pushSamplerNoteOff(note);
+            return true;
+        }
         return pushSampler(NoteEventKind::SamplerNote, note, velocity, samplerLastOnSeq[note], touchTicks, entryTicks);
     }
     // Releases every sampler key note-on of `note` / pad hit of `slot` pushed so far.

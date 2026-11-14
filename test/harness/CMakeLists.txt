@@ -7,6 +7,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+# Optional sanitizer build, in its own build directory: -DHARNESS_SANITIZE=address (or thread,
+# undefined, "address,undefined"). The allocation counter's malloc interposer is left out there
+# (the sanitizer owns malloc), so the allocation checks pass trivially in that build.
+set(HARNESS_SANITIZE "" CACHE STRING "sanitizers for the harness build (e.g. address, thread); empty = none")
+if(HARNESS_SANITIZE)
+  add_compile_options(-fsanitize=${HARNESS_SANITIZE} -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=${HARNESS_SANITIZE})
+  add_compile_definitions(HARNESS_NO_MALLOC_INTERPOSE=1)
+endif()
+
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(JUCE_MODULES "${REPO_ROOT}/ios/juce_modules")
 
