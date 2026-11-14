@@ -487,7 +487,7 @@ export type SequenceEvent = {
 };
 
 export type SequenceOptions = {
-  /** The loop length in beats (> 0 when there are events). */
+  /** The loop length in beats: at least 1/64 when there are events (else setSequence returns false). */
   loopBeats: number;
   /** At most SEQUENCE_MAX_EVENTS. */
   events: SequenceEvent[];
@@ -527,8 +527,13 @@ export type SequenceDiagnostics = {
   notesFired: number;
   /** Notes fired more than a block late (a block that started past the note). */
   lateFires: number;
-  /** Events the last setSequence dropped as invalid. */
+  /**
+   * Firings lost since launch (cumulative): starts over a block's limit (512), notes over 256
+   * sounding at once, or loop passes over a block's limit. Never a note-off.
+   */
   dropped: number;
+  /** Invalid events the last accepted setSequence skipped (bad note, length or start). */
+  invalidEvents: number;
   version: number;
   /** onSequenceNotes batches are built (a listener is set). */
   listening: boolean;

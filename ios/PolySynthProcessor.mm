@@ -84,19 +84,15 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
     seqOutputCount = 0;
     sequencer.process(blockBeat, bpm, playing, seeked, sr, numSamples, [this](const seqplay::Output& out) {
-        if (seqOutputCount < seqplay::SequencePlayer::kMaxBlockOutputs) seqOutputs[seqOutputCount++] = out;
+        if (seqOutputCount < seqplay::SequencePlayer::kMaxOutputs) seqOutputs[seqOutputCount++] = out;
         if (sequenceLog != nullptr) sequenceLog->push(out);
     });
     if (arpNow.enabled) {
         for (int i = 0; i < seqOutputCount; ++i) {
             const seqplay::Output& out = seqOutputs[i];
             if (out.kind != seqplay::EventKind::Note) continue;
-            if (out.on) {
-                arpeggiator.noteOn(out.note, out.velocity, kSequenceArpSeq);
-            } else {
-                const int note = out.note;
-                arpeggiator.releaseHeld([note](int n, uint64_t seq) { return seq == kSequenceArpSeq && n == note; });
-            }
+            if (out.on) arpeggiator.noteOnSequence(out.note, out.velocity);
+            else arpeggiator.releaseSequence(out.note);
         }
     }
 

@@ -120,11 +120,18 @@ private:
 };
 
 // Whether the session should be non-mixable (other apps' audio pauses), which iOS requires to
-// show the app's Now Playing info and route the lock-screen controls to it: only while Now Playing
-// info is set, and the transport plays or the app is in the background (so a lock-screen pause can
-// be followed by a play).
-inline bool wantsExclusiveSession(bool nowPlayingSet, bool transportPlaying, bool inBackground) {
-    return nowPlayingSet && (transportPlaying || inBackground);
+// show the app's Now Playing info and route the lock-screen controls to it. current: it is now.
+//  - Never without Now Playing info.
+//  - In the background: while the transport plays, or while it is paused by a lock-screen command
+//    in this background stretch (so the next play still reaches the app). Never just for entering
+//    the background with the transport stopped: other apps' audio is not paused for nothing.
+//  - In the foreground it never becomes exclusive (Play does not touch the session, so no glitch);
+//    coming back exclusive, it stays so while the transport plays and drops on the next stop.
+inline bool wantsExclusiveSession(bool current, bool nowPlayingSet, bool transportPlaying, bool inBackground,
+                                  bool pausedByRemote) {
+    if (!nowPlayingSet) return false;
+    if (inBackground) return transportPlaying || pausedByRemote;
+    return current && transportPlaying;
 }
 
 } // namespace bgpolicy

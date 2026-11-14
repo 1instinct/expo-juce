@@ -27,6 +27,10 @@
 // of the same pitch are counted: the release of a note goes out only when its last sounding
 // instance ends. A firing window carries from block to block ((previous end, this end]), so an
 // event fires exactly once per pass even across tempo changes and chunked blocks.
+//
+// Bounded work per block: at most kMaxBlockStarts starts and kMaxPassesPerBlock loop passes (a
+// loop is at least kMinLoopBeats long). Releases are never dropped: the output list has room for
+// every release a block can make (kMaxOutputs), so a full block can lose starts, never note-offs.
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +62,9 @@ struct Event {
 };
 
 constexpr int kMaxEvents = 8192;
+// The shortest loop setSequence takes (a 1/64 note): shorter loops would make a block walk
+// thousands of passes.
+constexpr double kMinLoopBeats = 1.0 / 64.0;
 
 // Checks and clamps one event against loopBeats. False: the event can never play (start outside
 // the loop, non-finite numbers, a note without a positive length, a drum voice outside 0–8).
@@ -91,7 +98,7 @@ struct Sequence {
 struct SetResult {
     bool ok = false;  // false: too many events, a bad loop length, or the writer timed out
     int accepted = 0; // events published
-    int dropped = 0;  // events that can never play (sanitizeEvent)
+    int dropped = 0;  // invalid events skipped (sanitizeEvent): they can never play
 };
 
 // The process-lifetime store the engine keeps (heap-allocated, about 640 KB: two slots of
@@ -106,13 +113,13 @@ public:
     SequenceStore& operator=(const SequenceStore&) = delete;
 
     // Copies `count` events (any order), keeps those sanitizeEvent accepts, sorts them by start and
-    // publishes. loopBeats <= 0 or non-finite with events, or more than kMaxEvents events: nothing
-    // changes, ok = false. count 0 publishes an empty sequence (stops what it plays).
+    // publishes. With events, loopBeats non-finite or under kMinLoopBeats, or more than kMaxEvents
+    // events: nothing changes, ok = false. count 0 publishes an empty sequence (stops what it plays).
     SetResult set(const Event* in, int count, double loopBeats, double fromBeat = -std::numeric_limits<double>::infinity(),
                   double endBeat = std::numeric_limits<double>::infinity()) {
         SetResult r;
         if (count < 0 || count > kMaxEvents || (count > 0 && in == nullptr)) return r;
-        if (count > 0 && !(std::isfinite(loopBeats) && loopBeats > 0.0)) return r;
+        if (count > 0 && !(std::isfinite(loopBeats) && loopBeats >= kMinLoopBeats)) return r;
         if (!(loopBeats > 0.0) || !std::isfinite(loopBeats)) loopBeats = 0.0;
         if (std::isnan(fromBeat)) fromBeat = -std::numeric_limits<double>::infinity();
         if (std::isnan(endBeat)) endBeat = std::numeric_limits<double>::infinity();
@@ -137,6 +144,7 @@ public:
         s.version = ++versionCount;
         published.store(target, std::memory_order_seq_cst);
         publishedCount.store(n, std::memory_order_relaxed);
+        lastInvalid.store(r.dropped, std::memory_order_relaxed);
         publishedLoopBeats.store(s.loopBeats, std::memory_order_relaxed);
         r.ok = true;
         r.accepted = n;
@@ -165,12 +173,16 @@ public:
     // ── Counters (written by the audio thread or a writer, read anywhere; relaxed) ──
     std::atomic<uint64_t> notesFired{0};  // note-ons and drum hits the player started
     std::atomic<uint64_t> lateFires{0};   // fired more than one sample after their beat
-    std::atomic<uint64_t> dropped{0};     // firings lost to a full active list or block list
+    // Firings lost since launch (cumulative): a start over a block's kMaxBlockStarts, a note over
+    // kMaxActive sounding, or passes over kMaxPassesPerBlock. Never a release.
+    std::atomic<uint64_t> dropped{0};
     std::atomic<int> activeNotes{0};      // synth notes the player has sounding
     std::atomic<bool> firing{false};      // the last block played the sequence (transport on, not muted, events)
     std::atomic<uint64_t> writerTimeouts{0};
 
     int eventCount() const { return publishedCount.load(std::memory_order_relaxed); }
+    // Invalid events the last successful set skipped (SetResult::dropped).
+    int lastInvalidCount() const { return lastInvalid.load(std::memory_order_relaxed); }
     double loopBeats() const { return publishedLoopBeats.load(std::memory_order_relaxed); }
     uint64_t version() const { return versionCount.load(std::memory_order_relaxed); }
 
@@ -191,6 +203,7 @@ private:
     std::atomic<bool> mutedFlag{false};
     std::atomic<uint64_t> versionCount{0};
     std::atomic<int> publishedCount{0};
+    std::atomic<int> lastInvalid{0};
     std::atomic<double> publishedLoopBeats{0.0};
     std::mutex writerLock;
 };
@@ -248,8 +261,12 @@ private:
 // The audio-thread half: one per synth (a rebuild starts a new one with nothing sounding).
 class SequencePlayer {
 public:
-    static constexpr int kMaxActive = 256;      // synth notes sounding at once
-    static constexpr int kMaxBlockOutputs = 512; // starts + releases in one block
+    static constexpr int kMaxActive = 256;       // synth notes sounding at once
+    static constexpr int kMaxBlockStarts = 512;  // note-ons and drum hits in one block
+    static constexpr int kMaxPassesPerBlock = 1024;
+    // Room for every output one block can make: its starts, and a release for each note that
+    // sounded at the block start or started in it. So a release is never dropped.
+    static constexpr int kMaxOutputs = kMaxBlockStarts + kMaxActive + kMaxBlockStarts;
     // Tolerance, in samples, for a beat that lands on a sample boundary up to rounding.
     static constexpr double kEpsSamples = 1.0e-6;
 
@@ -266,6 +283,7 @@ public:
     void process(double blockStartBeat, double bpm, bool playing, bool seeked, double sampleRate, int numSamples,
                  Sink&& sink) {
         outCount = 0;
+        startsEmitted = 0;
         if (store == nullptr || numSamples <= 0 || !(sampleRate > 0.0)) {
             flushOutputs(sink);
             return;
@@ -350,13 +368,19 @@ private:
         outCount = 0;
     }
 
-    bool emit(const Output& o) {
-        if (outCount >= kMaxBlockOutputs) {
+    // A start goes out only while the block has made fewer than kMaxBlockStarts.
+    bool emitStart(const Output& o) {
+        if (startsEmitted >= kMaxBlockStarts || outCount >= kMaxOutputs) {
             if (store) store->dropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        ++startsEmitted;
         outputs[outCount++] = o;
         return true;
+    }
+    // Always room (kMaxOutputs); the check only guards the array.
+    void emitRelease(const Output& o) {
+        if (outCount < kMaxOutputs) outputs[outCount++] = o;
     }
 
     bool stillSounding(uint8_t note) const {
@@ -376,7 +400,7 @@ private:
             o.kind = EventKind::Note;
             o.on = false;
             o.atBeat = atBeat;
-            emit(o);
+            emitRelease(o);
         }
     }
 
@@ -412,19 +436,27 @@ private:
         const double L = seq.loopBeats;
         const double from = std::max(lo, std::nextafter(seq.fromBeat, -std::numeric_limits<double>::infinity()));
         if (!(hi > from)) return;
-        const double firstPass = std::floor(from / L);
+        double firstPass = std::floor(from / L);
         const double lastPass = std::floor(hi / L);
+        if (!std::isfinite(firstPass) || !std::isfinite(lastPass)) return;
+        // A block spanning more passes than kMaxPassesPerBlock plays only the last ones.
+        if (lastPass - firstPass >= (double)kMaxPassesPerBlock) {
+            if (store) store->dropped.fetch_add(1, std::memory_order_relaxed);
+            firstPass = lastPass - (double)(kMaxPassesPerBlock - 1);
+        }
+        const int passes = (int)(lastPass - firstPass) + 1;
         const Event* first = seq.events;
         const Event* last = seq.events + seq.count;
-        for (double pass = firstPass; pass <= lastPass; pass += 1.0) {
-            const double base = pass * L;
+        // An integer counter: past 2^53 beats, pass + 1.0 would not move.
+        for (int p = 0; p < passes; ++p) {
+            const double base = (firstPass + (double)p) * L;
             // Events with base + start in (from, hi].
             const Event* it = std::upper_bound(first, last, from - base, [](double s, const Event& e) { return s < e.start; });
             for (; it != last; ++it) {
                 const double t = base + it->start;
                 if (t > hi) break;
                 if (t <= from || t < seq.fromBeat || t >= seq.endBeat || t < it->skipBefore) continue;
-                if (startCount >= kMaxBlockOutputs) {
+                if (startCount >= kMaxBlockStarts) {
                     if (store) store->dropped.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
@@ -476,14 +508,14 @@ private:
         o.on = true;
         o.atBeat = t;
         if (e.kind == EventKind::Drum) {
-            if (emit(o) && store) store->notesFired.fetch_add(1, std::memory_order_relaxed);
+            if (emitStart(o) && store) store->notesFired.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (activeCount >= kMaxActive) {
             if (store) store->dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        if (!emit(o)) return;
+        if (!emitStart(o)) return;
         if (store) store->notesFired.fetch_add(1, std::memory_order_relaxed);
         // Its release can come later in this block (after its start) or in a later block.
         active[activeCount++] = { t, t + e.length, e.start, offset + 1, e.note };
@@ -492,9 +524,10 @@ private:
     SequenceStore* store = nullptr;
     Active active[kMaxActive];
     int activeCount = 0;
-    Output outputs[kMaxBlockOutputs];
+    Output outputs[kMaxOutputs];
     int outCount = 0;
-    Start starts[kMaxBlockOutputs];
+    int startsEmitted = 0;
+    Start starts[kMaxBlockStarts];
     int startCount = 0;
     double windowEnd = 0.0;
     double lastLoopBeats = 0.0;

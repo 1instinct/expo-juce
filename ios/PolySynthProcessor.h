@@ -134,9 +134,6 @@ public:
     void setSequenceStore(seqplay::SequenceStore* s) { sequencer.setStore(s); }
     void setSequenceNoteLog(seqplay::NoteLog* log) { sequenceLog = log; }
     const seqplay::SequencePlayer& sequence() const { return sequencer; }
-    // The arpeggiator's sequence number for a note the sequence holds in it (the note queue's
-    // release marks never reach it).
-    static constexpr uint64_t kSequenceArpSeq = ~(uint64_t)0;
 
     void setTransport(TransportEngine* t) { transport = t; }
     // Receives the arpeggiator state every block (AnalysisRing::publishArp). nullptr = none.
@@ -173,7 +170,7 @@ private:
     uint64_t lastAllReleasedSeen = 0;      // NoteEventQueue::allReleasedMark last applied to the arp
     seqplay::SequencePlayer sequencer;
     seqplay::NoteLog* sequenceLog = nullptr;
-    seqplay::Output seqOutputs[seqplay::SequencePlayer::kMaxBlockOutputs]; // this block's (audio thread)
+    seqplay::Output seqOutputs[seqplay::SequencePlayer::kMaxOutputs]; // this block's (audio thread)
     int seqOutputCount = 0;
     uint64_t lastAllReleasedSeenBySequence = 0; // NoteEventQueue::allReleasedMark last applied to the sequence
 

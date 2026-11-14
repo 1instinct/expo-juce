@@ -136,6 +136,7 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 - (AVAudioSessionCategoryOptions)sessionCategoryOptions;
 - (void)resetRuntimeState;
 - (void)stopBackgroundCheck;
+- (void)wakeFromIdleStopIfNeeded:(NSString *)context;
 // Main thread: the beat timer itself, without changing beatTimerWanted.
 - (void)resumeBeatTimer;
 - (void)cancelBeatTimer;
@@ -257,7 +258,11 @@ static void carryXrunsLocked() {
 // sAcceptingNotes). Heap-allocated and never freed, so a call during process exit never finds it
 // destroyed. Events for JS are drained on sMidiInputQueue (serial), at most ~4 ms after the first
 // one of a burst, into one onMidiInput batch; the handler is only touched on that queue.
-static midiin::NoteQueueSink& sMidiInputSink = *new midiin::NoteQueueSink(sNoteQueue, &sAcceptingNotes);
+// A note-on the sink refuses while the engine is idle-stopped in the background (a Δ8 key through
+// the C entry point, which native BLE code calls directly) wakes the engine.
+static void wakeEngineForRefusedNote();
+static midiin::NoteQueueSink& sMidiInputSink =
+    *new midiin::NoteQueueSink(sNoteQueue, &sAcceptingNotes, wakeEngineForRefusedNote);
 static midiin::MidiInput& sMidiInput = *new midiin::MidiInput(sMidiInputSink);
 static LatencyWindow sMidiInputLatency; // arrival -> render, written by the audio thread
 static void (^sMidiInputHandler)(NSDictionary<NSString *, id> *) = nil; // midiInputQueue only
@@ -372,6 +377,8 @@ static std::atomic<double> sLastIdleStopSec{-1.0};
 static std::atomic<bool> sInBackground{false};
 static std::atomic<bool> sNowPlayingSet{false};
 static std::atomic<bool> sSessionExclusive{false};        // the session is not mixable (Now Playing)
+static bool sPausedByRemote = false; // main thread: a lock-screen pause in this background stretch
+static std::atomic<bool> sIdleStopActive{false};   // mirrors idleStopped, for the MIDI sink's wake hook
 
 static bgpolicy::Policy currentBackgroundPolicy() {
     bgpolicy::Policy p;
@@ -422,6 +429,7 @@ static void drainSequenceNotes() {
 static void setSequenceDrainRunning(bool on) {
     dispatch_async(engineEventQueue(), ^{
         if (on && sSequenceDrainTimer == nil) {
+            sSequenceLog.drain([](const seqplay::NoteLog::Entry&) {}); // notes from before: not news
             dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, engineEventQueue());
             dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, kSequenceDrainNs), (uint64_t)kSequenceDrainNs,
                                       2 * NSEC_PER_MSEC);
@@ -709,6 +717,7 @@ static int mainThreadMaxFramesPerSecond() {
     }
 
     self.idleStopped = NO;
+    sIdleStopActive.store(self.idleStopped == YES, std::memory_order_release);
     self.requestedBufferSize = (bufferSize > 0) ? std::min(bufferSize, 4096) : kDefaultBufferSize;
     self.requestedSampleRate = (sampleRate > 0.0) ? sampleRate : kDefaultSampleRate;
     sXrunsCarried.store(0, std::memory_order_relaxed); // xrunCount counts from this setup
@@ -727,6 +736,7 @@ static int mainThreadMaxFramesPerSecond() {
     if (ok) {
         [self registerSessionObservers];
         [self startStallProbe];
+        [self syncBackgroundStateAfterSetup];
         // An explicit setup supersedes any pending rebuild retry.
         self.recoveryGeneration = self.recoveryGeneration + 1;
         self.rebuildRetryPending = NO;
@@ -1177,6 +1187,7 @@ static int mainThreadMaxFramesPerSecond() {
     [self stopStallProbe];
     [self stopBackgroundCheck];
     self.idleStopped = NO;
+    sIdleStopActive.store(self.idleStopped == YES, std::memory_order_release);
     self.rebuildAfterIdleStop = NO;
     sSessionExclusive.store(false, std::memory_order_relaxed); // the next setup starts mixable
     self.routeFormatCheckPending = NO;
@@ -1323,6 +1334,16 @@ static int mainThreadMaxFramesPerSecond() {
     const AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)typeValue.unsignedIntegerValue;
     __weak ExpoJuceAudioEngine *weakSelf = self;
     if (type == AVAudioSessionInterruptionTypeBegan) {
+        // A "began" delivered late, for an interruption that happened while the app was suspended
+        // (iOS 10.3–15): the session is not interrupted now; stopping the transport would be wrong.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSNumber *wasSuspended = notification.userInfo[AVAudioSessionInterruptionWasSuspendedKey];
+#pragma clang diagnostic pop
+        if (wasSuspended != nil && wasSuspended.boolValue) {
+            NSLog(@"[ExpoJuceAudioEngine] stale interruption (app was suspended): ignored");
+            return;
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             ExpoJuceAudioEngine *strongSelf = weakSelf;
             if (strongSelf == nil) return;
@@ -1759,6 +1780,7 @@ static int mainThreadMaxFramesPerSecond() {
         @"notesFired": @((double)sSequence.notesFired.load(relaxed)),
         @"lateFires": @((double)sSequence.lateFires.load(relaxed)),
         @"dropped": @((double)sSequence.dropped.load(relaxed)),
+        @"invalidEvents": @(sSequence.lastInvalidCount()),
         @"version": @((double)sSequence.version()),
         @"listening": @(sSequenceLog.listening.load(relaxed) ? YES : NO),
         @"notesLost": @((double)sSequenceLog.lost.load(relaxed)),
@@ -1891,16 +1913,6 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
     const NSUInteger count = bytes.count;
     for (NSUInteger i = 0; i < count; ++i)
         buffer[i] = [bytes[i] isKindOfClass:[NSNumber class]] ? (uint8_t)(bytes[i].intValue & 0xFF) : 0;
-    if (self.idleStopped) {
-        // Only what looks like a note-on wakes the engine (not clock or sensing bytes). A BLE-MIDI
-        // timestamp byte can look like a status byte: a rare extra wake costs one idle period.
-        for (NSUInteger i = 0; i + 2 < count; ++i) {
-            if ((buffer[i] & 0xF0) == 0x90 && buffer[i + 1] < 0x80 && buffer[i + 2] > 0 && buffer[i + 2] < 0x80) {
-                [self wakeFromIdleStopIfNeeded:@"midi input"];
-                break;
-            }
-        }
-    }
     return expojuce_midi_input_bytes(buffer, (size_t)count, format, arrivalSeconds);
 }
 
@@ -2442,6 +2454,7 @@ static NSString *backingTrackPath(NSString *uri) {
 
 - (void)handleAppDidEnterBackground:(NSNotification *)notification {
     sInBackground.store(true, std::memory_order_relaxed);
+    sPausedByRemote = false;
     const bgpolicy::Policy policy = currentBackgroundPolicy();
     const bool pause = sIdleTracker.enterBackground(policy, CACurrentMediaTime());
     [self publishBackgroundState];
@@ -2460,6 +2473,7 @@ static NSString *backingTrackPath(NSString *uri) {
 
 - (void)handleAppWillEnterForeground:(NSNotification *)notification {
     sInBackground.store(false, std::memory_order_relaxed);
+    sPausedByRemote = false;
     [self stopBackgroundCheck];
     const bool restart = sIdleTracker.enterForeground();
     [self publishBackgroundState];
@@ -2526,6 +2540,7 @@ static NSString *backingTrackPath(NSString *uri) {
     if (!self.isReady || self.idleStopped) return;
     NSLog(@"[ExpoJuceAudioEngine] idle in the background: stopping the audio device");
     self.idleStopped = YES;
+    sIdleStopActive.store(self.idleStopped == YES, std::memory_order_release);
     sAcceptingNotes.store(false, std::memory_order_release);
     {
         LifecycleLock lifecycle;
@@ -2545,8 +2560,13 @@ static NSString *backingTrackPath(NSString *uri) {
 }
 
 // Main thread: reactivates the session and reopens the device after an idle stop (the existing
-// recovery path: reopen, or rebuild if it will not run). From the background (a remote play) iOS
-// may refuse the session: then the engine stays stopped and backgroundStartError says why.
+// recovery path: reopen, or rebuild if it will not run). From the background (a lock-screen play,
+// a note from a MIDI device): Apple documents that an app may not start audio from the background
+// unless its session category mixes with others (AVAudioSessionErrorCodeCannotStartPlaying), so
+// the session is reactivated mixable and made exclusive afterwards if Now Playing needs it. Code
+// runs at all only while iOS keeps the app awake (an active session; a Bluetooth event with the
+// bluetooth-central mode; the remote command itself). Unverified on a device: if iOS refuses, the
+// engine stays stopped and backgroundStartError says why.
 - (BOOL)restartAfterIdleStop:(NSString *)context {
     if (!self.idleStopped) return YES;
     // Mixable to start: iOS refuses a non-mixable session started from the background more often.
@@ -2565,6 +2585,7 @@ static NSString *backingTrackPath(NSString *uri) {
     sSessionExclusive.store(false, std::memory_order_relaxed);
     self.backgroundStartError = nil;
     self.idleStopped = NO;
+    sIdleStopActive.store(self.idleStopped == YES, std::memory_order_release);
     NSLog(@"[ExpoJuceAudioEngine] restarting the audio device after an idle stop (%@)", context);
     if (self.rebuildAfterIdleStop) {
         self.rebuildAfterIdleStop = NO;
@@ -2626,12 +2647,13 @@ static NSString *backingTrackPath(NSString *uri) {
         }
         copied = [clean copy];
     }
-    sNowPlayingSet.store(copied != nil, std::memory_order_relaxed);
+    // The flag follows nowPlayingInfo on the main queue (in call order with resetRuntimeState).
     __weak ExpoJuceAudioEngine *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         ExpoJuceAudioEngine *strongSelf = weakSelf;
         if (strongSelf == nil) return;
         strongSelf.nowPlayingInfo = copied;
+        sNowPlayingSet.store(copied != nil, std::memory_order_relaxed);
         [strongSelf updateNowPlayingInfo];
         [strongSelf updateSessionExclusivity];
     });
@@ -2669,7 +2691,7 @@ static MPRemoteCommand *remoteCommandNamed(NSString *name) {
             [self.remoteCommandTargets removeObjectForKey:name];
         }
         if (![wanted containsObject:name]) {
-            command.enabled = NO;
+            if (existing != nil) command.enabled = NO; // only a command this engine enabled
             continue;
         }
         __weak ExpoJuceAudioEngine *weakSelf = self;
@@ -2698,11 +2720,28 @@ static MPRemoteCommand *remoteCommandNamed(NSString *name) {
         }
         if (!playing) [self startTransport];
     } else if (playing) {
+        // Paused from the lock screen in the background: the session stays exclusive so the next
+        // play still reaches this app.
+        if (sInBackground.load(std::memory_order_relaxed)) sPausedByRemote = true;
         [self stopTransport];
     }
     emitEngineEvent(@"onRemoteCommand", @{ @"command": name, @"playing": @(play) });
     if (play != playing) emitEngineEvent(@"onTransportChange", @{ @"playing": @(play), @"reason": @"remoteCommand" });
     return MPRemoteCommandHandlerStatusSuccess;
+}
+
+// Main thread, after a successful setup: the app may be in the background (launched there, e.g. by
+// Bluetooth state restoration, or set up again after an idle stop). The background state and the
+// idle timer follow, so the idle stop works and no stale IdleStopped state is left.
+- (void)syncBackgroundStateAfterSetup {
+    const bool background = [UIApplication sharedApplication].applicationState == UIApplicationStateBackground;
+    sInBackground.store(background, std::memory_order_relaxed);
+    if (!background) return;
+    const double now = CACurrentMediaTime();
+    if (sIdleTracker.state() == bgpolicy::State::Foreground) sIdleTracker.enterBackground(currentBackgroundPolicy(), now);
+    else sIdleTracker.markRestarted(now);
+    [self publishBackgroundState];
+    if (sPolicySet.load(std::memory_order_acquire)) [self startBackgroundCheck];
 }
 
 // Any thread: the transport started or stopped; the Now Playing rate and the session follow.
@@ -2743,9 +2782,12 @@ static MPRemoteCommand *remoteCommandNamed(NSString *name) {
 // Main thread: the session mixes with other audio unless Now Playing needs it not to.
 - (void)updateSessionExclusivity {
     if (!self.isReady || self.idleStopped) return;
-    const bool want = bgpolicy::wantsExclusiveSession(self.nowPlayingInfo != nil, [self isTransportPlaying] == YES,
-                                                      sInBackground.load(std::memory_order_relaxed));
-    if (want == sSessionExclusive.load(std::memory_order_relaxed)) return;
+    const bool playing = [self isTransportPlaying] == YES;
+    if (playing) sPausedByRemote = false;
+    const bool current = sSessionExclusive.load(std::memory_order_relaxed);
+    const bool want = bgpolicy::wantsExclusiveSession(current, self.nowPlayingInfo != nil, playing,
+                                                      sInBackground.load(std::memory_order_relaxed), sPausedByRemote);
+    if (want == current) return;
     sSessionExclusive.store(want, std::memory_order_relaxed);
     AVAudioSession *session = [AVAudioSession sharedInstance];
     NSError *categoryError = nil;
@@ -2824,3 +2866,9 @@ static MPRemoteCommand *remoteCommandNamed(NSString *name) {
 - (void)dealloc { [self shutdown]; }
 
 @end
+
+// The MIDI input sink refused a note-on (sAcceptingNotes false): wake the engine if it is
+// idle-stopped (wakeFromIdleStopIfNeeded is a no-op otherwise: before setup, while rebuilding).
+static void wakeEngineForRefusedNote() {
+    [[ExpoJuceAudioEngine sharedInstance] wakeFromIdleStopIfNeeded:@"midi input"];
+}

@@ -524,7 +524,7 @@ export function hasSequencePlayer(): boolean {
 
 /**
  * Replaces the loop (atomically: the audio thread never sees half of it). False (nothing changes)
- * without the native player, over SEQUENCE_MAX_EVENTS events or with a bad loop length; invalid
+ * without the native player, over SEQUENCE_MAX_EVENTS events or with a loop under 1/64 beat; invalid
  * events (note out of range, length <= 0, start outside the loop) are skipped.
  */
 export function setSequence(sequence: SequenceOptions): boolean {

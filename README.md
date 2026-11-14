@@ -506,10 +506,11 @@ const sub = Juce.addSequenceNotesListener(({ notes }) => {
 
 - `setSequence` replaces the loop atomically; at most `SEQUENCE_MAX_EVENTS` (8192) events, else it
   returns false. `fromBeat` / `endBeat` bound where it fires (a count-in, a single pass);
-  `skipBefore` skips an event the app already played. `setSequenceMuted`, `clearSequence`.
+  `skipBefore` skips an event the app already played. The loop is at least 1/64 beat.
+  `setSequenceMuted`, `clearSequence`.
 - Jumps, stop, a new loop length, `allNotesOff` and muting release everything it started. A pad
   or MIDI input note and a sequence note of the same pitch do not cut each other.
-- With the arpeggiator on, sequence notes go through it.
+- With the arpeggiator on, sequence notes go through it; latch holds only the player's notes.
 
 Background playback needs the host app's `audio` background mode. Then:
 
@@ -530,8 +531,9 @@ Juce.addTransportChangeListener(({ playing, reason }) => {});
   session so iOS can suspend the app. The foreground, a note-on or a transport start restarts it.
   A lock-screen play after an idle stop tries to restart from the background; if iOS refuses,
   `onRemoteCommand` has `failed: true` and diagnostics `backgroundStartError` says why.
-- Now Playing needs a session that does not mix with other apps: while it is set and the transport
-  plays (or the app is in the background), other apps' audio pauses.
+- Now Playing needs a session that does not mix with other apps. With it set, the session turns
+  non-mixable (other apps' audio pauses) only in the background while the transport plays or after
+  a lock-screen pause; Play in the foreground never changes the session.
 - An interruption (a call, Siri) stops the transport and does not resume it.
 
 ### Diagnostics

@@ -13,37 +13,45 @@
   and muting release every note it started; a new sequence keeps the notes that are still in it and
   releases the rest. Notes share holds with pads and the MIDI input: a pad holding a note the
   sequence also plays is not cut by the sequence's note-off, and the other way round. With the
-  arpeggiator on, sequence notes go through it (as notes played from JS did). `setSequenceMuted`,
-  `clearSequence`, `hasSequencePlayer()`.
+  arpeggiator on, sequence notes go through it (as notes played from JS did); a pad and the
+  sequence holding the same pitch there do not release each other, and latch applies to the
+  player's notes only (a stopped sequence leaves nothing latched). Loops shorter than 1/64 beat are
+  refused, and a block's work is bounded (512 starts, 1024 loop passes); a full block can lose
+  starts, never a note-off. `setSequenceMuted`, `clearSequence`, `hasSequencePlayer()`.
 - `addSequenceNotesListener`: the notes the sequence plays (`{ note, kind, on, atBeat }`) in
   batches about every 16 ms, built only while a listener is set.
 - **Background playback policy.** `setBackgroundPolicy({ keepAlive, idleStopSeconds })`: with
   keepAlive the engine keeps playing in the background while it has something to play; without it,
   leaving the app stops the transport and releases every note. Idle in the background for
   `idleStopSeconds` (default 30), the engine closes its audio device and deactivates the session so
-  iOS can suspend the app; coming back restarts it. A note-on, a MIDI note-on or a transport start
-  while idle-stopped restarts the device (best effort from the background; the first note is lost).
+  iOS can suspend the app; coming back restarts it. A note-on (from JS, or a MIDI device through
+  the C entry point) or a transport start while idle-stopped restarts the device (best effort from
+  the background, with a mixable session as iOS requires there; the first note is lost). Setup in
+  the background (state restoration) starts in the background state.
   Apps that never call it keep the old behaviour.
 - **Now Playing and remote commands.** `setNowPlaying({ title, artist?, album? })` and
   `enableRemoteCommands(['play', 'pause', 'togglePlayPause'])`: lock screen and Control Center
-  commands start and stop the native transport directly and emit `onRemoteCommand`. While Now
-  Playing is set and the transport plays (or the app is in the background), the session is not
-  mixable, which iOS requires to show it: other apps' audio pauses.
+  commands start and stop the native transport directly and emit `onRemoteCommand`. With Now
+  Playing set, the session is made non-mixable (iOS requires it to show Now Playing; other apps'
+  audio pauses) only in the background while the transport plays or after a lock-screen pause;
+  Play in the foreground never changes the session.
 - **Interruptions** (a call, Siri) stop the transport and release every note, with no automatic
-  resume; `onAudioInterruption` (`began` / `ended`) and `onTransportChange` tell the app.
+  resume (a stale "began" for a time the app was suspended is ignored); `onAudioInterruption` (`began` / `ended`) and `onTransportChange` tell the app.
   `onTransportChange` also reports remote commands and the keepAlive-off background stop;
   `onBackgroundState` reports `foreground` / `background` / `idleStopped`.
 - Diagnostics: `sequence` (`events, loopBeats, playing, muted, activeNotes, notesFired, lateFires,
-  dropped, version, listening, notesLost`), `backgroundState`, `idleStopAt`, `backgroundPolicy`,
+  dropped, invalidEvents, version, listening, notesLost`), `backgroundState`, `idleStopAt`, `backgroundPolicy`,
   `idleStops`, `lastIdleStopAt`, `backgroundStartError`, `nowPlaying`.
 - Harness cases `seq`, `seqv` and `bg`.
 - The podspec links `MediaPlayer`.
+- `NoteQueueSink` (MIDI input) takes an optional hook called when it refuses a note-on.
 
 ### Changed (iOS)
 
 - A note retrigger cuts the previous voice of the same note only within the same source group:
   a sequence note does not cut a pad's or the arpeggiator's voice of that note, nor they a sequence
   note's. The arpeggiator's note-offs release only arpeggiator voices.
+- Remote commands this engine did not enable are left as they are.
 - A module created (launch, reload) clears the old runtime's sequence, background policy, Now
   Playing info and remote commands, as does the owning module going away.
 
