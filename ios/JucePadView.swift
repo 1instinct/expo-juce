@@ -9,19 +9,33 @@ import UIKit
 // Drums mode (mode "drums"): `note` is a drum voice (0–8) and every touch-down hits it (one-shot,
 // with the same velocity as a note; a second finger retriggers). onNoteOn fires per hit and
 // onNoteOff when the last touch lifts; no note-off is sent to the engine.
+//
+// Sampler mode (mode "sampler"): `note` is a sampler slot (0–15). Every touch-down hits the slot at
+// its root note (a second finger retriggers, like drums) and the last touch-up releases the slot
+// (a one-shot slot ignores the release and plays to its end).
 class JucePadView: ExpoView {
+  enum Mode: String {
+    case notes
+    case drums
+    case sampler
+  }
+
   let onNoteOn = EventDispatcher()
   let onNoteOff = EventDispatcher()
 
   var note: Int = 60
   var velocity: Int = 100
-  // Drums mode. Changing the mode releases whatever this pad is sounding.
-  var drumMode: Bool = false {
+  // What the pad plays. Changing the mode releases whatever this pad is sounding.
+  var padMode: Mode = .notes {
     didSet {
-      if drumMode != oldValue {
+      if padMode != oldValue {
         releaseAllTouches()
       }
     }
+  }
+  // Drums and sampler pads hit on every touch-down; notes pads hold one note.
+  private var hitsEveryTouch: Bool {
+    return padMode != .notes
   }
   // Disabled pads leave hit-testing entirely, so touches reach the views underneath (forwarding
   // to super would only walk the responder chain, which does not include siblings).
@@ -53,8 +67,9 @@ class JucePadView: ExpoView {
   // Main thread: when any pad last reported its touch (reportLastTouch is throttled).
   private static var lastTouchReportTime: CFTimeInterval = 0
   private var soundingNote: Int?
-  // The sounding note is a drum hit (nothing to release in the engine).
-  private var soundingIsDrum = false
+  // The mode the sounding note was started in (what to release in the engine: nothing for a drum
+  // hit, the slot for a sampler hit, the note otherwise).
+  private var soundingMode: Mode = .notes
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -120,7 +135,7 @@ class JucePadView: ExpoView {
     }
     let wasIdle = activeTouches.isEmpty
     activeTouches.formUnion(touches)
-    if (wasIdle || drumMode) && !activeTouches.isEmpty {
+    if (wasIdle || hitsEveryTouch) && !activeTouches.isEmpty {
       var timestamp: TimeInterval = 0
       for touch in touches {
         if timestamp == 0 || touch.timestamp < timestamp {
@@ -299,21 +314,29 @@ class JucePadView: ExpoView {
   }
 
   private func startNote(touchTimestamp: TimeInterval, entryTimestamp: CFTimeInterval) {
-    // A drums-mode retrigger (another finger while a hit is held) is just another hit: no
-    // onNoteOff in between, that fires only when the last touch lifts.
-    if !(drumMode && soundingIsDrum) {
-      stopNote()
-    }
+    // A drums / sampler retrigger (another finger while a hit is held) is just another hit: no
+    // onNoteOff (or sampler release) in between, that comes only when the last touch lifts.
     let noteNumber = note
     let noteVelocity = velocity
+    // (A sampler pad whose slot changed while held releases the old slot first.)
+    let retrigger = hitsEveryTouch && soundingMode == padMode && (padMode == .drums || soundingNote == noteNumber)
+    if !retrigger {
+      stopNote()
+    }
     soundingNote = noteNumber
-    soundingIsDrum = drumMode
-    if drumMode {
+    soundingMode = padMode
+    switch padMode {
+    case .drums:
       ExpoJuceBridge.padDrumHit(Int32(clamping: noteNumber),
                                 velocity: Int32(clamping: noteVelocity),
                                 touchTimestamp: touchTimestamp,
                                 entryTimestamp: entryTimestamp)
-    } else {
+    case .sampler:
+      ExpoJuceBridge.padSamplerHit(Int32(clamping: noteNumber),
+                                   velocity: Int32(clamping: noteVelocity),
+                                   touchTimestamp: touchTimestamp,
+                                   entryTimestamp: entryTimestamp)
+    case .notes:
       ExpoJuceBridge.padNoteOn(Int32(clamping: noteNumber),
                                velocity: Int32(clamping: noteVelocity),
                                touchTimestamp: touchTimestamp,
@@ -331,10 +354,15 @@ class JucePadView: ExpoView {
       return
     }
     soundingNote = nil
-    if !soundingIsDrum {
+    switch soundingMode {
+    case .drums:
+      break
+    case .sampler:
+      ExpoJuceBridge.samplerRelease(Int32(clamping: noteNumber))
+    case .notes:
       ExpoJuceBridge.noteOff(Int32(clamping: noteNumber))
     }
-    soundingIsDrum = false
+    soundingMode = .notes
     let payload: [String: Any] = [
       "note": noteNumber,
     ]

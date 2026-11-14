@@ -31,16 +31,23 @@ export type PadNoteOffEvent = {
   note: number;
 };
 
-/** What a `JucePadView` plays (0.8.0+). */
-export type PadMode = 'notes' | 'drums';
+/** What a `JucePadView` plays (0.8.0+; `sampler` 0.10.0+). */
+export type PadMode = 'notes' | 'drums' | 'sampler';
 
 export type JucePadViewProps = {
-  /** MIDI note triggered while the pad is touched; in `drums` mode the drum voice (0–8). */
+  /**
+   * MIDI note triggered while the pad is touched; in `drums` mode the drum voice (0–8); in
+   * `sampler` mode the sampler slot (0–15).
+   */
   note: number;
   /**
    * `notes` (default): the pad holds `note` on the synth while touched. `drums`: every touch-down
    * hits drum voice `note` natively (one-shot, same velocity; `onNoteOn` per hit, `onNoteOff` when
-   * the last touch lifts). Changing the mode releases the pad. Binaries older than 0.8.0 ignore it.
+   * the last touch lifts). `sampler` (0.10.0+): every touch-down hits sampler slot `note` at its
+   * root note (a second finger retriggers) and the last touch-up releases the slot (a one-shot
+   * slot ignores the release and plays to its end). The release is per slot: it also ends a gated
+   * sound another pad or `samplerHit` started on the same slot. Changing the mode releases the pad. Binaries
+   * older than 0.8.0 ignore the mode; binaries older than 0.10.0 treat `sampler` as `notes`.
    */
   mode?: PadMode;
   /** MIDI velocity 0-127 (default 100). */
@@ -246,6 +253,76 @@ export type DrumKitParams = {
 /** `getDrumState()` (0.8.0+): the kit and every voice (9; 8 before 0.8.0-rc.2), as stored natively (after clamping). */
 export type DrumState = { kit: DrumKitParams; voices: DrumVoiceParams[] };
 
+/** A sampler slot's loop (0.10.0+): ms of the sample; `endMs` -1 = the sample's end. */
+export type SamplerLoop = { startMs: number; endMs: number };
+
+/**
+ * One sampler slot's playing parameters (0.10.0+). Slots are 0–15. Times are ms of the sample;
+ * values are clamped natively, out-of-range or non-finite numbers never throw.
+ */
+export type SamplerSlotParams = {
+  /** MIDI note that plays the sample at its own pitch; pads play this note (default 60). */
+  rootNote: number;
+  /** Key zone, 0–127 (default 0..127). `lowNote > highNote`: no key plays the slot (pads still do). */
+  lowNote: number;
+  highNote: number;
+  /** Playback starts here (default 0). */
+  startMs: number;
+  /** Playback ends here; -1 = the sample's end (default). */
+  endMs: number;
+  /** Loop between two points of the sample, crossfaded over 5 ms; null = no loop (default). Gated slots only. */
+  loop: SamplerLoop | null;
+  /** true (default): plays to its end, ignoring note-offs and releases. false: plays while held. */
+  oneShot: boolean;
+  /** −60..24 dB (default 0). */
+  gainDb: number;
+  /** −1 (left) .. 1 (right), a balance (default 0). */
+  pan: number;
+  /** Semitones, −48..48 (default 0). */
+  tune: number;
+  /** Cents, −100..100 (default 0). */
+  fineCents: number;
+  /** Linear attack, 0–10000 ms (default 1). */
+  attackMs: number;
+  /** Linear release, 1–10000 ms (default 50). */
+  releaseMs: number;
+  /** 0 = every hit at full level, 1 = level follows velocity (default 1). */
+  velocitySens: number;
+  /** 0 = none (default), 1–8: a voice starting in a group fades the group's other voices out (5 ms). */
+  chokeGroup: number;
+};
+
+/** Sampler-wide settings (0.10.0+). */
+export type SamplerSettings = {
+  /** 0–1 (default 0.8). */
+  level: number;
+  /** Silences the sampler (default false). */
+  mute: boolean;
+  /** Voices the sampler may use, 1–32 (default 32). */
+  polyphony: number;
+};
+
+/** A slot in `getSamplerState()` (0.10.0+): its parameters (as stored) and what is loaded. */
+export type SamplerSlotState = SamplerSlotParams & {
+  loaded: boolean;
+  /** Frames of the playable buffer (0 = empty). */
+  frames: number;
+  durationMs: number;
+};
+
+/** `getSamplerState()` (0.10.0+): the settings and all 16 slots. */
+export type SamplerState = SamplerSettings & { slots: SamplerSlotState[] };
+
+/** What `loadSamplerSlot` resolves with (0.10.0+): the playable buffer. */
+export type SamplerLoadResult = {
+  frames: number;
+  /** Rate of the playable buffer: the engine's output rate when it was known, else the file's. */
+  sampleRate: number;
+  /** Of the file (1 = mono, played on both sides). */
+  channels: number;
+  durationMs: number;
+};
+
 /** Arpeggiator state in `Analysis.arp` (0.7.0+), as of the last rendered block. */
 export type ArpAnalysis = {
   /** The arp is enabled and holds notes (a step is sounding or coming). */
@@ -368,6 +445,14 @@ export type AudioDiagnostics = {
   drumHits?: number;
   /** Peak of the drum part, before the effects (decaying hold, 0.8.0+). */
   drumPeak?: number;
+  /** Sampler pad hits and key note-ons the engine consumed (cumulative since launch, 0.10.0+). */
+  samplerHits?: number;
+  /** Sampler voices sounding at the last block (0.10.0+). */
+  samplerVoices?: number;
+  /** Peak of the sampler part, before the effects (decaying hold, 0.10.0+). */
+  samplerPeak?: number;
+  /** Bytes of sample memory loaded, all slots (0.10.0+). */
+  samplerBytes?: number;
   sessionCategory: string;
   sessionSampleRate: number;
   sessionIOBufferMs: number;

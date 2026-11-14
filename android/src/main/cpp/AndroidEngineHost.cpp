@@ -18,6 +18,7 @@
 #include "TransportEngine.h"
 #include "Arpeggiator.h"
 #include "DrumMachine.h"
+#include "SamplerEngine.h"
 #include "SpectrumAnalyser.h"
 #include "NoteEventQueue.h"
 #include "GraphPlayer.h"
@@ -85,6 +86,9 @@ std::atomic<bool> sAcceptingNotes{false};
 FxParamStore sFxParams;
 ArpSettingsStore sArpOptions;
 DrumParamStore sDrumParams;
+// The sampler's parameters (stored defaults; nothing sets them on Android yet, and there is no
+// sample bank, so the synth's sampler stays silent).
+SamplerParamStore sSamplerParams;
 AnalysisRing sAnalysis;
 
 std::function<std::unique_ptr<juce::AudioIODeviceType>()> sExtraDeviceTypeFactory;
@@ -278,6 +282,7 @@ void doSetupLocked() {
     sSynth->setAnalysis(&sAnalysis);
     sSynth->arp().setSettingsStore(&sArpOptions);
     sSynth->drums().setParamStore(&sDrumParams);
+    sSynth->sampler().setParamStore(&sSamplerParams);
 
     setStep(7, "addNode (synth, fx chain)");
     auto synthNode = sGraph->addNode(std::move(synthProcessor));
@@ -444,7 +449,8 @@ std::string diagnosticsJson() {
     double callbackCount = 0.0, graphProcessCount = 0.0, outputPeak = 0.0, nanCount = 0.0, toneSamplesMixed = 0.0;
     double synthProcessCount = 0.0, synthPeak = 0.0, lastNoteToRenderMs = -1.0, lastTouchToRenderMs = -1.0;
     int activeVoices = 0;
-    double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0, drumPeak = 0.0;
+    double fxProcessCount = 0.0, fxLimiterGain = 1.0, fxNonFiniteResets = 0.0, drumPeak = 0.0, samplerPeak = 0.0;
+    int samplerVoices = 0;
     {
         std::unique_lock<std::mutex> lock(sEngineLock, std::defer_lock);
         if (acquireUserLock(lock)) {
@@ -476,6 +482,8 @@ std::string diagnosticsJson() {
                 lastNoteToRenderMs = synth->diag.lastNoteToRenderMs.load(relaxed);
                 lastTouchToRenderMs = synth->diag.lastTouchToRenderMs.load(relaxed);
                 drumPeak = (double)synth->drums().diag.peak.load(relaxed);
+                samplerPeak = (double)synth->sampler().diag.peak.load(relaxed);
+                samplerVoices = synth->sampler().diag.activeVoices.load(relaxed);
             }
             if (FxChainProcessor* fx = ready ? sFx : nullptr) {
                 fxProcessCount = (double)fx->diag.processCount.load(relaxed);
@@ -529,6 +537,10 @@ std::string diagnosticsJson() {
     d->setProperty("backingTrackTempoRatio", 1.0);
     d->setProperty("drumHits", number((double)sNoteQueue.drumHitsConsumed.load(std::memory_order_relaxed)));
     d->setProperty("drumPeak", number(drumPeak));
+    d->setProperty("samplerHits", number((double)sNoteQueue.samplerEventsConsumed.load(std::memory_order_relaxed)));
+    d->setProperty("samplerVoices", samplerVoices);
+    d->setProperty("samplerPeak", number(samplerPeak));
+    d->setProperty("samplerBytes", 0.0); // no sample bank on Android yet
 
     d->setProperty("engineState", engineState);
     d->setProperty("lockBusyDrops", number((double)sLockBusyDrops.load(std::memory_order_relaxed)));
@@ -657,6 +669,50 @@ std::string drumStateJson() {
     juce::var result(d);
     d->setProperty("kit", kitVar);
     d->setProperty("voices", juce::var(voices));
+    return toJson(result);
+}
+
+std::string samplerStateJson() {
+    juce::Array<juce::var> slots;
+    for (int s = 0; s < kSamplerSlots; ++s) {
+        const SamplerSlotParams p = sSamplerParams.slot(s);
+        auto* slot = new juce::DynamicObject();
+        juce::var slotVar(slot);
+        slot->setProperty("loaded", false); // no sample bank on Android yet
+        slot->setProperty("frames", 0);
+        slot->setProperty("durationMs", 0.0);
+        slot->setProperty("rootNote", p.rootNote);
+        slot->setProperty("lowNote", p.lowNote);
+        slot->setProperty("highNote", p.highNote);
+        slot->setProperty("startMs", forJS(p.startMs));
+        slot->setProperty("endMs", forJS(p.endMs));
+        if (p.loop) {
+            auto* loop = new juce::DynamicObject();
+            juce::var loopVar(loop);
+            loop->setProperty("startMs", forJS(p.loopStartMs));
+            loop->setProperty("endMs", forJS(p.loopEndMs));
+            slot->setProperty("loop", loopVar);
+        } else {
+            slot->setProperty("loop", juce::var());
+        }
+        slot->setProperty("oneShot", p.oneShot);
+        slot->setProperty("gainDb", forJS(p.gainDb));
+        slot->setProperty("pan", forJS(p.pan));
+        slot->setProperty("tune", forJS(p.tuneSemis));
+        slot->setProperty("fineCents", forJS(p.tuneCents));
+        slot->setProperty("attackMs", forJS(p.attackMs));
+        slot->setProperty("releaseMs", forJS(p.releaseMs));
+        slot->setProperty("velocitySens", forJS(p.velocitySens));
+        slot->setProperty("chokeGroup", p.chokeGroup);
+        slots.add(slotVar);
+    }
+    const SamplerSettings settings = sSamplerParams.settings();
+    auto* d = new juce::DynamicObject();
+    juce::var result(d);
+    d->setProperty("level", forJS(settings.level));
+    d->setProperty("mute", settings.mute);
+    d->setProperty("polyphony", settings.polyphony);
+    d->setProperty("slots", juce::var(slots));
     return toJson(result);
 }
 

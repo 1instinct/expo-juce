@@ -21,7 +21,8 @@ internal object ExpoJuceNative {
   enum class SynthParam { FILTER_CUTOFF, FILTER_RESONANCE, ATTACK, DECAY, SUSTAIN, RELEASE, DETUNE, MASTER_LEVEL }
 
   /** Indices of nativeStateJson (ExpoJuceJni.cpp). */
-  enum class State { EFFECTS, ARPEGGIATOR, DRUMS, ANALYSIS }
+  // The ordinal is the JNI nativeStateJson index: append only.
+  enum class State { EFFECTS, ARPEGGIATOR, DRUMS, ANALYSIS, SAMPLER }
 
   @Volatile var loadError: String? = null
     private set
@@ -70,6 +71,7 @@ internal object ExpoJuceNative {
   val effectsState: Map<String, Any?> by lazy { stateMap(State.EFFECTS) }
   val arpeggiatorState: Map<String, Any?> by lazy { stateMap(State.ARPEGGIATOR) }
   val drumState: Map<String, Any?> by lazy { stateMap(State.DRUMS) }
+  val samplerState: Map<String, Any?> by lazy { stateMap(State.SAMPLER) }
   private val analysisShape: Map<String, Any?> by lazy { stateMap(State.ANALYSIS) }
 
   fun analysis(): Map<String, Any?> {
@@ -89,6 +91,7 @@ internal object ExpoJuceNative {
     State.ARPEGGIATOR -> DefaultShapes.ARPEGGIATOR
     State.DRUMS -> DefaultShapes.DRUMS
     State.ANALYSIS -> DefaultShapes.ANALYSIS
+    State.SAMPLER -> DefaultShapes.SAMPLER
   }
 
   // ── Diagnostics ──

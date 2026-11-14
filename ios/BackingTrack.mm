@@ -1,4 +1,5 @@
 #include "BackingTrack.h"
+#include "Hermite.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -96,12 +97,7 @@ std::unique_ptr<BackingTrackBuffer> BackingTrack::resample(const juce::AudioBuff
             const double pos = i * step;
             const int64_t k = (int64_t)std::floor(pos);
             const float t = (float)(pos - (double)k);
-            const float xm1 = at(k - 1), x0 = at(k), x1 = at(k + 1), x2 = at(k + 2);
-            // Catmull-Rom / 4-point Hermite
-            const float c1 = 0.5f * (x1 - xm1);
-            const float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
-            const float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
-            y[i] = ((c3 * t + c2) * t + c1) * t + x0;
+            y[i] = hermite4(at(k - 1), at(k), at(k + 1), at(k + 2), t); // Catmull-Rom / 4-point Hermite
         }
     }
     return out;

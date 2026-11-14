@@ -156,7 +156,7 @@ EXPOJUCE_JNI(void, nativeSetSynthParam)(JNIEnv* env, jclass, jint param, jdouble
     });
 }
 
-// 0 effects, 1 arpeggiator, 2 drums, 3 analysis.
+// 0 effects, 1 arpeggiator, 2 drums, 3 analysis, 4 sampler.
 EXPOJUCE_JNI(jstring, nativeStateJson)(JNIEnv* env, jclass, jint which) {
     return guarded<jstring>(env, nullptr, [&] {
         switch ((int)which) {
@@ -164,6 +164,7 @@ EXPOJUCE_JNI(jstring, nativeStateJson)(JNIEnv* env, jclass, jint which) {
             case 1: return toJString(env, expojuce::host::arpeggiatorStateJson());
             case 2: return toJString(env, expojuce::host::drumStateJson());
             case 3: return toJString(env, expojuce::host::analysisJson());
+            case 4: return toJString(env, expojuce::host::samplerStateJson());
             default: return toJString(env, "{}");
         }
     });

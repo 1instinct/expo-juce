@@ -21,6 +21,8 @@
 #include "MidiInput.h"
 #include "ExpoJuceMidiInput.h"
 #include "OwnerToken.h"
+#include "SamplerEngine.h"
+#include "SamplerBank.h"
 #include "SequencePlayer.h"
 #include "BackgroundPolicy.h"
 #include "SynthParamSmoother.h"
@@ -44,6 +46,12 @@
 // JUCE's HeapBlock both end up here); while tCountAllocs is set on a thread, every allocation it
 // makes is counted. The fake device sets it around each GraphPlayer IO callback, so any
 // allocation anywhere inside the render (GraphPlayer, AudioProcessorGraph, synth) shows up.
+// A sanitizer build (-DHARNESS_SANITIZE=address|thread|…) leaves malloc to the sanitizer: the
+// counters then stay 0, and that build checks memory errors and races instead.
+static thread_local bool tCountAllocs = false;
+static std::atomic<uint64_t> gRenderAllocs{0};
+static std::atomic<uint64_t> gRenderFrees{0}; // frees inside counted render calls (must be 0 too)
+#ifndef HARNESS_NO_MALLOC_INTERPOSE
 extern "C" {
 void* __libc_malloc(size_t);
 void* __libc_calloc(size_t, size_t);
@@ -51,9 +59,6 @@ void* __libc_realloc(void*, size_t);
 void* __libc_memalign(size_t, size_t);
 void __libc_free(void*);
 }
-static thread_local bool tCountAllocs = false;
-static std::atomic<uint64_t> gRenderAllocs{0};
-static std::atomic<uint64_t> gRenderFrees{0}; // frees inside counted render calls (must be 0 too)
 static inline void countAlloc() {
     if (tCountAllocs) gRenderAllocs.fetch_add(1, std::memory_order_relaxed);
 }
@@ -75,6 +80,7 @@ void free(void* p) {
     __libc_free(p);
 }
 }
+#endif // HARNESS_NO_MALLOC_INTERPOSE
 
 //==============================================================================
 // BackingTrack::acquire() test seam (CMake defines BACKING_TRACK_ACQUIRE_HOOK as this name). A
@@ -2453,7 +2459,7 @@ static bool runAnalysis() {
 }
 
 //==============================================================================
-// Synth parameter smoothing (case `sm`). SynthParamSmoother: a cutoff step is a strictly
+// Synth parameter smoothing (case `psm`). SynthParamSmoother: a cutoff step is a strictly
 // monotone multiplicative ramp of exactly kRampSeconds × sr samples (constant ratio per sample,
 // first sample one ratio away from the old value: no step), that ends exactly on the target;
 // steps arriving every 1/28 s (a controller's rate) give one strictly increasing sweep with no
@@ -2686,7 +2692,7 @@ static bool runSynthSmoothing() {
     const uint64_t allocs = gRenderAllocs.load(), frees = gRenderFrees.load();
     if (allocs != 0 || frees != 0) fail("allocations in processBlock");
 
-    std::printf("sm    synth param smoothing (%.0f ms = %d samples @ 48k)  %-4s cutoff ramp %d samples, ratio err %.4f,"
+    std::printf("psm   synth param smoothing (%.0f ms = %d samples @ 48k)  %-4s cutoff ramp %d samples, ratio err %.4f,"
                 " 28 Hz sweep plateaus %d; processor cutoff err %.5f; level step max |dx| %.4f (steady %.4f), after %.1f;"
                 " sustain peak %.3f -> first %.3f -> %.3f; release@sus0 active %d/%d peak %.3f; allocs %llu frees %llu%s%s\n",
                 SynthParamSmoother::kRampSeconds * 1000.0, L, ok ? "PASS" : "FAIL", rampLen, maxRampRelErr, sweepPlateau,
@@ -5057,6 +5063,8 @@ static bool runMidiEntry() {
     return pass;
 }
 
+#include "sampler_cases.inc"
+
 //==============================================================================
 // Loop sequence player (ios/SequencePlayer.h, 0.9.0-rc.5), driven like PolySynthProcessor drives
 // it: the transport advances a block, then the player runs with the block's start beat / bpm /
@@ -5637,7 +5645,7 @@ static bool runSequenceVoices() {
     return pass;
 }
 
-// Smoothing with the arpeggiator and the loop sequence (case `smv`). Their events split a block
+// Smoothing with the arpeggiator and the loop sequence (case `psmv`). Their events split a block
 // into segments (PolySynthProcessor renders up to each event offset), so the smoother must still
 // advance by exactly one value per sample: a cutoff step taken while the arp, or the sequence,
 // starts and stops voices at offsets inside 471-sample blocks follows the same ramp as with no
@@ -5646,7 +5654,8 @@ static bool runSequenceVoices() {
 // still fades over its release time and is silent after it, also when the envelope times change
 // during that release. Non-finite setter values change nothing. Stealing with a detune ramp
 // running stays finite, and a voice stolen again before it renders leaves a tail at its own
-// pitch. 0 allocations in every processBlock.
+// pitch. A sampler pad hit adds the same output with the synth busy and ramping as on an idle
+// synth, from the first sample of its block. 0 allocations in every processBlock.
 static bool runSynthSmoothingVoices() {
     constexpr double sr = 48000.0;
     const int L = (int)std::floor(SynthParamSmoother::kRampSeconds * sr);
@@ -5839,14 +5848,87 @@ static bool runSynthSmoothingVoices() {
         check(std::fabs(tailCrossings - want) <= 2.0, "double steal: tail has " + std::to_string(tailCrossings)
               + " sign changes, want about " + std::to_string((int)std::lround(want)));
     }
+    // 6. The sampler is not touched by synth smoothing and keeps its own timing: with arp events
+    //    splitting the synth's render and cutoff / level / detune / sustain ramps running, a pad hit
+    //    adds exactly what the same hit renders on a synth with no notes and no parameter changes
+    //    (with - without the hit == the hit alone, both channels, within float rounding), from the
+    //    first sample of the block after the hit.
+    double samplerDiff = -1.0;
+    {
+        std::vector<float> L(24000), R(24000);
+        for (int i = 0; i < 24000; ++i) {
+            L[(size_t)i] = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi * 997.0 * i / sr);
+            R[(size_t)i] = 0.25f * (float)std::cos(2.0 * juce::MathConstants<double>::pi * 331.0 * i / sr);
+        }
+        auto run = [&](bool synthBusy, bool hit, std::vector<float>& outL, std::vector<float>& outR) {
+            SamplerBank bank;
+            std::string error;
+            bank.install(3, SamplerBank::fromAudio(L.data(), R.data(), 24000, sr), bank.beginLoad(3), error);
+            TransportEngine transport;
+            PolySynthProcessor synth;
+            synth.setTransport(&transport);
+            synth.setSamplerSource(&bank);
+            synth.setRateAndBufferSizeDetails(sr, 512);
+            synth.prepareToPlay(sr, 512);
+            synth.sampler().params().setLevel(1.0);
+            SamplerSlotParams p;
+            p.attackMs = 0.0f;
+            synth.sampler().params().setSlot(3, p);
+            if (synthBusy) {
+                ArpSettings s = ArpSettings::defaults();
+                s.enabled = true; s.gate = 0.5f;
+                synth.arp().setSettings(s);
+                synth.noteOn(48, 100);
+                synth.noteOn(55, 100);
+            }
+            juce::AudioBuffer<float> buf(2, 512);
+            juce::MidiBuffer midi;
+            const int total = 471 * 30;
+            outL.assign((size_t)total, 0.0f);
+            outR.assign((size_t)total, 0.0f);
+            for (int done = 0, k = 0; done < total; ++k) {
+                const int n = std::min(471, total - done);
+                if (synthBusy && k == 4) {
+                    synth.setFilterCutoff(300.0); synth.setMasterLevel(0.2); synth.setDetune(-50.0); synth.setSustain(0.3);
+                }
+                if (hit && k == 5) synth.samplerHit(3, 127);
+                buf.setSize(2, n, false, false, true);
+                gRenderAllocs.store(0); gRenderFrees.store(0);
+                tCountAllocs = true;
+                synth.processBlock(buf, midi);
+                tCountAllocs = false;
+                allocs += gRenderAllocs.load() + gRenderFrees.load();
+                std::memcpy(&outL[(size_t)done], buf.getReadPointer(0), (size_t)n * sizeof(float));
+                std::memcpy(&outR[(size_t)done], buf.getReadPointer(1), (size_t)n * sizeof(float));
+                done += n;
+            }
+        };
+        std::vector<float> aL, aR, bL, bR, cL, cR;
+        run(true, true, aL, aR);
+        run(true, false, bL, bR);
+        run(false, true, cL, cR);
+        samplerDiff = 0.0;
+        for (size_t i = 0; i < aL.size(); ++i) {
+            samplerDiff = std::max(samplerDiff, (double)std::fabs((aL[i] - bL[i]) - cL[i]));
+            samplerDiff = std::max(samplerDiff, (double)std::fabs((aR[i] - bR[i]) - cR[i]));
+        }
+        int firstC = -1;
+        for (size_t i = 0; i < cL.size(); ++i) if (cL[i] != 0.0f || cR[i] != 0.0f) { firstC = (int)i; break; }
+        check(firstC == 5 * 471 || firstC == 5 * 471 + 1, "sampler hit starts at " + std::to_string(firstC));
+        check(samplerDiff < 1e-5, "sampler output changed by the synth's smoothing / segments ("
+              + std::to_string(samplerDiff) + ")");
+        float synthPeak = 0.0f;
+        for (float v : bL) synthPeak = std::max(synthPeak, std::fabs(v));
+        check(synthPeak > 0.01f, "synth silent in the sampler comparison");
+    }
     check(nonFinite == 0, "non-finite output " + std::to_string(nonFinite));
     check(allocs == 0, "allocations " + std::to_string(allocs));
     const bool pass = failed == 0;
-    std::printf("smv   smoothing with arp / sequence events inside blocks  %-4s cutoff ramp err none %.5f arp %.5f seq %.5f;"
+    std::printf("psmv  smoothing with arp / sequence events inside blocks  %-4s cutoff ramp err none %.5f arp %.5f seq %.5f;"
                 " release@sus0 mid / after: arp %.3f / %.3f, seq %.3f / %.3f, times changed %.3f;"
-                " double-steal tail sign changes %d; %d failed checks%s\n",
+                " double-steal tail sign changes %d; sampler with - without - alone %.2g; %d failed checks%s\n",
                 pass ? "PASS" : "FAIL", worstErr[0], worstErr[1], worstErr[2], arpMid, arpAfter, seqMid, seqAfter,
-                timesMid, tailCrossings, failed, detail.c_str());
+                timesMid, tailCrossings, samplerDiff, failed, detail.c_str());
     std::fflush(stdout);
     return pass;
 }
@@ -6017,11 +6099,17 @@ int main(int argc, char** argv) {
     if (want("mih")) unexpected += runMidiHolds() ? 0 : 1;
     if (want("mic")) unexpected += runMidiEntry() ? 0 : 1;
     if (want("own")) unexpected += runOwnerToken() ? 0 : 1;
+    if (want("sm")) unexpected += runSamplerCore() ? 0 : 1;
+    if (want("smb")) unexpected += runSamplerBudget() ? 0 : 1;
+    if (want("sml")) unexpected += runSamplerLoader() ? 0 : 1;
+    if (want("sms")) unexpected += runSamplerSwapStress() ? 0 : 1;
+    if (want("smq")) unexpected += runSamplerInSynth() ? 0 : 1;
+    if (want("smd")) unexpected += runSamplerDefaultsMatchJs() ? 0 : 1;
     if (want("seq")) unexpected += runSequence() ? 0 : 1;
     if (want("seqv")) unexpected += runSequenceVoices() ? 0 : 1;
     if (want("bg")) unexpected += runBackgroundPolicy() ? 0 : 1;
-    if (want("sm")) unexpected += runSynthSmoothing() ? 0 : 1;
-    if (want("smv")) unexpected += runSynthSmoothingVoices() ? 0 : 1;
+    if (want("psm")) unexpected += runSynthSmoothing() ? 0 : 1;
+    if (want("psmv")) unexpected += runSynthSmoothingVoices() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"
                 "(whole case), synthPk = peak inside the synth before the graph.\n"
                 "Case (i) logs jasserts from Voice::prepare(0 Hz) during doSetup; expected, it is re-prepared.\n");

@@ -53,7 +53,7 @@ Replaced the mono SynthEngine + AVAudioEngine with a JUCE-owned audio stack buil
 
 `setup()` rejects with the failing step, `getDiagnostics()` exposes every layer from device callbacks to synth peak, `playTestTone()` bypasses the graph, an offline harness reproduces the device callback on Linux. Root causes of the first on-device silence (fixed 2026-10-22): a stale Metro bundle running the app on stubs, infinite recursion in `-setBeatCallback:`, `setup()` always resolving, and expo-av switching the shared session to Ambient. 0.5.2 adds: 128-sample buffer, no allocation on the audio thread, native `JucePadView` touch path, 2 ms default attack, session re-assert and interruption / media-reset recovery (keeping synth settings and transport state across rebuilds).
 
-Synth parameter smoothing: cutoff, resonance, detune, master level and sustain ramp per sample over 40 ms instead of stepping (see [Parameter smoothing](#parameter-smoothing)); a note released at sustain 0 now fades over its release time (it was cut on the next block). Verified in the offline harness (case `sm`); not yet run on a device.
+Synth parameter smoothing: cutoff, resonance, detune, master level and sustain ramp per sample over 40 ms instead of stepping (see [Parameter smoothing](#parameter-smoothing)); a note released at sustain 0 now fades over its release time (it was cut on the next block). Verified in the offline harness (cases `psm`, `psmv`); not yet run on a device.
 
 ### Sub-project 2: Effects Chain
 **Status:** In progress (0.6.0) — engine + JS API done and verified in the offline harness; not yet run on a device
@@ -61,9 +61,9 @@ Synth parameter smoothing: cutoff, resonance, detune, master level and sustain r
 One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Also in 0.6.0: an `AuxProcessor` node summed into the output after the effects, with a sample-accurate metronome (5 click styles, bar accent) and a backing track (off-thread decode + resample, gapless MP3 loop regions, lock-free swap, follows transport play / stop / seek; see [Metronome and backing track](#metronome-and-backing-track-060)); `getAnalysis()` (output peak / rms, 128-point scope, last note, transport) for HUDs; a `hitPolygon` touch shape on `JucePadView`. Later: reorderable / per-node effects via modular routing (sub-project 5).
 
 ### Sub-project 3: Sample Playback / Drum Machine
-**Status:** Drum machine in progress (0.8.0-rc.0) — engine + JS API verified in the offline harness, not yet run on a device; sampler planned
+**Status:** Drum machine in progress (0.8.0-rc.0); sampler in progress (0.10.0-rc.0, iOS) — engine + JS API verified in the offline harness, not yet run on a device
 
-0.8.0 adds a synthesized drum part (kick, snare, closed / open hat, clap, low / mid / high tom, rim; nine voices, the mid tom since 0.8.0-rc.2; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). Next: a `SamplerProcessor` that loads audio files into the same voice slots (multi-sample mapping, transport-sequenced playback).
+0.8.0 adds a synthesized drum part (kick, snare, closed / open hat, clap, low / mid / high tom, rim; nine voices, the mid tom since 0.8.0-rc.2; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). 0.10.0 adds a sampler in the same synth node: 16 slots of decoded audio files on 32 voices, with key zones, loops, choke groups and a sampler mode on `JucePadView` (see [Sampler](#sampler-0100-ios)). Later: multi-sample velocity layers, transport-sequenced playback, Android.
 
 ### Sub-project 4: Audio Input Processing
 **Status:** Planned
@@ -157,7 +157,8 @@ sample, over 40 ms from the value it is currently at:
 before the previous ramp has finished, so a sweep is one continuous glide with no flat
 segments, and the sound lags the control by at most 40 ms. (The effect chain ramps its
 parameters over 50 ms.) Settings restored on a rebuilt engine are applied at once, not ramped.
-Non-finite values (NaN, ±Infinity) are ignored. The JS API is unchanged.
+Non-finite values (NaN, ±Infinity) are ignored. The JS API is unchanged. The drums and the sampler
+have their own parameters and are not affected.
 
 ### Effects (0.6.0+)
 
@@ -375,6 +376,78 @@ if (ExpoJuce.hasDrums()) {
 Decay times above are to −60 dB at `decay` 0.5. More on the voices in
 [docs/drums.md](docs/drums.md).
 
+### Sampler (0.10.0+, iOS)
+
+16 sample slots, numbered `0`–`15`, played by 32 shared voices. Pads play a slot at its root
+note; keys play every loaded slot whose key zone holds the note, pitched by playback rate
+(`2^((note − rootNote + tune + fineCents / 100) / 12)`, 4-point Hermite interpolation). The
+sampler is mixed with the synth and the drums before the effects chain, with its own level and
+mute; the arpeggiator never applies to it.
+
+```ts
+if (ExpoJuce.hasSampler()) {
+  const info = await ExpoJuce.loadSamplerSlot(0, fileUri, { rootNote: 60, oneShot: true }); // { frames, sampleRate, channels, durationMs }
+  ExpoJuce.samplerHit(0, 110);                    // pad: slot 0 at its root note
+  ExpoJuce.setSamplerSlot(1, { oneShot: false, loop: { startMs: 120, endMs: 860 }, lowNote: 48, highNote: 72 });
+  ExpoJuce.samplerNoteOn(55, 100);                // keys: every loaded slot whose zone holds 55
+  ExpoJuce.samplerNoteOff(55);
+  ExpoJuce.setSampler({ level: 0.9, polyphony: 16 });
+  const { slots } = ExpoJuce.getSamplerState();   // as stored (after clamping) + what is loaded
+}
+```
+
+- `loadSamplerSlot(slot, uri, params?)`: a local file (`file://` URI or absolute path; WAV, AIFF,
+  FLAC, MP3, plus CoreAudio formats such as M4A) decoded and resampled to the device rate off the
+  audio thread, then swapped in; voices still playing the slot's previous sample fade out over 64
+  samples. `params` (partial) are applied right before the new sample is published, and only if
+  it is (a failed or superseded load leaves the slot's parameters as they were). Limits: 60 s per
+  sample, 256 MB across all slots (replaced samples not yet freed count; the slot being replaced
+  does not), and the memory the process may still allocate. A later
+  load or `unloadSamplerSlot` of the same slot supersedes a load in flight. Rejects with
+  `ERR_SAMPLER_SLOT`, `ERR_SAMPLER_FILE`, `_FORMAT`, `_TOO_LONG`, `_MEMORY`, `_SUPERSEDED`, or
+  `ERR_UNSUPPORTED` (no sampler in this binary).
+- `samplerHit(slot, velocity)` / `samplerRelease(slot)` (pads) and `samplerNoteOn(note, velocity)` /
+  `samplerNoteOff(note)` (keys): any thread, lock-free, through the same queue as `noteOn`. A
+  one-shot slot plays to its end and ignores releases; a gated slot (`oneShot: false`) plays while
+  held, then releases. A sound reaching its end fades over its last 1 ms (no click). Velocity is
+  clamped to 1–127 (`samplerNoteOn` with velocity 0 is a note-off); an out-of-range slot or note
+  is ignored; hits are dropped while the engine is not set up. `allNotesOff()` releases the
+  sampler too. `samplerRelease(slot)` is per slot, not per caller: it releases every gated sound a
+  hit on the slot started, including another pad's.
+- `setSamplerSlot(slot, params)` (`SamplerSlotParams`; omitted and unknown keys unchanged,
+  numbers clamped; `false` for a slot outside 0–15) and `setSampler({ level, mute, polyphony })`.
+  Defaults: `SAMPLER_SLOT_DEFAULTS`, `SAMPLER_DEFAULTS`; `SAMPLER_SLOT_COUNT` (16) and
+  `SAMPLER_VOICE_COUNT` (32) are exported.
+- Loaded samples and parameters are kept natively for the life of the app (they work before
+  `setup()` and survive engine rebuilds). Android, web and binaries older than 0.10.0:
+  `hasSampler()` is `false`, `loadSamplerSlot` rejects with `ERR_UNSUPPORTED`, the other calls do
+  nothing or return `false`, and `getSamplerState()` returns the defaults.
+- `JucePadView` `mode="sampler"`: pad `note` is the slot (see [`JucePadView`](#jucepadview-052)).
+- With the [loop sequence](#loop-sequence-and-background-playback-090-rc5-ios): sequence events
+  never reach the sampler (a sequence holds synth notes and drum hits only), and stopping the
+  transport leaves sampler voices alone; play a sampler part from JS (`samplerHit`) for now.
+  With a background policy, sounding sampler voices keep the engine busy (no idle stop while one
+  plays). An interruption, or leaving the app with `keepAlive: false`, ends every sampler voice,
+  one-shots included, over 5 ms. A hit or key note-on while idle-stopped restarts the device (the
+  hit itself is lost, as for `noteOn`).
+- Diagnostics: `samplerHits`, `samplerVoices`, `samplerPeak`, `samplerBytes`.
+
+| Slot parameter | Range (default) |
+|---|---|
+| `rootNote` | 0–127 (60) |
+| `lowNote` / `highNote` | 0–127 (0 / 127); `lowNote > highNote`: no key plays the slot |
+| `startMs` / `endMs` | ms of the sample (0 / −1 = the end) |
+| `loop` | `{ startMs, endMs }` or `null` (null); gated slots only, 5 ms crossfade |
+| `oneShot` | (true) |
+| `gainDb` | −60..24 (0) |
+| `pan` | −1..1 (0), a balance |
+| `tune` / `fineCents` | −48..48 semitones / −100..100 cents (0 / 0) |
+| `attackMs` / `releaseMs` | 0–10000 (1) / 1–10000 (50), linear |
+| `velocitySens` | 0–1 (1) |
+| `chokeGroup` | 0–8 (0 = none) |
+
+More in [docs/sampler.md](docs/sampler.md).
+
 ### Analysis (0.6.0+)
 
 ```ts
@@ -432,6 +505,12 @@ ignore the prop (the pad keeps playing notes), so check `hasDrums()` first.
 ```tsx
 <JucePadView mode="drums" note={0} velocity={110} style={{ width: 80, height: 80 }} />
 ```
+
+`mode="sampler"` (0.10.0+): every touch-down hits sampler slot `note` (0–15) at its root note (a
+second finger retriggers) and the last touch-up releases the slot, so a gated slot sounds while
+the pad is held and a one-shot slot plays to its end. `onNoteOn` fires per hit and `onNoteOff`
+when the last touch lifts. Binaries older than 0.10.0 play notes instead, so check `hasSampler()`
+first.
 
 `hitPolygon` (0.6.0+) makes the touch area non-rectangular: a flat `[x0, y0, x1, y1, …]`
 polygon normalised to the view (0–1). Touches outside it (including on its children) pass
@@ -638,7 +717,7 @@ without it), output only, so no microphone permission is involved.
 | | Android 0.9.0 |
 |---|---|
 | `setup` / `shutdown`, `noteOn` / `noteOff` / `allNotesOff`, the nine synth setters, `playTestTone`, `getDiagnostics` | implemented |
-| effects, metronome / backing track, analysis, arpeggiator, drums, transport, beat events | present, not implemented: setters return `false` (nothing applied), getters return the defaults, `loadBackingTrack` rejects with `ERR_UNSUPPORTED`, `hasDrums()` is `false` |
+| effects, metronome / backing track, analysis, arpeggiator, drums, sampler (0.10.0+), transport, beat events | present, not implemented: setters return `false` (nothing applied), getters return the defaults, `loadBackingTrack` and `loadSamplerSlot` reject with `ERR_UNSUPPORTED`, `hasDrums()` and `hasSampler()` are `false` |
 | `JucePadView` | not available: `isJucePadViewAvailable()` is `false` |
 
 Differences from iOS:
@@ -741,6 +820,7 @@ its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the m
 
 - [docs/latency.md](docs/latency.md) — latency budget, signal path, changes, panel fields, slow-motion measurement
 - [docs/drums.md](docs/drums.md) — drum voices: models, parameters, realtime rules
+- [docs/sampler.md](docs/sampler.md) — sampler: voices, loading and hand-off, realtime rules
 - [CHANGELOG.md](CHANGELOG.md)
 - [test/harness/README.md](test/harness/README.md) — the offline engine harness
 

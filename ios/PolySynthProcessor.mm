@@ -6,6 +6,11 @@ PolySynthProcessor::PolySynthProcessor()
     : AudioProcessor(BusesProperties()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)) {
     lastAllReleasedSeen = queue->allReleasedMark();
+    lastSamplerSilenceSeen = queue->samplerSilenceMark();
+}
+
+PolySynthProcessor::~PolySynthProcessor() {
+    if (SamplerBufferSource* source = samplerEngine.bufferSource()) source->releaseReader();
 }
 
 void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
@@ -16,6 +21,8 @@ void PolySynthProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
         voices[i].prepare(sampleRate, samplesPerBlock);
     }
     drumMachine.prepare(sampleRate);
+    samplerEngine.prepare(sampleRate, samplesPerBlock);
+    if (SamplerBufferSource* source = samplerEngine.bufferSource()) source->requestRate(sampleRate);
     smoother.prepare(sampleRate, t);
     snapParams.store(false);
 }
@@ -29,6 +36,9 @@ void PolySynthProcessor::releaseResources() {}
 
 void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                        juce::MidiBuffer& /*midiMessages*/) {
+    // Flush-to-zero for the voices, drums and sampler (decaying envelopes and filters would
+    // otherwise run into denormals); restored when the block returns.
+    juce::ScopedNoDenormals noDenormals;
     buffer.clear();
 
     const int numSamples = buffer.getNumSamples();
@@ -66,11 +76,14 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // drops the held notes the player released. Applied every block, so a release sent while
     // the device was stopped or reopening takes effect on the first block after it. The arp's
     // options are snapshotted once here and hold for the whole block. Drum hits in the queue
-    // start their drum voice whether or not the arpeggiator is enabled.
+    // start their drum voice whether or not the arpeggiator is enabled; so do sampler events, which
+    // the sampler releases from its own marks (or allNotesOff) right after the drain.
     const ArpSettings& arpNow = arpeggiator.beginBlock();
+    samplerEngine.beginBlock(); // this block's slot buffers and parameters
     if (arpNow.enabled) {
         queue->drainNoteOns([this](const NoteEvent& event) {
             if (event.kind == NoteEventKind::Drum) { startDrumHit(event); return; }
+            if (event.kind != NoteEventKind::Note) { startSamplerEvent(event); return; }
             arpeggiator.noteOn(event.note, event.velocity, event.seq);
             recordNoteLatency(event);
         });
@@ -83,9 +96,20 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     } else {
         queue->drainNoteOns([this](const NoteEvent& event) {
             if (event.kind == NoteEventKind::Drum) startDrumHit(event);
-            else startQueuedNote(event);
+            else if (event.kind == NoteEventKind::Note) startQueuedNote(event);
+            else startSamplerEvent(event);
         });
         lastAllReleasedSeen = queue->allReleasedMark();
+    }
+    samplerEngine.releaseHeld([this](bool fromKey, int id, uint64_t seq) { return queue->isSamplerReleased(fromKey, id, seq); });
+    {
+        // The engine's interruption / background stop: every sampler voice whose event came before
+        // it ends (one-shots too); events drained above that came after it keep playing.
+        const uint64_t silence = queue->samplerSilenceMark();
+        if (silence != lastSamplerSilenceSeen) {
+            lastSamplerSilenceSeen = silence;
+            samplerEngine.silenceUpTo(silence);
+        }
     }
     for (int v = 0; v < MAX_VOICES; v++) {
         if (voices[v].isHeld() && queue->isReleased(voices[v].getNoteNumber(), voices[v].startSeq))
@@ -180,6 +204,9 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 
     if (buffer.getNumChannels() > 1) {
         buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
+        // The sampler is stereo: added after the mono parts are copied to both channels. With
+        // nothing sounding it does not touch the buffer.
+        samplerEngine.render(buffer.getWritePointer(0), buffer.getWritePointer(1), numSamples);
     }
 
     if (analysis != nullptr)
@@ -256,6 +283,13 @@ void PolySynthProcessor::applySequenceOutput(const seqplay::Output& out) {
 // Audio thread (processBlock): start a queued drum hit and record its latency.
 void PolySynthProcessor::startDrumHit(const NoteEvent& event) {
     drumMachine.trigger(event.note, event.velocity);
+    recordNoteLatency(event);
+}
+
+// Audio thread (processBlock): start a queued sampler pad hit or key note-on and record its latency.
+void PolySynthProcessor::startSamplerEvent(const NoteEvent& event) {
+    if (event.kind == NoteEventKind::SamplerHit) samplerEngine.hit(event.note, event.velocity, event.seq);
+    else samplerEngine.noteOn(event.note, event.velocity, event.seq);
     recordNoteLatency(event);
 }
 

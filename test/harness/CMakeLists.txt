@@ -7,6 +7,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+# Optional sanitizer build, in its own build directory: -DHARNESS_SANITIZE=address (or thread,
+# undefined, "address,undefined"). The allocation counter's malloc interposer is left out there
+# (the sanitizer owns malloc), so the allocation checks pass trivially in that build.
+set(HARNESS_SANITIZE "" CACHE STRING "sanitizers for the harness build (e.g. address, thread); empty = none")
+if(HARNESS_SANITIZE)
+  add_compile_options(-fsanitize=${HARNESS_SANITIZE} -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=${HARNESS_SANITIZE})
+  add_compile_definitions(HARNESS_NO_MALLOC_INTERPOSE=1)
+endif()
+
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(JUCE_MODULES "${REPO_ROOT}/ios/juce_modules")
 
@@ -17,7 +27,7 @@ set(JUCE_MODULES "${REPO_ROOT}/ios/juce_modules")
 set(HARNESS_GIT_REF "HEAD" CACHE STRING "git ref for ios/ engine sources, or WORKTREE")
 set(SNAP "${CMAKE_BINARY_DIR}/engine_src")
 file(MAKE_DIRECTORY "${SNAP}")
-set(ENGINE_UNITS Voice VoiceAllocator TransportEngine PolySynthProcessor FxChainProcessor BackingTrack AuxProcessor ExpoJuceMidiInput)
+set(ENGINE_UNITS Voice VoiceAllocator TransportEngine PolySynthProcessor FxChainProcessor BackingTrack AuxProcessor ExpoJuceMidiInput SamplerBank)
 set(ENGINE_CPP)
 foreach(u IN LISTS ENGINE_UNITS)
   foreach(ext h mm)
@@ -39,7 +49,7 @@ foreach(u IN LISTS ENGINE_UNITS)
   list(APPEND ENGINE_CPP "${SNAP}/${u}.cpp")
 endforeach()
 # Header-only engine units (pure C++), e.g. the device callback GraphPlayer.
-set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser DrumMachine LatencyStats DisplayRate DeviceFormat MidiInput OwnerToken SequencePlayer BackgroundPolicy SynthParamSmoother)
+set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser DrumMachine LatencyStats DisplayRate DeviceFormat MidiInput OwnerToken SequencePlayer BackgroundPolicy Hermite SamplerEngine SynthParamSmoother)
 foreach(u IN LISTS ENGINE_HEADERS)
   set(out "${SNAP}/${u}.h")
   if(HARNESS_GIT_REF STREQUAL "WORKTREE")
