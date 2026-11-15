@@ -822,6 +822,88 @@ export type TouchLatencyDiagnostics = {
   outputLatencyMs: number;
   /** MIDI byte input arrival → render block (0.9.0-rc.2+; see `midiInput`). */
   midiInputToRenderMs?: LatencyLegStats;
+  /** Every pad touch and how many took over 100 ms / 1 s to be delivered (iOS, since launch). */
+  slowTouches?: SlowTouchCounters;
+  /** The last 8 pad touches delivered more than 100 ms late, oldest first (iOS). */
+  slowTouchLog?: SlowTouchEntry[];
+};
+
+/** `TouchLatencyDiagnostics.slowTouches`: counted per touch (each finger), not per note. */
+export type SlowTouchCounters = {
+  touches: number;
+  over100ms: number;
+  over1s: number;
+};
+
+/**
+ * One entry of `TouchLatencyDiagnostics.slowTouchLog`: a pad touch whose `touchesBegan` entry came
+ * more than 100 ms after its `UITouch.timestamp`. Times are `CACurrentMediaTime()` seconds (the
+ * clock of `clockSec`). Fields marked "after the fact" stay at -1 / '' / false until filled.
+ */
+export type SlowTouchEntry = {
+  /** `touchesBegan` entry − `UITouch.timestamp` (ms). */
+  deliveryMs: number;
+  /** `UITouch.timestamp` as read at `touchesBegan` entry (s). */
+  touchTimestamp: number;
+  /** `touchesBegan` entry (s). */
+  entryTimestamp: number;
+  /** `UIEvent.timestamp` of the event that delivered it (s); 0 without an event. */
+  eventTimestamp: number;
+  /** `touchesBegan` entry − `UIEvent.timestamp` (ms); -1 without an event. */
+  eventDeliveryMs: number;
+  /** `UITouch.phase` at `touchesBegan` entry: 'began', 'moved', 'stationary', 'ended', 'cancelled' or 'other(n)'. */
+  phase: string;
+  tapCount: number;
+  /** `UITouch.majorRadius` (points). */
+  majorRadius: number;
+  /** Distance to the nearest window edge (points); -1 without a window. */
+  edgeDistance: number;
+  /** Touches in this `touchesBegan` call. */
+  touchesInCall: number;
+  /** Touches the pad already held before this call. */
+  heldBefore: number;
+  /** Touches of this call the pad already held (delivered to `touchesBegan` twice). */
+  alreadyHeld: number;
+  /** `UIEvent.allTouches.count`: every touch of the event, on any view. */
+  eventTouches: number;
+  /** The pad's mode: 'notes', 'drums' or 'sampler'. */
+  mode: string;
+  /** Whether this call started a note or hit. */
+  startedNote: boolean;
+  /** `UITouch.gestureRecognizers` at entry (at most 12). */
+  recognizers: SlowTouchRecognizer[];
+  /** `UIApplication.applicationState` at entry: 'active', 'inactive' or 'background'. */
+  appState: string;
+  /** Seconds from the last didBecomeActive / willResignActive to entry; -1 if none seen since the first pad was created. */
+  sinceDidBecomeActiveSec: number;
+  sinceWillResignActiveSec: number;
+  /** A didBecomeActive or willResignActive fell between `touchTimestamp` and `entryTimestamp`. */
+  activityChangedDuringDelivery: boolean;
+  /** After the fact: 'ended' or 'cancelled' once a pad handled the touch's end; '' until then (or if no pad saw it). */
+  endPhase: string;
+  /** After the fact: `touchesBegan` entry → the pad handling the touch's end (ms). */
+  endedAfterMs: number;
+  /** After the fact: `endedAfterMs` ≤ 50, i.e. began and end were delivered together. */
+  endedWithin50ms: boolean;
+  /** After the fact: `UITouch.timestamp` at the end − `touchTimestamp` (ms): how long the finger was down. */
+  heldMs: number;
+  /** After the fact: the end's own delivery, handled − `UITouch.timestamp` at the end (ms). */
+  endDeliveryMs: number;
+  /**
+   * After the fact (about 0.25 s later): the longest main-thread stall (display-link gap over 50 ms)
+   * overlapping `touchTimestamp` … `entryTimestamp` (ms); 0 if none; -1 if the stall probe was not running.
+   */
+  deliveryGapMs: number;
+  /** As `deliveryGapMs`, over `touchTimestamp` … the end being handled; -1 until the end is seen. */
+  lifetimeGapMs: number;
+};
+
+/** A recognizer the slow touch was delivered to. */
+export type SlowTouchRecognizer = {
+  class: string;
+  /** 'possible', 'began', 'changed', 'ended', 'cancelled' or 'failed'. */
+  state: string;
+  delaysTouchesBegan: boolean;
 };
 
 /** A gesture recognizer or scroll view on the path from a pad to its window. depth 0 = the pad. */

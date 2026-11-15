@@ -26,6 +26,15 @@
 + (void)reportLastTouch:(NSDictionary<NSString *, id> *)touch {
     [[ExpoJuceAudioEngine sharedInstance] reportLastTouch:touch];
 }
++ (void)reportSlowTouchLog:(NSArray<NSDictionary<NSString *, id> *> *)entries {
+    [[ExpoJuceAudioEngine sharedInstance] reportSlowTouchLog:entries];
+}
++ (void)countPadTouches:(int)touches over100ms:(int)over100ms over1s:(int)over1s {
+    [[ExpoJuceAudioEngine sharedInstance] countPadTouches:touches over100ms:over100ms over1s:over1s];
+}
++ (double)longestMainThreadGapMsFrom:(double)fromSec to:(double)toSec {
+    return [[ExpoJuceAudioEngine sharedInstance] longestMainThreadGapMsFrom:fromSec to:toSec];
+}
 
 // ── Synth ──
 + (void)noteOn:(int)note velocity:(int)velocity {

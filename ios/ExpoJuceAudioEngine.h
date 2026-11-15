@@ -142,6 +142,15 @@ typedef void(^BeatCallback)(double beat, double bpm, double position);
 // reportLastTouch: the recognizers attached to the last touch and where it landed (lastTouch).
 - (void)reportTouchPath:(NSArray<NSDictionary<NSString *, id> *> *)entries;
 - (void)reportLastTouch:(NSDictionary<NSString *, id> *)touch;
+// Slow-touch probe from JucePadView (main thread, diagnostics touchLatency.slowTouches /
+// slowTouchLog). reportSlowTouchLog: the last slow touches, oldest first (capped at 8).
+// countPadTouches: adds one touchesBegan's touches and how many took over 100 ms / 1 s to arrive
+// (atomics only, no allocation). longestMainThreadGapMsFrom:to: the longest logged main-thread stall
+// (a display-link gap over 50 ms) overlapping [fromSec, toSec] on the CACurrentMediaTime clock: 0 if
+// none, -1 while the stall probe is not running.
+- (void)reportSlowTouchLog:(NSArray<NSDictionary<NSString *, id> *> *)entries;
+- (void)countPadTouches:(int)touches over100ms:(int)over100ms over1s:(int)over1s;
+- (double)longestMainThreadGapMsFrom:(double)fromSec to:(double)toSec;
 // Parameters: lock-free, any thread, remembered before setup and across rebuilds; absent / unknown
 // keys and non-finite values unchanged, numbers clamped. Voice keys: tune (semitones −24..24),
 // decay, tone, level (0–1). NO for a voice outside 0–8 (nothing applied).

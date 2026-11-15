@@ -28,6 +28,10 @@ typedef void(^ExpoJuceBeatBlock)(double beat, double bpm, double position);
 // Touch path diagnostics from JucePadView (main thread): see ExpoJuceAudioEngine.h.
 + (void)reportTouchPath:(NSArray<NSDictionary<NSString *, id> *> *)entries NS_SWIFT_NAME(reportTouchPath(_:));
 + (void)reportLastTouch:(NSDictionary<NSString *, id> *)touch NS_SWIFT_NAME(reportLastTouch(_:));
+// Slow-touch probe from JucePadView (main thread): see ExpoJuceAudioEngine.h.
++ (void)reportSlowTouchLog:(NSArray<NSDictionary<NSString *, id> *> *)entries NS_SWIFT_NAME(reportSlowTouchLog(_:));
++ (void)countPadTouches:(int)touches over100ms:(int)over100ms over1s:(int)over1s NS_SWIFT_NAME(countPadTouches(_:over100ms:over1s:));
++ (double)longestMainThreadGapMsFrom:(double)fromSec to:(double)toSec NS_SWIFT_NAME(longestMainThreadGapMs(from:to:));
 
 // ── Synth (MIDI-style) ───────────────────────────────────────────
 + (void)noteOn:(int)note velocity:(int)velocity;

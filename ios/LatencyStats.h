@@ -192,6 +192,21 @@ public:
         return latencyPercentile(intervals.data(), m, 0.50);
     }
 
+    // The longest stall in `records` (n of them) that overlaps [fromSec, toSec], in ms: a stall
+    // spans atSec … atSec + ms / 1000. 0 when none does, or when the window is not finite or ends
+    // before it starts. Used for the slow-touch log (a touch waiting through a main-thread block).
+    static double longestOverlapMs(const StallRecord* records, int n, double fromSec, double toSec) noexcept {
+        if (!std::isfinite(fromSec) || !std::isfinite(toSec) || toSec < fromSec) return 0.0;
+        double best = 0.0;
+        for (int k = 0; k < n; ++k) {
+            const double start = records[k].atSec;
+            const double ms = records[k].ms;
+            if (!std::isfinite(start) || !std::isfinite(ms) || !(ms > 0.0)) continue;
+            if (start <= toSec && start + ms / 1000.0 >= fromSec) best = std::max(best, ms);
+        }
+        return best;
+    }
+
     uint64_t count() const noexcept { return written.load(std::memory_order_acquire); }
 
 private:
