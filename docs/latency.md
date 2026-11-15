@@ -279,34 +279,47 @@ Candidates:
 | `appState`, `sinceDidBecomeActiveSec`, `sinceWillResignActiveSec`, `activityChangedDuringDelivery` | `applicationState` at entry; seconds since the last didBecomeActive / willResignActive (−1: none seen since the first pad was created); whether either fell inside the delivery |
 | `endPhase`, `endedAfterMs`, `endedWithin50ms` | After the fact: `ended` / `cancelled` once a pad handled the touch's end (`''` while still down, or if no pad saw the end), the time from `touchesBegan` entry to that, and whether it was within 50 ms |
 | `heldMs`, `endDeliveryMs` | After the fact: `UITouch.timestamp` at the end − `touchTimestamp`, and the end's own delivery |
-| `deliveryGapMs` | About 0.25 s later: the longest main-thread stall (display-link gap over 50 ms, `mainThreadStallLog`) overlapping `touchTimestamp` … `entryTimestamp`; 0: none; −1: the stall probe was not running (or not measured yet) |
-| `lifetimeGapMs` | The same over `touchTimestamp` … the end; −1 until the end is seen |
+| `deliveryGapMs` | Measured 0.2–0.5 s after entry: the longest main-thread stall (display-link gap over 50 ms, `mainThreadStallLog`) overlapping `touchTimestamp` … `entryTimestamp`; 0: none; −1: the stall probe was not running (or not measured yet) |
+| `lifetimeGapMs` | The same over `touchTimestamp` … the end; −1 until 0.2–0.5 s after the end. The stall log keeps 32 stalls, so a hold through more than 32 can read low |
 
-**Reading it against the hypotheses.** Take each slow entry on its own:
+**Reading it against the hypotheses.** Take each slow entry on its own. Some fields are evidence,
+others only context:
 
-- **(a)** `endedWithin50ms: true` (began and end delivered together at the lift) or `phase`
-  `moved` / `ended` at entry, `heldMs` close to `deliveryMs`, `appState` `active`,
-  `deliveryGapMs` 0. A recognizer in `recognizers` with `delaysTouchesBegan` in state `failed`
-  names the culprit; the list may also be empty or only React Native's handlers, because a
-  failed recognizer can already be detached when the touch is delivered, so check `touchPath` for
-  the delaying recognizers on the way up. `eventDeliveryMs` small next to a large `deliveryMs`
-  means the delivering event was the lift or the move, not the touch-down.
+- **(a)** `endedWithin50ms: true` (began and end delivered together at the lift), or `phase`
+  `moved` / `ended` at entry, with `appState` `active` and `deliveryGapMs` 0. Whether UIKit hands
+  a delayed touch over with its touch-down state or its current state is not documented, so
+  `phase` may also read `began` here; a large `deliveryMs` at all means the stamp was kept from
+  the touch-down. A recognizer in `recognizers` with `delaysTouchesBegan` in state `failed` names
+  the culprit; the list may also hold only React Native's handlers, because a failed recognizer can
+  be detached by the time the touch is delivered, so check `touchPath` for the delaying
+  recognizers on the way up. A small `edgeDistance` (within about 20–30 points of an edge) points
+  at the system's screen-edge gate, which holds touches near the edges
+  (`preferredScreenEdgesDeferringSystemGestures`). `eventDeliveryMs` small next to a large
+  `deliveryMs` means the delivering event was the lift or the move, not the touch-down. A
+  recognizer that fails on a timer while the finger stays still gives `phase` `began` or
+  `stationary` and `endedWithin50ms: false`, which looks like (c).
 - **(b)** `appState` not `active`, `activityChangedDuringDelivery: true`, or
-  `sinceDidBecomeActiveSec` below `deliveryMs / 1000`. `deliveryGapMs` reads 0 or −1 here: the
-  stall probe's display link pauses while the app is inactive and does not count the gap across a
-  pause, so a missing gap does not argue against (b).
-- **(c)** `alreadyHeld` above 0, or `phase` `stationary` (a touch the pad was given again), or
-  `phase` `began` with `endedWithin50ms: false` and a long `endedAfterMs` (the finger really
-  stayed down after the late delivery) while (a), (b), (d) and (e) are all clear: the stamp is
-  older than the touch-down it describes. Compare `touchTimestamp` with the other entries: two
-  slow entries with the same `touchTimestamp` are one timestamp seen twice.
-- **(d)** `heldBefore` above 0, `eventTouches` above `touchesInCall` (other fingers down
-  elsewhere) or `touchesInCall` above 1, especially on a `drums` / `sampler` pad. A chord held
-  about 5 s shows as `eventTouches` ≥ 2 with `heldMs` near 5000 on the other entries.
+  `sinceDidBecomeActiveSec` (when not −1, which means unknown) below `deliveryMs / 1000`.
+  `deliveryGapMs` reads 0 or −1 here: the stall probe's display link pauses while the app is
+  inactive and does not count the gap across a pause, so a missing gap does not argue against (b).
+- **(c)** Positive signs only: `alreadyHeld` above 0 (the pad was given a touch it already held),
+  or two slow entries with the same `touchTimestamp` (one stamp seen twice). `phase` `stationary`
+  fits (c) and the timer case of (a). `eventDeliveryMs` normal (about a frame) while `deliveryMs`
+  is seconds says the event is fresh and only the touch's stamp is old. Do not conclude (c) by
+  elimination: see "upstream" below.
+- **(d)** Other fingers cannot make a new touch's own delivery late: the leg uses the stamps of
+  the touches that are beginning. A held chord matters only through re-delivery (`alreadyHeld`
+  above 0, which is (c)) or by keeping a recognizer from failing (which is (a)). `heldBefore`
+  above 0, `eventTouches` above `touchesInCall` and `touchesInCall` above 1 are context: they say a
+  chord was down, not that it caused the delay. Compare them with how often slow touches occur
+  without a chord.
 - **(e)** `deliveryGapMs` close to `deliveryMs` (a stall covering most of the delivery) with
   `appState` `active`. `deliveryGapMs` 0 with the probe running (not −1) rules (e) out: a
   blocked main thread delays the display link too, so a block cannot hide from the stall log
   while the app is active. `lifetimeGapMs` shows a block later in the touch's life.
+- **Upstream of the app** (none of the above): the event itself arrived late, before the main
+  thread ever saw it (the system's event delivery, not the app). `eventDeliveryMs` close to
+  `deliveryMs`, `appState` `active`, `deliveryGapMs` 0, `alreadyHeld` 0 and no delaying recognizer.
 
 The probe runs on the main thread after the note has been queued (and after the note-off for an
 end): the per-call count is a loop over the touches and one call with integers into the engine
