@@ -8,3 +8,4 @@ FOUNDATION_EXPORT const unsigned char ExpoJuceVersionString[];
 
 // Import all public headers
 #import "ExpoJuceBridge.h"
+#import "ExpoJuceTouchVelocity.h"

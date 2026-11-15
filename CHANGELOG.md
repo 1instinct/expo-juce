@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.10.0-rc.3
+
+### Added (iOS)
+
+- **Touch velocity.** `JucePadView` takes `touchVelocity` (default false): while
+  `setTouchVelocity({ enabled: true, … })` is set, each note or hit plays at a velocity estimated in
+  the touch handler right before the engine call, from force (alone, where the hardware reports
+  more than 5 % of its maximum on the touch-down frame) or a weighted blend of the contact radius
+  and the device impact (accelerometer peak against the per-axis median of the 150–30 ms before the
+  touch, at least 3 samples). No added latency and no lock on the note path: one scan of a
+  lock-free accelerometer ring, no waiting for later samples. `onNoteOn` carries `touch` (`TouchSignals`) when the velocity was estimated.
+- `hasTouchVelocity()`, `setTouchVelocity(config)` (curve soft / normal / hard, min / max
+  velocity, calibration; validated and clamped natively), `calibrateTouchVelocity(soft, hard)`
+  (pure TS, medians of a "tap softly, tap hard" session), `TOUCH_VELOCITY_DEFAULTS`, and the types
+  `TouchVelocityCurve`, `TouchVelocityCalibration`, `TouchVelocityConfig`, `TouchSignals`,
+  `TouchVelocityEstimate`, `TouchVelocityDiagnostics`.
+- CoreMotion accelerometer at 100 Hz, only while touch velocity is enabled and a pad with
+  `touchVelocity` is in a window; stopped in the background. The pod links CoreMotion; no
+  Info.plist entry is needed.
+- Diagnostics `touchVelocity`: settings, accelerometer state and measured rate, the last estimate
+  and the last 16, each with `impactLate` (the peak in the 50 ms after the touch). `accelAgeMs` is
+  signed, so a negative value shows an accelerometer / touch clock mismatch.
+- `ios/TouchVelocity.h` (pure C++), host-tested by the harness (cases `tv`, `tvd`);
+  `test/touch-velocity.test.mjs` tests the TS calibration in CI.
+
+### Android, web
+
+- `hasTouchVelocity()` and `setTouchVelocity` return false; pads play their fixed `velocity`.
+
 ## 0.10.0-rc.2
 
 ### Added (iOS)

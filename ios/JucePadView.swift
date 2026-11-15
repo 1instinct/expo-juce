@@ -13,6 +13,10 @@ import UIKit
 // Sampler mode (mode "sampler"): `note` is a sampler slot (0–15). Every touch-down hits the slot at
 // its root note (a second finger retriggers, like drums) and the last touch-up releases the slot
 // (a one-shot slot ignores the release and plays to its end).
+//
+// Touch velocity (prop touchVelocity, with setTouchVelocity enabled): the velocity of a note or hit
+// is estimated from the touch-down itself (ExpoJuceTouchVelocity / TouchVelocity.h) right before
+// the engine call, and onNoteOn carries the signals as `touch`.
 class JucePadView: ExpoView {
   enum Mode: String {
     case notes
@@ -25,6 +29,15 @@ class JucePadView: ExpoView {
 
   var note: Int = 60
   var velocity: Int = 100
+  // Touch velocity (ExpoJuceTouchVelocity): when on and enabled by setTouchVelocity, a touch-down
+  // plays at the velocity estimated from it instead of `velocity`.
+  var touchVelocity: Bool = false {
+    didSet {
+      updateTouchVelocityRegistration()
+    }
+  }
+  // Whether this pad counts as a touch-velocity pad in a window (the accelerometer runs while one does).
+  private var touchVelocityRegistered = false
   // What the pad plays. Changing the mode releases whatever this pad is sounding.
   var padMode: Mode = .notes {
     didSet {
@@ -76,6 +89,29 @@ class JucePadView: ExpoView {
     isMultipleTouchEnabled = true
     // Slow-touch probe: start watching app activity changes (once per process).
     _ = AppActivityClock.shared
+  }
+
+  // Safety net: a view torn down while still counted (no didMoveToWindow(nil)) must not keep the
+  // accelerometer on. padDetached is safe on any thread (it hops to the main thread).
+  deinit {
+    if touchVelocityRegistered {
+      ExpoJuceTouchVelocity.padDetached()
+    }
+  }
+
+  // Counted while touchVelocity is on and the view is in a window.
+  private func updateTouchVelocityRegistration() {
+    let wanted = touchVelocity && window != nil
+    if wanted == touchVelocityRegistered {
+      return
+    }
+    touchVelocityRegistered = wanted
+    if wanted {
+      let forceTouch: Bool = traitCollection.forceTouchCapability == .available
+      ExpoJuceTouchVelocity.padAttached(forceTouchCapable: forceTouch)
+    } else {
+      ExpoJuceTouchVelocity.padDetached()
+    }
   }
 
   // MARK: - Hit shape
@@ -146,7 +182,13 @@ class JucePadView: ExpoView {
           timestamp = touch.timestamp
         }
       }
-      startNote(touchTimestamp: timestamp, entryTimestamp: entryTimestamp)
+      // Touch velocity: one ring scan, before the note (0 = disabled, play the fixed velocity).
+      var estimated: Int32 = 0
+      if touchVelocity {
+        estimated = ExpoJuceTouchVelocity.estimateVelocity(touches: touches, touchTimestamp: timestamp,
+                                                           entryTimestamp: entryTimestamp)
+      }
+      startNote(touchTimestamp: timestamp, entryTimestamp: entryTimestamp, estimatedVelocity: Int(estimated))
     }
     // After the note: diagnostics only.
     reportLastTouch(touches, entryTimestamp: entryTimestamp)
@@ -186,6 +228,7 @@ class JucePadView: ExpoView {
 
   override func didMoveToWindow() {
     super.didMoveToWindow()
+    updateTouchVelocityRegistration()
     guard window != nil else {
       return
     }
@@ -570,11 +613,12 @@ class JucePadView: ExpoView {
     stopNote()
   }
 
-  private func startNote(touchTimestamp: TimeInterval, entryTimestamp: CFTimeInterval) {
+  // estimatedVelocity: 1–127 from touch velocity, or 0 for the fixed `velocity`.
+  private func startNote(touchTimestamp: TimeInterval, entryTimestamp: CFTimeInterval, estimatedVelocity: Int) {
     // A drums / sampler retrigger (another finger while a hit is held) is just another hit: no
     // onNoteOff (or sampler release) in between, that comes only when the last touch lifts.
     let noteNumber = note
-    let noteVelocity = velocity
+    let noteVelocity = estimatedVelocity > 0 ? estimatedVelocity : velocity
     // (A sampler pad whose slot changed while held releases the old slot first.)
     let retrigger = hitsEveryTouch && soundingMode == padMode && (padMode == .drums || soundingNote == noteNumber)
     if !retrigger {
@@ -599,10 +643,13 @@ class JucePadView: ExpoView {
                                touchTimestamp: touchTimestamp,
                                entryTimestamp: entryTimestamp)
     }
-    let payload: [String: Any] = [
+    var payload: [String: Any] = [
       "note": noteNumber,
       "velocity": noteVelocity,
     ]
+    if estimatedVelocity > 0 {
+      payload["touch"] = ExpoJuceTouchVelocity.lastTouchSignals()
+    }
     onNoteOn(payload)
   }
 

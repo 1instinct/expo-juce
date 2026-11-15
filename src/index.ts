@@ -20,6 +20,12 @@ import {
   JucePadViewProps,
   PadNoteOnEvent,
   PadNoteOffEvent,
+  TouchVelocityCurve,
+  TouchVelocityCalibration,
+  TouchVelocityConfig,
+  TouchSignals,
+  TouchVelocityEstimate,
+  TouchVelocityDiagnostics,
   EffectId,
   EffectParams,
   EffectState,
@@ -71,6 +77,7 @@ import {
   NowPlayingDiagnostics,
 } from './ExpoJuce.types';
 import type { NativeSamplerSlotParams } from './ExpoJuceModule';
+import { TOUCH_VELOCITY_DEFAULTS, calibrateTouchVelocity, touchVelocityConfigForNative } from './touchVelocity';
 import { defaultEffectsState } from './effectDefaults';
 import { ARP_DEFAULTS, arpDefaults } from './arpDefaults';
 import { DRUM_KIT_DEFAULTS, DRUM_VOICE_COUNT, DRUM_VOICE_DEFAULTS, drumDefaults } from './drumDefaults';
@@ -106,6 +113,26 @@ export function isJucePadViewAvailable(): boolean {
     typeof ExpoJuceModule?.hasJucePadView === 'function' && ExpoJuceModule.hasJucePadView() === true
   );
 }
+
+// ── Touch velocity (iOS, 0.10.0-rc.3+) ──────────────────────────
+
+/** True when this binary estimates touch velocity (iOS 0.10.0-rc.3+; false on Android, web and older binaries). */
+export function hasTouchVelocity(): boolean {
+  return typeof ExpoJuceModule?.hasTouchVelocity === 'function' && ExpoJuceModule.hasTouchVelocity() === true;
+}
+
+/**
+ * Sets the whole touch velocity configuration (omitted fields take their defaults; numbers are
+ * clamped natively). Pads with `touchVelocity` then play at the velocity estimated from each
+ * touch-down; disabled, they play their fixed `velocity`. The accelerometer runs only while this is
+ * enabled and such a pad is on screen. false when the binary has no estimator.
+ */
+export function setTouchVelocity(config: TouchVelocityConfig): boolean {
+  if (typeof ExpoJuceModule?.setTouchVelocity !== 'function' || config == null) return false;
+  return ExpoJuceModule.setTouchVelocity(touchVelocityConfigForNative(config)) === true;
+}
+
+export { calibrateTouchVelocity, TOUCH_VELOCITY_DEFAULTS };
 
 export async function shutdown(): Promise<void> {
   return ExpoJuceModule.shutdown();
@@ -895,6 +922,12 @@ export {
   JucePadViewProps,
   PadNoteOnEvent,
   PadNoteOffEvent,
+  TouchVelocityCurve,
+  TouchVelocityCalibration,
+  TouchVelocityConfig,
+  TouchSignals,
+  TouchVelocityEstimate,
+  TouchVelocityDiagnostics,
   SetupOptions,
   ChangeEventPayload,
   BeatEventPayload,

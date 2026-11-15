@@ -26,6 +26,7 @@ Pod::Spec.new do |s|
     'JucePadView.swift',
     'ExpoJuceBridge.m',
     'ExpoJuceAudioEngine.mm',
+    'ExpoJuceTouchVelocity.mm',
     'PolySynthProcessor.mm',
     'FxChainProcessor.mm',
     'AuxProcessor.mm',
@@ -66,6 +67,7 @@ Pod::Spec.new do |s|
     "BackgroundPolicy.h",
     "ExpoJuceMidiInput.h", # plain C, but its <stdint.h> include trips check:headers; native callers dlsym it
     "SynthParamSmoother.h",
+    "TouchVelocity.h",
   ]
 
   # JUCE modules: each compiled as its own translation unit (separate .mm file)
@@ -73,7 +75,7 @@ Pod::Spec.new do |s|
   s.preserve_paths = ["juce_modules/**"]
 
   s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreAudio',
-                 'Foundation', 'Accelerate', 'CoreMIDI', 'MediaPlayer',
+                 'Foundation', 'Accelerate', 'CoreMIDI', 'CoreMotion', 'MediaPlayer',
                  'CoreGraphics', 'CoreImage', 'CoreText',
                  'QuartzCore', 'UIKit', 'WebKit', 'Metal', 'MetalKit'
   s.weak_frameworks = 'UserNotifications'

@@ -1,6 +1,6 @@
 {
   "name": "expo-juce",
-  "version": "0.10.0-rc.2",
+  "version": "0.10.0-rc.3",
   "description": "Realtime DSP w/C++ & JUCE",
   "type": "module",
   "main": "build/index.js",
@@ -26,6 +26,7 @@
     "check:headers": "node test/check-podspec-headers.cjs",
     "check:juce-patches": "node test/check-juce-patches.cjs",
     "check:ios-syntax": "node test/check-ios-syntax.cjs",
+    "test:touch-velocity": "node test/touch-velocity.test.mjs",
     "download-juce": "node src/scripts/bundle-juce.js",
     "vendor-juce": "node src/scripts/vendor-juce.cjs",
     "open:ios": "xed example/ios",

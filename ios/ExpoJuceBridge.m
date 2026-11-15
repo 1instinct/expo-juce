@@ -1,5 +1,6 @@
 #import "ExpoJuceBridge.h"
 #import "ExpoJuceAudioEngine.h"
+#import "ExpoJuceTouchVelocity.h"
 
 @implementation ExpoJuceBridge
 
@@ -15,7 +16,12 @@
 + (void)shutdown { [[ExpoJuceAudioEngine sharedInstance] shutdown]; }
 
 // ── Diagnostics ──
-+ (NSDictionary<NSString *, id> *)getDiagnostics { return [[ExpoJuceAudioEngine sharedInstance] diagnostics]; }
++ (NSDictionary<NSString *, id> *)getDiagnostics {
+    NSMutableDictionary<NSString *, id> *d = [[[ExpoJuceAudioEngine sharedInstance] diagnostics] mutableCopy]
+        ?: [NSMutableDictionary dictionary];
+    d[@"touchVelocity"] = [ExpoJuceTouchVelocity diagnostics];
+    return d;
+}
 + (BOOL)playTestTone:(double)durationMs { return [[ExpoJuceAudioEngine sharedInstance] playTestTone:durationMs]; }
 + (BOOL)setDisplayRateHint:(double)hz { return [[ExpoJuceAudioEngine sharedInstance] setDisplayRateHint:hz]; }
 + (void)startBeatTimer { [[ExpoJuceAudioEngine sharedInstance] startBeatTimer]; }

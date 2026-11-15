@@ -49,7 +49,7 @@ foreach(u IN LISTS ENGINE_UNITS)
   list(APPEND ENGINE_CPP "${SNAP}/${u}.cpp")
 endforeach()
 # Header-only engine units (pure C++), e.g. the device callback GraphPlayer.
-set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser DrumMachine LatencyStats DisplayRate DeviceFormat MidiInput OwnerToken SequencePlayer BackgroundPolicy Hermite SamplerEngine SynthParamSmoother)
+set(ENGINE_HEADERS GraphPlayer NoteEventQueue AnalysisRing Arpeggiator SpectrumAnalyser DrumMachine LatencyStats DisplayRate DeviceFormat MidiInput OwnerToken SequencePlayer BackgroundPolicy Hermite SamplerEngine SynthParamSmoother TouchVelocity)
 foreach(u IN LISTS ENGINE_HEADERS)
   set(out "${SNAP}/${u}.h")
   if(HARNESS_GIT_REF STREQUAL "WORKTREE")
@@ -121,7 +121,9 @@ target_compile_definitions(harness PRIVATE HARNESS_FIXTURES="${CMAKE_CURRENT_SOU
                                            # BackingTrack::acquire() test seam, see harness.cpp
                                            BACKING_TRACK_ACQUIRE_HOOK=harnessBackingTrackAcquireHook
                                            # NoteEventQueue::drainNoteOns() test seam, see harness.cpp
-                                           NOTE_EVENT_QUEUE_DRAIN_HOOK=harnessNoteQueueDrainHook)
+                                           NOTE_EVENT_QUEUE_DRAIN_HOOK=harnessNoteQueueDrainHook
+                                           # touchvel::AccelRing::readSince() test seam, see harness.cpp
+                                           TOUCH_VELOCITY_READ_HOOK=harnessTouchVelocityReadHook)
 
 # Android host (android/src/main/cpp/AndroidEngineHost.cpp): its portable part, with JUCE's Android
 # device replaced by a fake device type (host_test.cpp). Same git ref / WORKTREE rule as ios/.

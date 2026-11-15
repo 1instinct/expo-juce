@@ -35,6 +35,13 @@ export default {
   setDisplayRateHint(_hz: number): boolean {
     return false;
   },
+  // No touch velocity on web: pads play their fixed velocity.
+  hasTouchVelocity(): boolean {
+    return false;
+  },
+  setTouchVelocity(_config: Record<string, unknown>): boolean {
+    return false;
+  },
   // No audio engine on web: effects calls are no-ops (false = not applied).
   setEffectEnabled(_id: string, _enabled: boolean): boolean {
     return false;

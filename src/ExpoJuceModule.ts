@@ -33,6 +33,11 @@ export type ExpoJuceNativeModule = {
   shutdown(): Promise<void>;
   hasJucePadView?(): boolean;
 
+  // Touch velocity (0.10.0-rc.3+; iOS has it, Android and web return false). The config as
+  // touchVelocityConfigForNative sends it.
+  hasTouchVelocity?(): boolean;
+  setTouchVelocity?(config: Record<string, unknown>): boolean;
+
   // Diagnostics
   getDiagnostics(): AudioDiagnostics;
   playTestTone(durationMs: number): boolean;
