@@ -565,6 +565,7 @@ export type SequenceEventKind = 'note' | 'drum' | 'samplerHit' | 'samplerKey';
 
 /** One event of the loop the native sequence player plays (setSequence). */
 export type SequenceEvent = {
+  /** Required here; an event without one (JS from before the kinds) plays as 'note'. */
   kind: SequenceEventKind;
   /** MIDI note 0–127, the drum voice 0–8, the sampler slot 0–15 (samplerHit) or key 0–127 (samplerKey). */
   note: number;
@@ -572,7 +573,11 @@ export type SequenceEvent = {
   velocity: number;
   /** Beats from the loop start, 0 <= start < loopBeats. */
   start: number;
-  /** Beats (> 0). Ignored for drums (a hit). For samplerHit: beats until the slot is released. */
+  /**
+   * Beats (> 0). Ignored for drums (a hit). For samplerHit: beats until the slot is released (a
+   * one-shot slot plays on, but still needs a length > 0); for samplerKey: beats until key off. A
+   * note or sampler event with length <= 0 is skipped (diagnostics `sequence.invalidEvents`).
+   */
   length: number;
   /**
    * Absolute transport beat before which this event does not fire (it fires from its next
@@ -583,8 +588,8 @@ export type SequenceEvent = {
 
 /**
  * Why setSequence refused a sequence (lastSequenceError / validateSequence). `index` is the event
- * that caused it, or -1 when it is not about one event (no native player, too many events, a bad
- * loop length, a binary without sampler events).
+ * that caused it (for a binary without sampler events: the first sampler event), or -1 when it is
+ * not about one event (no native player, too many events, refused by the native player).
  */
 export type SequenceError = {
   index: number;

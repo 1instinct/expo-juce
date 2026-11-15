@@ -29,7 +29,8 @@
 // instance ends. Sampler events are not counted: each start carries a tag of its own (Output::tag)
 // and its release names that tag, so it ends exactly the voices that start played. Whenever
 // everything is released (stop, seek, loop length, mute, clear, allNotesOff) after the player has
-// started a sampler event, a SamplerStop output goes out first in the block: the synth then ends
+// started a sampler event, a SamplerStop output goes out at offset 0 (after that block's releases,
+// before any start): the synth then ends
 // every sampler voice the sequence started, one-shots included (see PolySynthProcessor). A new
 // sequence only releases (a one-shot whose event is gone plays on, as a drum hit does). A firing
 // window carries from block to block ((previous end, this end]), so an
@@ -105,8 +106,8 @@ inline Reject rejectReason(const Event& e) {
 inline const char* rejectText(Reject r) {
     switch (r) {
         case Reject::Kind: return "unknown kind";
-        case Reject::SamplerSlot: return "samplerHit slot outside 0-15";
-        case Reject::SamplerKeyNote: return "samplerKey note outside 0-127";
+        case Reject::SamplerSlot: return "samplerHit slot is not an integer 0-15";
+        case Reject::SamplerKeyNote: return "samplerKey note is not an integer 0-127";
         default: return "";
     }
 }
@@ -163,9 +164,23 @@ public:
     // Copies `count` events (any order), keeps those sanitizeEvent accepts, sorts them by start and
     // publishes. With events, loopBeats non-finite or under kMinLoopBeats, more than kMaxEvents
     // events, or an event rejectReason refuses (its index in rejectedIndex): nothing changes, ok =
-    // false. count 0 publishes an empty sequence (stops what it plays).
+    // false. count 0 publishes an empty sequence (stops what it plays). Every call sets what
+    // lastRejectedEvent / lastReject report (one atomic: concurrent calls never mix theirs).
     SetResult set(const Event* in, int count, double loopBeats, double fromBeat = -std::numeric_limits<double>::infinity(),
                   double endBeat = std::numeric_limits<double>::infinity()) {
+        const SetResult r = publish(in, count, loopBeats, fromBeat, endBeat);
+        lastRejectPacked.store(r.rejectedIndex >= 0 ? (r.rejectedIndex << 4) | (int)r.reason : -1, std::memory_order_relaxed);
+        return r;
+    }
+
+    // An empty sequence (stops everything the sequence plays).
+    bool clear() { return set(nullptr, 0, 0.0).ok; }
+
+    void setMuted(bool on) { mutedFlag.store(on, std::memory_order_release); }
+    bool muted() const { return mutedFlag.load(std::memory_order_acquire); }
+
+private:
+    SetResult publish(const Event* in, int count, double loopBeats, double fromBeat, double endBeat) {
         SetResult r;
         if (count < 0 || count > kMaxEvents || (count > 0 && in == nullptr)) return r;
         if (count > 0 && !(std::isfinite(loopBeats) && loopBeats >= kMinLoopBeats)) return r;
@@ -174,8 +189,6 @@ public:
             if (why != Reject::None) {
                 r.rejectedIndex = i;
                 r.reason = why;
-                lastRejectedIndex.store(i, std::memory_order_relaxed);
-                lastRejectReason.store((uint8_t)why, std::memory_order_relaxed);
                 return r;
             }
         }
@@ -205,18 +218,12 @@ public:
         publishedCount.store(n, std::memory_order_relaxed);
         lastInvalid.store(r.dropped, std::memory_order_relaxed);
         publishedLoopBeats.store(s.loopBeats, std::memory_order_relaxed);
-        lastRejectedIndex.store(-1, std::memory_order_relaxed);
-        lastRejectReason.store((uint8_t)Reject::None, std::memory_order_relaxed);
         r.ok = true;
         r.accepted = n;
         return r;
     }
 
-    // An empty sequence (stops everything the sequence plays).
-    bool clear() { return set(nullptr, 0, 0.0).ok; }
-
-    void setMuted(bool on) { mutedFlag.store(on, std::memory_order_release); }
-    bool muted() const { return mutedFlag.load(std::memory_order_acquire); }
+public:
 
     // ── Audio thread ──
 
@@ -246,10 +253,16 @@ public:
     int lastInvalidCount() const { return lastInvalid.load(std::memory_order_relaxed); }
     double loopBeats() const { return publishedLoopBeats.load(std::memory_order_relaxed); }
     uint64_t version() const { return versionCount.load(std::memory_order_relaxed); }
-    // The last set() refused because of one event: its index and why (-1 / None after a set that
-    // published).
-    int lastRejectedEvent() const { return lastRejectedIndex.load(std::memory_order_relaxed); }
-    Reject lastReject() const { return (Reject)lastRejectReason.load(std::memory_order_relaxed); }
+    // The event the last set() refused the whole sequence for, and why; -1 / None when the last
+    // set() published or failed for another reason (loop length, too many events, writer timeout).
+    int lastRejectedEvent() const {
+        const int p = lastRejectPacked.load(std::memory_order_relaxed);
+        return p < 0 ? -1 : p >> 4;
+    }
+    Reject lastReject() const {
+        const int p = lastRejectPacked.load(std::memory_order_relaxed);
+        return p < 0 ? Reject::None : (Reject)(p & 15);
+    }
 
 private:
     bool waitUntilNotReading(int slot) {
@@ -270,8 +283,7 @@ private:
     std::atomic<int> publishedCount{0};
     std::atomic<int> lastInvalid{0};
     std::atomic<double> publishedLoopBeats{0.0};
-    std::atomic<int> lastRejectedIndex{-1};
-    std::atomic<uint8_t> lastRejectReason{0};
+    std::atomic<int> lastRejectPacked{-1}; // (index << 4) | Reject, or -1
     std::mutex writerLock;
 };
 

@@ -630,7 +630,8 @@ const sub = Juce.addSequenceNotesListener(({ notes }) => {
   `{ index, message }`, e.g. `events[3]: samplerHit slot 16 is not an integer 0-15`): an
   unknown kind, a `samplerHit` slot that is not an integer 0–15, a `samplerKey` note that is not
   an integer 0–127, sampler events on a binary without `hasSequenceSampler()`, too many events,
-  a loop under 1/64 beat. `validateSequence(sequence)` runs the same checks without sending.
+  a loop under 1/64 beat. `validateSequence(sequence)` runs the kind, slot, key and event-count
+  checks without sending (not the capability or loop-length ones).
   Other invalid events (a synth note or drum voice out of range, `length <= 0`, a start outside
   the loop) are skipped, as before (diagnostics `sequence.invalidEvents`).
 - Jumps, stop, a new loop length, `allNotesOff` and muting release everything it started

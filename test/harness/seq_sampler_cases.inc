@@ -208,30 +208,56 @@ static bool offsets(uint64_t& allocs) {
                 onTags.push_back(o.tag);
                 continue;
             }
+            // The start with this tag, and the event and pass it came from: the release must land
+            // at that start + that event's length (two overlapping hits on slot 3 end in the other
+            // order from their starts, so swapped tags would show here).
             bool matched = false;
-            for (const Rec& p : out)
-                if (p.on && p.tag == o.tag && p.kind == o.kind && p.note == o.note && p.at < o.at) matched = true;
+            for (const Rec& p : out) {
+                if (!p.on || p.tag != o.tag || p.kind != o.kind || p.note != o.note) continue;
+                for (int pass = 0; pass < 3 && !matched; ++pass)
+                    for (const auto& e : ev)
+                        if (e.kind == p.kind && e.note == p.note && seqSampleOf(pass * Lb + e.start, spb) == p.at
+                            && seqSampleOf(pass * Lb + e.start + e.length, spb) == o.at)
+                            matched = true;
+            }
             tagErrors += matched ? 0 : 1;
         }
-        c(tagErrors == 0, "tags: " + std::to_string(tagErrors) + " errors");
+        c(tagErrors == 0, "tags: each release at its own start + length (" + std::to_string(tagErrors) + " errors)");
         c(stops == 0, "no SamplerStop while playing");
         c(rig.store->notesFired.load() == 3 * ev.size() && rig.store->lateFires.load() == 0, "fired / late");
         // Stop: the held sampler events are released by tag, then one SamplerStop, all at the
         // block start; nothing more in the next stopped blocks.
         const size_t before = out.size();
         const int64_t stopAt = rig.clock;
+        // The sampler starts with no release yet: the stop must release exactly these tags.
+        std::vector<uint32_t> heldTags;
+        for (const Rec& o : out)
+            if (seqplay::isSamplerKind(o.kind) && o.on) heldTags.push_back(o.tag);
+        for (const Rec& o : out)
+            if (seqplay::isSamplerKind(o.kind) && !o.on) {
+                const auto it = std::find(heldTags.begin(), heldTags.end(), o.tag);
+                if (it != heldTags.end()) heldTags.erase(it);
+            }
+        const int heldBefore = rig.player.activeNoteCount();
         rig.transport.stop();
         runPlayer(rig, 768, {256}, out, allocs);
         int stopOuts = 0, offsAtStop = 0, other = 0;
+        std::vector<uint32_t> releasedTags;
         for (size_t i = before; i < out.size(); ++i) {
             const Rec& o = out[i];
             if (o.kind == seqplay::EventKind::SamplerStop && o.at == stopAt && !o.on) ++stopOuts;
-            else if (!o.on && o.at == stopAt) ++offsAtStop;
-            else ++other;
+            else if (!o.on && o.at == stopAt) {
+                ++offsAtStop;
+                if (seqplay::isSamplerKind(o.kind)) releasedTags.push_back(o.tag);
+            } else ++other;
         }
+        std::sort(heldTags.begin(), heldTags.end());
+        std::sort(releasedTags.begin(), releasedTags.end());
         c(stopOuts == 1 && other == 0, "stop: one SamplerStop at the block start (" + std::to_string(stopOuts) + ", other "
           + std::to_string(other) + ")");
-        c(offsAtStop >= 1 && rig.player.activeNoteCount() == 0, "stop: held sampler events released");
+        c(!heldTags.empty() && releasedTags == heldTags && offsAtStop == heldBefore && rig.player.activeNoteCount() == 0,
+          "stop: each held sampler event released once by its tag (" + std::to_string(releasedTags.size()) + " of "
+              + std::to_string(heldTags.size()) + ", offs " + std::to_string(offsAtStop) + " of " + std::to_string(heldBefore) + ")");
     }
     // Through PolySynthProcessor (arp off and on): a 1-beat loop of slot 7 hits at 0.0 and 0.3 and a
     // key note 60 (gated slot 6) at 0.6 for 0.1 beat, 471-sample blocks, three passes: each starts
@@ -314,16 +340,20 @@ static bool release(uint64_t& allocs) {
         allocs += rig.allocs;
     }
     {
-        // Two overlapping hits on one gated slot (0–2 and 1–3): each release ends its own voice.
+        // Two overlapping hits on one gated slot (0–2 at velocity 127, 1–3 at 40): each release
+        // ends its own voice; the different levels show which one survives.
         Rig rig(bank.bank, 48000.0);
-        std::vector<seqplay::Event> ev = { hitEv(0.0, 2.0, 6), hitEv(1.0, 2.0, 6) };
+        std::vector<seqplay::Event> ev = { hitEv(0.0, 2.0, 6, 127), hitEv(1.0, 2.0, 6, 40) };
         rig.store->set(ev.data(), 2, 4.0);
         rig.transport.start();
         rig.runTo(kBeat + kBeat / 2);
-        c(rig.voices(6, 1) == 2, "two sequence voices on slot 6");
+        const float first = rig.at(kBeat / 2), second = rig.at(kBeat + kBeat / 2 - 1) - first;
+        c(rig.voices(6, 1) == 2 && first == 0.5f && second > 0.0f && second < 0.4f,
+          "two sequence voices on slot 6 (" + s(first) + " + " + s(second) + ")");
         rig.runTo(2 * kBeat + kBeat / 20);
-        c(rig.voices(6, 1) == 1 && rig.at(rig.now() - 1) == 0.5f, "at 2.05 the first is released, the second sounds ("
-          + std::to_string(rig.voices(6, 1)) + ")");
+        c(rig.voices(6, 1) == 1 && std::fabs(rig.at(rig.now() - 1) - second) < 1e-6f,
+          "at 2.05 the first is released, the second sounds (" + std::to_string(rig.voices(6, 1)) + ", "
+              + s(rig.at(rig.now() - 1)) + ")");
         rig.runTo(3 * kBeat + kBeat / 20);
         c(rig.voices(6) == 0 && rig.at(rig.now() - 1) == 0.0f, "at 3.05 both released");
         allocs += rig.allocs;
@@ -349,7 +379,10 @@ static bool stops(uint64_t& allocs) {
         c(rig.peak(t0 + kOneShotFade, t0 + 960) == 0.0f && rig.voices(-1) == 0 && rig.synth.sequence().activeNoteCount() == 0,
           what + ": nothing sounding (peak " + s(rig.peak(t0 + kOneShotFade, t0 + 960)) + ", voices "
               + std::to_string(rig.voices(-1)) + ")");
-        c(rig.peak(t0, t0 + 1) > 0.0f, what + ": faded, not cut");
+        // The one-shot's 240-sample fade, not an instant stop's 64-sample declick: still sounding
+        // at t0 + 100 (the gated voice's 48-sample release is over by then).
+        c(rig.peak(t0, t0 + 1) > 0.0f && rig.at(t0 + 100) > 0.0f && rig.at(t0 + 100) < 0.5f,
+          what + ": faded, not cut (" + s(rig.at(t0 + 100)) + " at +100)");
     };
     const std::pair<const char*, std::function<void(Rig&)>> actions[] = {
         { "stop", [](Rig& r) { r.transport.stop(); } },
@@ -568,7 +601,7 @@ static bool smoothing(uint64_t& allocs) {
             e.setSlotBuffer(0, &x->view);
             e.setSlotParams(0, smtest::plain());
             e.hit(0, 127);
-            float tmpL[471], tmpR[471];
+            float tmpL[471] = {}, tmpR[471] = {};
             e.render(tmpL, tmpR, 471); // sounding at level 1
             e.setLevel(0.25f);
             float* l = pass == 0 ? whole : split;
@@ -697,6 +730,16 @@ static bool validate() {
     c(r.ok && r.accepted == 2 && r.dropped == 4 && r.rejectedIndex == -1, "skipped: accepted " + std::to_string(r.accepted)
       + " dropped " + std::to_string(r.dropped));
     c(store->lastRejectedEvent() == -1 && store->lastReject() == seqplay::Reject::None, "a published set clears the rejection");
+    // A refusal for another reason (a loop under 1/64 beat) also clears it: the diagnostics are
+    // always about the last set().
+    {
+        const std::vector<seqplay::Event> bad = { hitEv(0.0, 1.0, 16) };
+        store->set(bad.data(), 1, 4.0);
+        const std::vector<seqplay::Event> one = { hitEv(0.0, 0.001, 3) };
+        const seqplay::SetResult tiny = store->set(one.data(), 1, 0.001);
+        c(!tiny.ok && store->lastRejectedEvent() == -1 && store->lastReject() == seqplay::Reject::None,
+          "a refusal for the loop length clears the last rejection");
+    }
     const seqplay::Sequence* seq = store->acquire();
     c(seq && seq->count == 2 && seq->events[0].kind == seqplay::EventKind::SamplerHit && seq->events[0].velocity == 1
       && seq->events[1].kind == seqplay::EventKind::SamplerKey, "kept and clamped");
