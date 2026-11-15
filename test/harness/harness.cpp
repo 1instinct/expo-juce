@@ -6146,10 +6146,36 @@ static bool runTouchVelocity() {
         check(r.valid && near(r.peak, 0.2, 1e-12) && r.baselineCount == 12 && r.windowCount == 5,
               "window edges (" + std::to_string(r.peak) + ")");
         grid();
-        add(-0.150, 0.14, 0.0, -1.0); // baseline edges included: mean x = 0.14 / 14
+        add(-0.150, 0.14, 0.0, -1.0); // baseline edges included (counted), the outlier left out by the median
         add(-0.030, 0.0, 0.0, -1.0);
         r = computeImpact(s.data(), (int)s.size(), t, now);
-        check(r.baselineCount == 14 && near(r.peak, 0.01, 1e-12), "baseline edges, mean removed");
+        check(r.baselineCount == 14 && near(r.peak, 0.0, 1e-12), "baseline edges, median ignores one outlier");
+        // A fast passage: the previous tap's spike (two samples) inside the baseline window does not
+        // shift the baseline (a mean would: 0.8 / 12 g on x).
+        grid();
+        add(-0.100, 0.4, 0.0, -1.0);
+        add(-0.090, 0.4, 0.0, -1.0);
+        add(0.008, 0.3, 0.0, -1.0);
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.valid && near(r.peak, 0.3, 1e-12), "previous tap in the baseline: median unaffected");
+        // Per-axis median: gravity (0, 0, −1) with noise on every axis.
+        s.clear();
+        for (int k = -20; k <= 1; ++k) add(k * 0.01 + 0.005, (k % 3) * 0.001, -(k % 2) * 0.001, -1.0 + (k % 4) * 0.001);
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.valid && r.peak < 0.01, "noisy rest stays near 0 (" + std::to_string(r.peak) + ")");
+        // At least 3 baseline samples.
+        s.clear();
+        add(-0.100, 0, 0, -1);
+        add(-0.050, 0, 0, -1);
+        add(0.005, 0.2, 0, -1);
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(!r.valid && r.baselineCount == 2, "2 baseline samples: invalid");
+        add(-0.040, 0, 0, -1);
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.valid && r.baselineCount == 3 && near(r.peak, 0.2, 1e-12), "3 baseline samples: valid");
+        double even[4] = {4.0, 1.0, 3.0, 2.0};
+        double odd[3] = {9.0, -1.0, 5.0};
+        check(detail::medianInPlace(even, 4) == 2.5 && detail::medianInPlace(odd, 3) == 5.0, "median even / odd");
         // Gravity in any direction is removed: a tilted phone at rest has no impact.
         s.clear();
         for (int k = -20; k <= 1; ++k) add(k * 0.01 + 0.005, 0.6, -0.8, 0.0);
@@ -6159,7 +6185,8 @@ static bool runTouchVelocity() {
         grid();
         add(0.016, 9.0, 0.0, 0.0);
         r = computeImpact(s.data(), (int)s.size(), t, t + 0.0155);
-        check(r.valid && near(r.peak, 0.0) && r.ageSec == 0.0, "samples after now ignored");
+        check(r.valid && near(r.peak, 0.0) && near(r.ageSec, -0.0005, 1e-9),
+              "samples after now ignored, age signed (clock check)");
     }
     // ── Staleness and empty windows ──
     {
@@ -6213,7 +6240,11 @@ static bool runTouchVelocity() {
         valid.peak = 0.25;
         check(near(strengthOf(touch(10, 3.0, 6.0), valid, cal), 0.5), "force alone (radius/impact ignored)");
         check(near(strengthOf(touch(50, 9.0, 6.0), none, cal), 1.0), "force clamped to 1");
-        check(near(strengthOf(touch(27, 0.0, 6.0), valid, cal), 0.0), "force 0 is valid");
+        check(near(strengthOf(touch(27, 0.0, 6.0), valid, cal), 0.8), "force 0 on the first frame: blend");
+        check(near(strengthOf(touch(27, 0.3, 6.0), valid, cal), 0.8) && !forceValid(touch(27, 0.3, 6.0)),
+              "force at the 5 % floor: blend");
+        check(near(strengthOf(touch(27, 0.31, 6.0), valid, cal), 0.31 / 6.0) && forceValid(touch(27, 0.31, 6.0)),
+              "force above the floor: force");
         check(near(strengthOf(touch(27, NAN, 6.0), none, cal), 0.5), "non-finite force: blend");
         check(near(strengthOf(touch(27), valid, cal), (0.4 * 0.5 + 0.6 * 1.0) / 1.0), "blend radius 0.5 + impact 1");
         valid.peak = std::sqrt(0.02 * 0.25);
@@ -6298,7 +6329,7 @@ static bool runTouchVelocity() {
         check(mono, "monotonic in impact");
         mono = true;
         prev = 0;
-        for (double f = 0.0; f <= 7.0; f += 0.1) {
+        for (double f = 0.34; f <= 7.0; f += 0.1) { // above the 5 % floor (0.3335)
             const int v = velocityFor(strengthOf(touch(25, f, 6.67), none, st.calibration), st);
             mono = mono && v >= prev;
             prev = v;
@@ -6332,6 +6363,9 @@ static bool runTouchVelocity() {
             log.push(r);
         }
         check(log.size() == 16 && log.total() == 20 && log.at(0).touchT == 4 && log.at(15).touchT == 19, "log keeps 16");
+        check(log.at(0).seq == 5 && log.at(15).seq == 20, "log seq");
+        check(log.find(4) == nullptr && log.find(0) == nullptr && log.find(21) == nullptr, "find: overwritten / none");
+        check(log.find(5) != nullptr && log.find(5)->touchT == 4 && log.find(20)->touchT == 19, "find: kept");
     }
 
     const bool pass = failed == 0;

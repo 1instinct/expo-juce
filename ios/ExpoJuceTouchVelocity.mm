@@ -36,7 +36,9 @@ struct MainState {
     bool observing = false;
     bool lateScheduled = false;
     touchvel::Estimate last;
+    double lastTouchT = 0.0;
     bool hasLast = false;
+    bool lastRecorded = false; // pushed to sRecent (after the note, by lastTouchSignals)
 };
 static MainState sMain;
 static CMMotionManager *sMotion = nil;
@@ -52,11 +54,11 @@ struct ReportedConfig {
 static os_unfair_lock sConfigLock = OS_UNFAIR_LOCK_INIT;
 static ReportedConfig sReported;
 
-// Recent estimates: the main thread pushes, diagnostics read; both fill impactLate. Held for a
-// copy or a few short ring scans.
+// Recent estimates: the main thread pushes (after the note, never on the note path), diagnostics
+// read; both fill impactLate. Held only to copy records in or out, never across a ring scan.
 static os_unfair_lock sRecordLock = OS_UNFAIR_LOCK_INIT;
 static touchvel::RecentLog sRecent;
-static touchvel::AccelSample sLateScan[touchvel::AccelRing::kSize]; // guarded by sRecordLock
+static touchvel::AccelSample sLateScanMain[touchvel::AccelRing::kSize]; // main thread: impactLate scans
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -112,22 +114,54 @@ static NSDictionary<NSString *, id> *calibrationDictionary(const touchvel::Calib
     };
 }
 
-// Fills impactLate of the records whose window has closed. Caller holds sRecordLock.
-static void fillLateLocked(double now) {
-    for (int i = 0; i < sRecent.size(); ++i) {
-        touchvel::Record &r = sRecent.at(i);
+// Fills impactLate of the records whose window has closed. sRecordLock is held only to copy the
+// waiting records out and to write the results back; the ring scans run without it. buf: the
+// caller's scan buffer (AccelRing::kSize samples, not shared with another thread). Returns whether
+// any record still waits.
+static bool fillLate(double now, touchvel::AccelSample *buf) {
+    const int kMax = touchvel::RecentLog::kSize;
+    uint64_t seqs[kMax];
+    double touchTs[kMax];
+    int count = 0;
+    os_unfair_lock_lock(&sRecordLock);
+    for (int i = 0; i < sRecent.size() && count < kMax; ++i) {
+        const touchvel::Record &r = sRecent.at(i);
         if (r.lateDone) continue;
-        if (now - r.touchT > kLateGiveUpSec) {
-            r.late = touchvel::Impact();
-            r.lateDone = true;
+        seqs[count] = r.seq;
+        touchTs[count] = r.touchT;
+        ++count;
+    }
+    os_unfair_lock_unlock(&sRecordLock);
+    if (count == 0) return false;
+
+    touchvel::Impact results[kMax];
+    bool done[kMax];
+    bool waiting = false;
+    for (int i = 0; i < count; ++i) {
+        done[i] = true;
+        if (now - touchTs[i] > kLateGiveUpSec) {
+            results[i] = touchvel::Impact(); // the ring no longer covers it
             continue;
         }
-        const int n = sRing.readSince(touchvel::scanFrom(r.touchT), sLateScan, touchvel::AccelRing::kSize);
-        const touchvel::Impact late = touchvel::computeImpactLate(sLateScan, n, r.touchT);
-        if (late.pending) continue;
-        r.late = late;
-        r.lateDone = true;
+        const int n = sRing.readSince(touchvel::scanFrom(touchTs[i]), buf, touchvel::AccelRing::kSize);
+        results[i] = touchvel::computeImpactLate(buf, n, touchTs[i]);
+        if (results[i].pending) {
+            done[i] = false;
+            waiting = true;
+        }
     }
+
+    os_unfair_lock_lock(&sRecordLock);
+    for (int i = 0; i < count; ++i) {
+        if (!done[i]) continue;
+        touchvel::Record *r = sRecent.find(seqs[i]);
+        if (r != nullptr && !r->lateDone) {
+            r->late = results[i];
+            r->lateDone = true;
+        }
+    }
+    os_unfair_lock_unlock(&sRecordLock);
+    return waiting;
 }
 
 // Main thread: fill impactLate shortly after a touch (off the note path), again while any waits.
@@ -137,14 +171,7 @@ static void scheduleLateFill() {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kLateFillDelaySec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         sMain.lateScheduled = false;
-        bool waiting = false;
-        os_unfair_lock_lock(&sRecordLock);
-        fillLateLocked(CACurrentMediaTime());
-        for (int i = 0; i < sRecent.size(); ++i) {
-            if (!sRecent.at(i).lateDone) waiting = true;
-        }
-        os_unfair_lock_unlock(&sRecordLock);
-        if (waiting) scheduleLateFill();
+        if (fillLate(CACurrentMediaTime(), sLateScanMain)) scheduleLateFill();
     });
 }
 
@@ -247,13 +274,11 @@ static void ensureObserving() {
     return YES;
 }
 
-+ (void)padAttached {
++ (void)padAttachedForceTouchCapable:(BOOL)forceTouchCapable {
     onMain(^{
         sMain.pads += 1;
         sPadCount.store(sMain.pads);
-        if ([UITraitCollection currentTraitCollection].forceTouchCapability == UIForceTouchCapabilityAvailable) {
-            sForceCapable.store(true);
-        }
+        if (forceTouchCapable) sForceCapable.store(true);
         ensureObserving();
         updateMotion();
     });
@@ -286,21 +311,27 @@ static void ensureObserving() {
     if (n == 0) n = sRing.readSince(-std::numeric_limits<double>::infinity(), sScan, 1); // its age only
     const touchvel::Impact impact = touchvel::computeImpact(sScan, n, touchTimestamp, entryTimestamp);
     const touchvel::Estimate e = touchvel::estimate(inputs, count, impact, sMain.settings);
+    // No lock here: the record for diagnostics is pushed after the note, by lastTouchSignals.
     sMain.last = e;
+    sMain.lastTouchT = touchTimestamp;
     sMain.hasLast = true;
-    touchvel::Record record;
-    record.estimate = e;
-    record.touchT = touchTimestamp;
-    os_unfair_lock_lock(&sRecordLock);
-    sRecent.push(record);
-    os_unfair_lock_unlock(&sRecordLock);
+    sMain.lastRecorded = false;
     return e.velocity;
 }
 
 + (NSDictionary<NSString *, id> *)lastTouchSignals {
     if (!sMain.hasLast) return @{};
-    if (sMain.last.touch.maxForce > 0.0) sForceCapable.store(true);
-    scheduleLateFill();
+    if (!sMain.lastRecorded) {
+        sMain.lastRecorded = true;
+        if (sMain.last.touch.maxForce > 0.0) sForceCapable.store(true);
+        touchvel::Record record;
+        record.estimate = sMain.last;
+        record.touchT = sMain.lastTouchT;
+        os_unfair_lock_lock(&sRecordLock);
+        sRecent.push(record);
+        os_unfair_lock_unlock(&sRecordLock);
+        scheduleLateFill();
+    }
     return signalsDictionary(sMain.last);
 }
 
@@ -314,10 +345,11 @@ static void ensureObserving() {
     const int n = sRing.readSince(now - 1.0, recent.data(), touchvel::AccelRing::kSize);
     const double hz = touchvel::measuredHz(recent.data(), n, now);
 
+    // (The 1 s window above is a prefix of what impactLate needs; scan again with the full buffer.)
+    fillLate(now, recent.data());
     std::vector<touchvel::Record> records;
     records.reserve(touchvel::RecentLog::kSize);
     os_unfair_lock_lock(&sRecordLock);
-    fillLateLocked(now);
     for (int i = 0; i < sRecent.size(); ++i) records.push_back(sRecent.at(i));
     os_unfair_lock_unlock(&sRecordLock);
 

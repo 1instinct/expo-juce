@@ -269,13 +269,14 @@ Exit code non-zero on any failure.
   filtered, capped and wrapped past 256; a torn read, the writer lapping the slot being copied
   through the `TOUCH_VELOCITY_READ_HOOK` seam the CMake file defines, discarded with nothing mixed;
   a concurrent writer of 400k samples with every sample read whole and consecutive; the baseline
-  `[t−150, t−30] ms` and impact `[t−20 ms, now]` windows and their edges, gravity in any
-  direction removed, samples after `now` ignored; 100 ms staleness, no samples, empty windows
-  invalid; `impactLate` pending until its window closes, then the peak in `[t, t+50] ms`; measured
-  rate; force alone when valid; blend weights, an invalid impact or radius dropping its term,
+  `[t−150, t−30] ms` and impact `[t−20 ms, now]` windows and their edges, the baseline a per-axis
+  median (one outlier or the previous tap's spike in it ignored) of at least 3 samples, gravity in
+  any direction removed, samples after `now` ignored and the age signed; 100 ms staleness, no
+  samples, empty windows invalid; `impactLate` pending until its window closes, then the peak in
+  `[t, t+50] ms`; measured rate; force alone only above 5 % of its maximum; blend weights, an invalid impact or radius dropping its term,
   weight 0, no usable term = 0.5; curves soft ≥ normal ≥ hard with shared ends; min / max, bounds
   ordered and clamped; calibration sanitised; velocity monotonic in radius, impact and force; the
-  strongest of several touches; the 16-entry log), `tvd` (`src/touchVelocity.ts` has the same
+  strongest of several touches; the 16-entry log and finding a record by its sequence number), `tvd` (`src/touchVelocity.ts` has the same
   defaults as `TouchVelocity.h`).
 - Sanitizers: configure a separate build directory with `-DHARNESS_SANITIZE=address` (or `thread`,
   `undefined`). That build leaves out the malloc interposer, so the allocation checks pass

@@ -16,9 +16,10 @@ NS_ASSUME_NONNULL_BEGIN
 // Any thread: getDiagnostics().touchVelocity.
 + (NSDictionary<NSString *, id> *)diagnostics NS_SWIFT_NAME(diagnostics());
 
-// Main thread (other threads are forwarded to it): a pad with touchVelocity on entered / left a
-// window. The accelerometer follows the count.
-+ (void)padAttached NS_SWIFT_NAME(padAttached());
+// Any thread (the work is forwarded to the main thread): a pad with touchVelocity on entered / left
+// a window. The accelerometer follows the count. forceTouchCapable: the pad's
+// traitCollection.forceTouchCapability is available (diagnostics only).
++ (void)padAttachedForceTouchCapable:(BOOL)forceTouchCapable NS_SWIFT_NAME(padAttached(forceTouchCapable:));
 + (void)padDetached NS_SWIFT_NAME(padDetached());
 
 // Main thread, in touchesBegan before the note: the velocity (1–127) for the strongest of the new

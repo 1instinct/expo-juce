@@ -534,7 +534,8 @@ Pads with `touchVelocity` play each note or hit at a velocity estimated from how
 landed, instead of their fixed `velocity`. The estimate is made in the touch handler right before
 the engine call from what is known at that moment, so it adds no latency:
 
-- **force** (`UITouch.force`), alone, on hardware that reports it (3D Touch, Apple Pencil);
+- **force** (`UITouch.force`), alone, on hardware that reports it (3D Touch, Apple Pencil) and
+  when the touch-down frame carries more than 5 % of the maximum;
 - otherwise a weighted blend of the **contact radius** (`UITouch.majorRadius`) and the **device
   impact** (the accelerometer's peak deviation from its short pre-touch baseline, at 100 Hz).
   Without fresh accelerometer samples (simulator, off) the radius carries the note alone.

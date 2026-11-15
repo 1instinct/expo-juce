@@ -91,8 +91,15 @@ class JucePadView: ExpoView {
     _ = AppActivityClock.shared
   }
 
-  // Counted while touchVelocity is on and the view is in a window (didMoveToWindow covers removal:
-  // a view in a window is retained by its superview, so it never deallocates while counted).
+  // Safety net: a view torn down while still counted (no didMoveToWindow(nil)) must not keep the
+  // accelerometer on. padDetached is safe on any thread (it hops to the main thread).
+  deinit {
+    if touchVelocityRegistered {
+      ExpoJuceTouchVelocity.padDetached()
+    }
+  }
+
+  // Counted while touchVelocity is on and the view is in a window.
   private func updateTouchVelocityRegistration() {
     let wanted = touchVelocity && window != nil
     if wanted == touchVelocityRegistered {
@@ -100,7 +107,8 @@ class JucePadView: ExpoView {
     }
     touchVelocityRegistered = wanted
     if wanted {
-      ExpoJuceTouchVelocity.padAttached()
+      let forceTouch: Bool = traitCollection.forceTouchCapability == .available
+      ExpoJuceTouchVelocity.padAttached(forceTouchCapable: forceTouch)
     } else {
       ExpoJuceTouchVelocity.padDetached()
     }

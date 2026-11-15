@@ -5,7 +5,8 @@
 // the offline harness (test/harness, case "tv") tests it on the host.
 //
 // At touch-down the pad turns what it knows at that moment into a MIDI velocity 1–127:
-//   - force (UITouch.force / maximumPossibleForce) when the hardware reports it, alone;
+//   - force (UITouch.force / maximumPossibleForce) when the hardware reports more than 5 % of its
+//     maximum on the touch-down frame, alone;
 //   - otherwise a weighted blend of the contact radius (UITouch.majorRadius) and the device
 //     impact: the largest deviation of the acceleration vector from its short pre-touch baseline.
 // Nothing waits for later samples: the note fires in touchesBegan, so the estimate costs one ring
@@ -109,8 +110,12 @@ private:
 
 // The impact windows, relative to the touch's timestamp t (seconds).
 struct Windows {
-    double baselineFromSec = 0.150; // baseline: mean of the samples in [t − 0.150, t − 0.030]
+    // baseline: per-axis median of the samples in [t − 0.150, t − 0.030], at least
+    // minBaselineSamples of them (else the impact is invalid). The median keeps the previous tap's
+    // spike in a fast passage from shifting it.
+    double baselineFromSec = 0.150;
     double baselineToSec = 0.030;
+    int minBaselineSamples = 3;
     double impactFromSec = 0.020;   // impact: peak deviation over [t − 0.020, now]
     double staleSec = 0.100;        // newest sample older than this at `now`: impact invalid
     double lateSec = 0.050;         // impactLate: peak deviation over [t, t + 0.050]
@@ -123,31 +128,43 @@ struct Impact {
     bool valid = false;
     double peak = 0.0;          // g, when valid
     bool hasSamples = false;    // any sample at all (else the accelerometer is off or silent)
-    double ageSec = 0.0;        // now − newest sample, when hasSamples
+    // now − newest sample, when hasSamples. Signed on purpose: a negative age (a sample stamped
+    // after the handler's entry) means the accelerometer and touch clocks disagree.
+    double ageSec = 0.0;
     int baselineCount = 0;
     int windowCount = 0;
     bool pending = false;       // impactLate only: its window has not closed yet
 };
 
 namespace detail {
-// Mean of the samples in [touchT − from, touchT − to]; false when there are none.
+// Median of v[0..n) (n > 0), reordering v.
+inline double medianInPlace(double* v, int n) {
+    std::nth_element(v, v + n / 2, v + n);
+    const double upper = v[n / 2];
+    if (n % 2 == 1) return upper;
+    return 0.5 * (*std::max_element(v, v + n / 2) + upper);
+}
+
+// Per-axis median of the samples in [touchT − from, touchT − to] (at most AccelRing::kSize of
+// them); false with fewer than w.minBaselineSamples. count: the samples in the window.
 inline bool baselineOf(const AccelSample* s, int n, double touchT, const Windows& w, double& bx, double& by,
                        double& bz, int& count) {
     bx = by = bz = 0.0;
     count = 0;
     const double lo = touchT - w.baselineFromSec;
     const double hi = touchT - w.baselineToSec;
-    for (int i = 0; i < n; ++i) {
+    double xs[AccelRing::kSize], ys[AccelRing::kSize], zs[AccelRing::kSize];
+    for (int i = 0; i < n && count < AccelRing::kSize; ++i) {
         if (s[i].t < lo || s[i].t > hi) continue;
-        bx += s[i].x;
-        by += s[i].y;
-        bz += s[i].z;
+        xs[count] = s[i].x;
+        ys[count] = s[i].y;
+        zs[count] = s[i].z;
         ++count;
     }
-    if (count == 0) return false;
-    bx /= count;
-    by /= count;
-    bz /= count;
+    if (count < std::max(1, w.minBaselineSamples)) return false;
+    bx = medianInPlace(xs, count);
+    by = medianInPlace(ys, count);
+    bz = medianInPlace(zs, count);
     return true;
 }
 
@@ -161,14 +178,14 @@ inline double deviation(const AccelSample& s, double bx, double by, double bz) {
 
 // Impact of a touch at touchT, from what is known at `now` (the handler's entry). s: the samples
 // (any order), n of them. Invalid when there are no samples, the newest is older than staleSec,
-// or the baseline or impact window is empty.
+// the baseline has fewer than minBaselineSamples, or the impact window is empty.
 inline Impact computeImpact(const AccelSample* s, int n, double touchT, double now, const Windows& w = Windows()) {
     Impact r;
     if (s == nullptr || n <= 0) return r;
     double newest = -std::numeric_limits<double>::infinity();
     for (int i = 0; i < n; ++i) newest = std::max(newest, s[i].t);
     r.hasSamples = true;
-    r.ageSec = std::max(0.0, now - newest);
+    r.ageSec = now - newest;
     double bx, by, bz;
     const bool haveBaseline = detail::baselineOf(s, n, touchT, w, bx, by, bz, r.baselineCount);
     if (r.ageSec > w.staleSec || !haveBaseline) return r;
@@ -325,13 +342,18 @@ inline double normLog(double x, double lo, double hi) {
     return clamp01(std::log(x / lo) / std::log(hi / lo));
 }
 
+// Force sensing hardware often reports 0 or a tiny force on the touch-down frame, before the finger
+// has pressed: force counts only above this fraction of maxForce.
+constexpr double kForceFloor = 0.05;
+
 inline bool forceValid(const TouchInput& t) {
-    return std::isfinite(t.maxForce) && t.maxForce > 0.0 && std::isfinite(t.force) && t.force >= 0.0;
+    return std::isfinite(t.maxForce) && t.maxForce > 0.0 && std::isfinite(t.force)
+        && t.force > kForceFloor * t.maxForce;
 }
 
-// Strength 0–1 of one touch. Force when valid, alone. Otherwise the weighted mean of the radius
-// term and (when the impact is valid) the impact term; an invalid impact or radius drops its
-// term. With no usable term (every weight 0, or nothing valid) the strength is 0.5.
+// Strength 0–1 of one touch. Force when valid (above kForceFloor), alone. Otherwise the weighted
+// mean of the radius term and (when the impact is valid) the impact term; an invalid impact or
+// radius drops its term. With no usable term (every weight 0, or nothing valid) the strength is 0.5.
 inline double strengthOf(const TouchInput& t, const Impact& impact, const Calibration& c) {
     if (forceValid(t)) return clamp01(t.force / t.maxForce);
     double sum = 0.0;
@@ -389,6 +411,7 @@ struct Record {
     double touchT = 0.0;
     Impact late;           // impactLate; pending until filled
     bool lateDone = false;
+    uint64_t seq = 0;      // set by RecentLog::push: 1, 2, … (0 = none)
 };
 
 // The last kSize estimates; one thread writes, and readers hold the caller's lock. Preallocated.
@@ -397,8 +420,16 @@ public:
     static constexpr int kSize = 16;
 
     void push(const Record& r) noexcept {
-        items[(size_t)(count % kSize)] = r;
+        Record& slot = items[(size_t)(count % kSize)];
+        slot = r;
         ++count;
+        slot.seq = count;
+    }
+    // The kept record with this seq, or nullptr once it was overwritten.
+    Record* find(uint64_t seq) noexcept {
+        if (seq == 0 || seq > count || count - seq >= (uint64_t)kSize) return nullptr;
+        Record& r = items[(size_t)((seq - 1) % kSize)];
+        return r.seq == seq ? &r : nullptr;
     }
     int size() const noexcept { return (int)std::min<uint64_t>(count, kSize); }
     uint64_t total() const noexcept { return count; }

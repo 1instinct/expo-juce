@@ -66,12 +66,18 @@ export type TouchSignals = {
   /** `UITouch.majorRadius` (pt) of the strongest new touch. */
   radius: number;
   radiusTolerance: number;
-  /** `UITouch.force` / `maximumPossibleForce`; maxForce 0 = no force sensing (force unused). */
+  /**
+   * `UITouch.force` / `maximumPossibleForce`; maxForce 0 = no force sensing. Force sets the strength
+   * alone only above 5 % of maxForce.
+   */
   force: number;
   maxForce: number;
   /** Device impact (g); null when the accelerometer had no fresh samples (off, stale or unavailable). */
   impact: number | null;
-  /** Age of the newest accelerometer sample at the touch handler (ms); null with no sample at all. */
+  /**
+   * Age of the newest accelerometer sample at the touch handler (ms); null with no sample at all.
+   * Signed: negative means a sample was stamped after the handler started (clock mismatch).
+   */
   accelAgeMs: number | null;
   /** 0–1, before the curve. */
   strength: number;
@@ -107,7 +113,7 @@ export type TouchVelocityDiagnostics = {
     /** Samples received since launch. */
     samples: number;
   };
-  /** The screen reports 3D Touch, or a touch carried force. */
+  /** A pad's trait collection reports 3D Touch, or a touch carried force. */
   forceCapable: boolean;
   /** Pads with `touchVelocity` in a window. */
   pads: number;

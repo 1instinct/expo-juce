@@ -10,7 +10,7 @@ it and what the diagnostics report.
 |---|---|---|
 | Contact size | `UITouch.majorRadius`, `majorRadiusTolerance` (pt) | Quantised in steps of a few points. A firmer strike flattens the finger more, but the first frame often comes before full flattening, and finger size and angle dominate: weak alone, needs calibration. |
 | Device impact | CoreMotion accelerometer at 100 Hz (the practical iPhone ceiling) | A firm tap jolts the phone. Strong on a table, weaker hand-held. |
-| Force | `UITouch.force / maximumPossibleForce` | Only where `maximumPossibleForce > 0` (3D Touch devices, Apple Pencil). Used alone when present. |
+| Force | `UITouch.force / maximumPossibleForce` | Only where `maximumPossibleForce > 0` (3D Touch devices, Apple Pencil). Used alone when above 5 % of the maximum on the touch-down frame. |
 
 `CMAccelerometerData.timestamp`, `UITouch.timestamp` and `CACurrentMediaTime()` share the boot clock.
 
@@ -22,11 +22,15 @@ Pure C++, tested on the host by the offline harness (cases `tv`, `tvd`).
   serial), read on the main thread at touch-down and by diagnostics. Every slot carries a sequence
   number; a reader drops a slot that the writer overwrote while it was being copied. No locks, no
   allocation.
-- **Impact** for a touch at `t`: baseline = mean acceleration vector over `[t − 150 ms, t − 30 ms]`
-  (removes gravity and slow hand motion); impact = the largest `|a − baseline|` (g) over
-  `[t − 20 ms, now]`, where `now` is the touch handler's entry. Invalid when the newest sample is
-  more than 100 ms old (accelerometer off or stalled) or either window is empty.
-- **Strength 0–1:** force when valid, alone: `force / maxForce`. Otherwise the weighted mean of
+- **Impact** for a touch at `t`: baseline = per-axis median of the samples in
+  `[t − 150 ms, t − 30 ms]` (removes gravity and slow hand motion; the median keeps the previous
+  tap's spike in a fast passage from shifting it), at least 3 samples; impact = the largest
+  `|a − baseline|` (g) over `[t − 20 ms, now]`, where `now` is the touch handler's entry. Invalid
+  when the newest sample is more than 100 ms old (accelerometer off or stalled), the baseline has
+  fewer than 3 samples (e.g. right after the accelerometer started) or the impact window is empty.
+- **Strength 0–1:** force when valid, alone: `force / maxForce`. Force counts only above 5 % of
+  `maxForce`: force hardware often reports 0 or a tiny value on the touch-down frame, and such a
+  touch uses the blend instead. Otherwise the weighted mean of
   `norm(radius; radiusSoft, radiusHard)` (linear) and `norm(impact; impactSoft, impactHard)` (log
   scale), weights `radiusWeight` / `impactWeight`. An invalid impact (or radius) drops its term;
   with no usable term the strength is 0.5. Of several touches landing in one call the strongest
@@ -104,11 +108,15 @@ a set is empty); keep the previous calibration then.
 | `accel.running` / `available` | Accelerometer updates on / the device has one (known once started). |
 | `accel.requestedHz` / `measuredHz` | 100 / samples per second over the last second. |
 | `accel.samples` | Samples received since launch. |
-| `forceCapable` | The screen reports 3D Touch, or a touch carried force. |
+| `forceCapable` | A pad's trait collection reports 3D Touch, or a touch carried force. |
 | `pads` | Pads with `touchVelocity` in a window. |
 | `clockSec` | `CACurrentMediaTime()` at the read. |
 | `last` | The last estimate, or null. |
 | `recent` | The last 16 estimates, oldest first. |
+
+`accelAgeMs` is signed: the touch handler's entry minus the newest accelerometer sample's
+timestamp. It is normally a few ms; a negative value means a sample was stamped after the handler
+started, i.e. the accelerometer and touch clocks disagree (the impact windows would then be off).
 
 Each estimate: the `TouchSignals` fields plus `velocity`, `forceUsed`, `impactLate` (g, null until
 known or when the samples are gone) and `atSec` (the touch's timestamp, on the `clockSec` clock).
