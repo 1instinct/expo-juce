@@ -6099,15 +6099,26 @@ static bool runTouchVelocity() {
     {
         static AccelRing ring;
         std::atomic<bool> done{false};
+        std::atomic<bool> readerStarted{false};
         const int total = 400000;
+        // The writer starts once the reader is reading and yields every 64 pushes, so the two
+        // overlap even on a 2-core runner (else the check below would pass on an empty ring).
         std::thread writer([&]() {
-            for (int i = 1; i <= total; ++i) ring.push(i, i, -i, 0.5 * i);
+            while (!readerStarted.load()) std::this_thread::yield();
+            for (int i = 1; i <= total; ++i) {
+                ring.push(i, i, -i, 0.5 * i);
+                if ((i & 63) == 0) std::this_thread::yield();
+            }
             done.store(true);
         });
+        uint64_t overlapSamples = 0; // read by reads that started before the writer finished
         while (!done.load() || stressReads < 10) {
+            const bool writing = !done.load();
+            readerStarted.store(true);
             const int n = ring.readSince(-inf, buf, AccelRing::kSize);
             ++stressReads;
             stressSamples += (uint64_t)n;
+            if (writing) overlapSamples += (uint64_t)n;
             for (int i = 0; i < n; ++i) {
                 const bool whole = buf[i].x == buf[i].t && buf[i].y == -buf[i].t && buf[i].z == 0.5 * buf[i].t;
                 const bool consecutive = i == 0 || buf[i].t == buf[i - 1].t - 1.0;
@@ -6116,6 +6127,7 @@ static bool runTouchVelocity() {
         }
         writer.join();
         check(stressBad == 0, "concurrent: torn or out-of-order samples " + std::to_string(stressBad));
+        check(overlapSamples > 0, "concurrent: reads overlapped the writer");
         check(ring.pushed() == (uint64_t)total, "concurrent: count");
     }
 
