@@ -4080,6 +4080,25 @@ static bool runStallLog() {
         StallRecord r[3] = {{5.0, 60.0}, {4.0, 60.0}, {7.0, 60.0}};
         check(near(StallLog::intervalP50Ms(r, 3), 3000.0), "negative interval skipped");
     }
+    { // longest stall overlapping a window (the slow-touch probe): stalls span atSec … atSec + ms
+        StallLog log;
+        log.addGap(10.2, 200.0); // 10.0 … 10.2
+        log.addGap(12.1, 100.0); // 12.0 … 12.1
+        log.addGap(20.5, 500.0); // 20.0 … 20.5
+        const int n = log.copy(out);
+        check(n == 3, "three stalls");
+        check(StallLog::longestOverlapMs(out, n, 9.0, 9.9) == 0.0, "window before every stall: 0");
+        check(StallLog::longestOverlapMs(out, n, 10.1, 10.15) == 200.0, "window inside a stall");
+        check(StallLog::longestOverlapMs(out, n, 9.5, 12.05) == 200.0, "two stalls: the longer");
+        check(StallLog::longestOverlapMs(out, n, 12.09, 19.0) == 100.0, "window starting in a stall's last 10 ms");
+        check(StallLog::longestOverlapMs(out, n, 10.21, 11.99) == 0.0, "between stalls: 0");
+        check(StallLog::longestOverlapMs(out, n, 0.0, 100.0) == 500.0, "every stall: the longest");
+        check(StallLog::longestOverlapMs(out, n, 12.0, 10.0) == 0.0, "reversed window: 0");
+        check(StallLog::longestOverlapMs(out, n, std::numeric_limits<double>::quiet_NaN(), 30.0) == 0.0, "NaN window: 0");
+        check(StallLog::longestOverlapMs(out, 0, 0.0, 100.0) == 0.0, "no records: 0");
+        StallRecord bad[2] = {{std::numeric_limits<double>::quiet_NaN(), 900.0}, {15.0, -5.0}};
+        check(StallLog::longestOverlapMs(bad, 2, 0.0, 100.0) == 0.0, "non-finite or non-positive records skipped");
+    }
     { // no allocation
         StallLog log;
         gRenderAllocs.store(0); gRenderFrees.store(0);

@@ -53,6 +53,7 @@ static const int kDefaultBufferSize = devicefmt::kDefaultBufferSize;
 static const double kDefaultSampleRate = devicefmt::kDefaultSampleRate;
 static const int kMaxDeviceOpenLog = 8;       // diagnostics: the last device opens the engine made
 static const int kMaxTouchPathEntries = 30;   // diagnostics: touchPath cap
+static const int kMaxSlowTouchLog = 8;        // diagnostics: touchLatency.slowTouchLog cap
 static const int64_t kRecoveryDelayMs = 300; // let JUCE's own session handlers run first
 static const int64_t kDeadDeviceCheckMs = 150; // callbackCount must advance within this window
 static const int64_t kRebuildRetryDelayMs = 1000;
@@ -92,6 +93,8 @@ static const int kMaxRebuildAttempts = 3;     // failed rebuild: first attempt +
 // reportTouchPath: / reportLastTouch:).
 @property (atomic, copy) NSArray<NSDictionary<NSString *, id> *> *touchPathReport;
 @property (atomic, copy) NSDictionary<NSString *, id> *lastTouchReport;
+// The pads' last slow touches (reportSlowTouchLog:; main thread writes a new array; atomic copy).
+@property (atomic, copy) NSArray<NSDictionary<NSString *, id> *> *slowTouchLogReport;
 // The main-thread display link (ExpoJuceMainDisplayLink): the stall probe, running while the
 // engine is set up, and the display-rate hint. Created on first use, kept for the process. Main thread.
 @property (nonatomic, strong) ExpoJuceMainDisplayLink *mainDisplayLink;
@@ -250,6 +253,11 @@ static TouchLatencyStats sTouchLatency;
 static StallWindow sStalls;
 static StallLog sStallLog;
 static std::atomic<bool> sStallProbeRunning{false};
+// Pad touches counted by JucePadView after each touchesBegan (countPadTouches:…; main thread),
+// and how many of them took over 100 ms / 1 s from UITouch.timestamp to touchesBegan entry.
+static std::atomic<uint64_t> sPadTouches{0};
+static std::atomic<uint64_t> sPadTouchesOver100ms{0};
+static std::atomic<uint64_t> sPadTouchesOver1s{0};
 static displayrate::RateWindow sDisplayRate;
 static std::atomic<bool> sDisplayLinkTicking{false}; // the link exists and is not paused
 static std::atomic<int> sDisplayRateHint{0};         // the last hint asked for (sanitized)
@@ -1802,6 +1810,14 @@ static int mainThreadMaxFramesPerSecond() {
     touchLatency[@"bufferMs"] = @(sampleRate > 0.0 ? (double)bufferSize * 1000.0 / sampleRate : 0.0);
     touchLatency[@"outputLatencyMs"] = @(session.outputLatency * 1000.0);
     touchLatency[@"midiInputToRenderMs"] = leg(sMidiInputLatency);
+    // Slow-touch probe (JucePadView): every pad touch counted, those over 100 ms / 1 s, and the
+    // last kMaxSlowTouchLog slow ones in detail.
+    touchLatency[@"slowTouches"] = @{
+        @"touches": @((double)sPadTouches.load(std::memory_order_relaxed)),
+        @"over100ms": @((double)sPadTouchesOver100ms.load(std::memory_order_relaxed)),
+        @"over1s": @((double)sPadTouchesOver1s.load(std::memory_order_relaxed)),
+    };
+    touchLatency[@"slowTouchLog"] = self.slowTouchLogReport ?: @[];
     d[@"touchLatency"] = touchLatency;
 
     // MIDI byte input (MidiInput.h): its counters and the arrival -> render leg.
@@ -1946,6 +1962,27 @@ static void recordTouchDelivery(double touchTimestamp, double entryTimestamp) {
 
 - (void)reportLastTouch:(NSDictionary<NSString *, id> *)touch {
     self.lastTouchReport = touch;
+}
+
+- (void)reportSlowTouchLog:(NSArray<NSDictionary<NSString *, id> *> *)entries {
+    if (entries.count > (NSUInteger)kMaxSlowTouchLog)
+        entries = [entries subarrayWithRange:NSMakeRange(entries.count - (NSUInteger)kMaxSlowTouchLog,
+                                                         (NSUInteger)kMaxSlowTouchLog)];
+    self.slowTouchLogReport = entries;
+}
+
+- (void)countPadTouches:(int)touches over100ms:(int)over100ms over1s:(int)over1s {
+    const auto relaxed = std::memory_order_relaxed;
+    if (touches > 0) sPadTouches.fetch_add((uint64_t)touches, relaxed);
+    if (over100ms > 0) sPadTouchesOver100ms.fetch_add((uint64_t)over100ms, relaxed);
+    if (over1s > 0) sPadTouchesOver1s.fetch_add((uint64_t)over1s, relaxed);
+}
+
+- (double)longestMainThreadGapMsFrom:(double)fromSec to:(double)toSec {
+    if (!sStallProbeRunning.load(std::memory_order_relaxed)) return -1.0;
+    StallRecord stalls[StallLog::kSize];
+    const int n = sStallLog.copy(stalls);
+    return StallLog::longestOverlapMs(stalls, n, fromSec, toSec);
 }
 
 // Releases are always recorded, ready or not: a release must reach a voice that is still

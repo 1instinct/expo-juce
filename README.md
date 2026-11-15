@@ -706,6 +706,12 @@ start on the `clockSec` clock), `mainThreadStallIntervalP50Ms` (their median spa
 `enabled`) and the `midiInputToRenderMs` leg (bytes' arrival → render block), also in
 `touchLatency`.
 
+After 0.10.0-rc.1 (iOS), `touchLatency.slowTouches` counts pad touches (`touches`, `over100ms`,
+`over1s`) and `touchLatency.slowTouchLog` details the last 8 touches delivered more than 100 ms
+late: phase, recognizers and their state, app state, other touches held, when the touch ended and
+any main-thread stall during it. See
+[docs/latency.md](docs/latency.md#slow-touch-probe-ios-after-0100-rc1).
+
 ### Display-rate hint
 
 `setDisplayRateHint(hz)` (0.9.0-rc.4+, iOS) keeps a ProMotion display at `hz` (above 60, up to

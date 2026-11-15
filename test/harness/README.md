@@ -137,7 +137,9 @@ Exit code non-zero on any failure.
   allocation in the render), `stall` (the main-thread gap window: longest gap over 10 s, slot reuse,
   the > 50 ms count), `stlog` (0.9.0-rc.4: the stall log keeps the last 32 gaps over 50 ms oldest
   first with start = end − gap, ignores non-finite input, and the median spacing of their starts
-  skips intervals that are not positive; no allocation), `rate` (0.9.0-rc.4, `ios/DisplayRate.h`:
+  skips intervals that are not positive; `longestOverlapMs`, for the slow-touch probe, returns the
+  longest stall overlapping a window, 0 for none, a reversed or non-finite window, and skips
+  non-finite records; no allocation), `rate` (0.9.0-rc.4, `ios/DisplayRate.h`:
   the hint's sanitizing, the link's range per hint and screen maximum (raised to (80, hint, hint)
   clamped, held to 60, or left at the default on a 60 Hz screen), and the measured rate as the
   median frame duration over 32 ticks; no allocation), `bsel` (`ios/DeviceFormat.h`: nearest listed buffer size, the session's rate

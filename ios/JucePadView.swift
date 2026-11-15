@@ -74,6 +74,8 @@ class JucePadView: ExpoView {
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
     isMultipleTouchEnabled = true
+    // Slow-touch probe: start watching app activity changes (once per process).
+    _ = AppActivityClock.shared
   }
 
   // MARK: - Hit shape
@@ -134,8 +136,10 @@ class JucePadView: ExpoView {
       return
     }
     let wasIdle = activeTouches.isEmpty
+    let heldBefore = activeTouches.count
     activeTouches.formUnion(touches)
-    if (wasIdle || hitsEveryTouch) && !activeTouches.isEmpty {
+    let startsNote = (wasIdle || hitsEveryTouch) && !activeTouches.isEmpty
+    if startsNote {
       var timestamp: TimeInterval = 0
       for touch in touches {
         if timestamp == 0 || touch.timestamp < timestamp {
@@ -146,6 +150,8 @@ class JucePadView: ExpoView {
     }
     // After the note: diagnostics only.
     reportLastTouch(touches, entryTimestamp: entryTimestamp)
+    probeSlowTouches(touches, event: event, entryTimestamp: entryTimestamp, heldBefore: heldBefore,
+                     startedNote: startsNote)
   }
 
   override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -160,7 +166,7 @@ class JucePadView: ExpoView {
       super.touchesEnded(touches, with: event)
       return
     }
-    endTouches(touches)
+    endTouches(touches, cancelled: false)
   }
 
   override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -168,7 +174,7 @@ class JucePadView: ExpoView {
       super.touchesCancelled(touches, with: event)
       return
     }
-    endTouches(touches)
+    endTouches(touches, cancelled: true)
   }
 
   override func willMove(toWindow newWindow: UIWindow?) {
@@ -295,9 +301,239 @@ class JucePadView: ExpoView {
     ExpoJuceBridge.reportLastTouch(report)
   }
 
+  // MARK: - Slow-touch probe (diagnostics, off the note path)
+
+  // A touch whose delivery (touchesBegan entry − UITouch.timestamp) is over slowTouchSec. `fields`
+  // is what diagnostics report (touchLatency.slowTouchLog); the end and the main-thread gaps are
+  // filled in after the fact. The touch is held weakly, only to match its end. Main thread only.
+  private final class SlowTouchRecord {
+    weak var touch: UITouch?
+    var fields: [String: Any]
+    let touchTimestamp: TimeInterval
+    let entryTimestamp: CFTimeInterval
+    // CACurrentMediaTime() when the pad handled the touch's end (0: not yet).
+    var endTimestamp: CFTimeInterval = 0
+    var deliveryGapMeasured = false
+    var lifetimeGapMeasured = false
+
+    init(touch: UITouch, fields: [String: Any], touchTimestamp: TimeInterval, entryTimestamp: CFTimeInterval) {
+      self.touch = touch
+      self.fields = fields
+      self.touchTimestamp = touchTimestamp
+      self.entryTimestamp = entryTimestamp
+    }
+  }
+
+  private static let slowTouchSec: Double = 0.1
+  private static let slowTouchLogSize = 8
+  // The last slowTouchLogSize slow touches of every pad, oldest first.
+  private static var slowTouchLog: [SlowTouchRecord] = []
+  // A report to the engine is scheduled (coalesces bursts; the gaps are measured then).
+  private static var slowTouchReportScheduled = false
+
+  // Runs after the note has started: counts this call's touches (and the slow ones) in the engine
+  // with no allocation, and records the slow ones in detail. heldBefore: the view's touches before
+  // this call; startedNote: whether this call started a note or hit.
+  private func probeSlowTouches(_ touches: Set<UITouch>, event: UIEvent?, entryTimestamp: CFTimeInterval,
+                                heldBefore: Int, startedNote: Bool) {
+    var over100ms: Int32 = 0
+    var over1s: Int32 = 0
+    for touch in touches {
+      let delivery: Double = entryTimestamp - touch.timestamp
+      if delivery > JucePadView.slowTouchSec {
+        over100ms += 1
+      }
+      if delivery > 1.0 {
+        over1s += 1
+      }
+    }
+    ExpoJuceBridge.countPadTouches(Int32(clamping: touches.count), over100ms: over100ms, over1s: over1s)
+    guard over100ms > 0 else {
+      return
+    }
+
+    // Shared by every slow touch of this call.
+    let appState: String
+    switch UIApplication.shared.applicationState {
+    case .active:
+      appState = "active"
+    case .inactive:
+      appState = "inactive"
+    case .background:
+      appState = "background"
+    @unknown default:
+      appState = "unknown"
+    }
+    let clock = AppActivityClock.shared
+    let becameActiveAt: CFTimeInterval = clock.didBecomeActiveAt
+    let resignedActiveAt: CFTimeInterval = clock.willResignActiveAt
+    let eventTimestamp: Double = event?.timestamp ?? 0
+    let eventTouches: Int = event?.allTouches?.count ?? 0
+    // Touches of this call that the view already held (a touch delivered to touchesBegan twice).
+    let alreadyHeld: Int = max(0, heldBefore + touches.count - activeTouches.count)
+
+    for touch in touches {
+      let touchTimestamp: TimeInterval = touch.timestamp
+      let delivery: Double = entryTimestamp - touchTimestamp
+      guard delivery > JucePadView.slowTouchSec else {
+        continue
+      }
+      var edgeDistance: Double = -1
+      if let window = touch.window {
+        let point = touch.location(in: window)
+        let bounds = window.bounds
+        let horizontalEdge: CGFloat = min(point.x - bounds.minX, bounds.maxX - point.x)
+        let verticalEdge: CGFloat = min(point.y - bounds.minY, bounds.maxY - point.y)
+        edgeDistance = Double(min(horizontalEdge, verticalEdge))
+      }
+      let attached: [UIGestureRecognizer] = touch.gestureRecognizers ?? []
+      let recognizers: [[String: Any]] = attached.prefix(12).map { (recognizer: UIGestureRecognizer) -> [String: Any] in
+        let entry: [String: Any] = [
+          "class": NSStringFromClass(type(of: recognizer)),
+          "state": JucePadView.stateName(recognizer.state),
+          "delaysTouchesBegan": recognizer.delaysTouchesBegan,
+        ]
+        return entry
+      }
+      let activityChanged: Bool = (becameActiveAt >= touchTimestamp && becameActiveAt <= entryTimestamp)
+        || (resignedActiveAt >= touchTimestamp && resignedActiveAt <= entryTimestamp)
+
+      var fields: [String: Any] = [:]
+      fields["deliveryMs"] = delivery * 1000.0
+      fields["touchTimestamp"] = touchTimestamp
+      fields["entryTimestamp"] = entryTimestamp
+      fields["eventTimestamp"] = eventTimestamp
+      fields["eventDeliveryMs"] = eventTimestamp > 0 ? (entryTimestamp - eventTimestamp) * 1000.0 : -1.0
+      fields["phase"] = JucePadView.phaseName(touch.phase)
+      fields["tapCount"] = touch.tapCount
+      fields["majorRadius"] = Double(touch.majorRadius)
+      fields["edgeDistance"] = edgeDistance
+      fields["touchesInCall"] = touches.count
+      fields["heldBefore"] = heldBefore
+      fields["alreadyHeld"] = alreadyHeld
+      fields["eventTouches"] = eventTouches
+      fields["mode"] = padMode.rawValue
+      fields["startedNote"] = startedNote
+      fields["recognizers"] = recognizers
+      fields["appState"] = appState
+      fields["sinceDidBecomeActiveSec"] = becameActiveAt > 0 ? entryTimestamp - becameActiveAt : -1.0
+      fields["sinceWillResignActiveSec"] = resignedActiveAt > 0 ? entryTimestamp - resignedActiveAt : -1.0
+      fields["activityChangedDuringDelivery"] = activityChanged
+      // Filled in after the fact (-1 / "" / false until then).
+      fields["endPhase"] = ""
+      fields["endedAfterMs"] = -1.0
+      fields["endedWithin50ms"] = false
+      fields["heldMs"] = -1.0
+      fields["endDeliveryMs"] = -1.0
+      fields["deliveryGapMs"] = -1.0
+      fields["lifetimeGapMs"] = -1.0
+
+      let record = SlowTouchRecord(touch: touch, fields: fields, touchTimestamp: touchTimestamp,
+                                   entryTimestamp: entryTimestamp)
+      JucePadView.slowTouchLog.append(record)
+    }
+    let overflow = JucePadView.slowTouchLog.count - JucePadView.slowTouchLogSize
+    if overflow > 0 {
+      JucePadView.slowTouchLog.removeFirst(overflow)
+    }
+    JucePadView.scheduleSlowTouchReport()
+  }
+
+  // After the note-off for these touches: fills in the end of any slow touch among them.
+  private static func noteSlowTouchEnds(_ touches: Set<UITouch>, cancelled: Bool) {
+    guard !slowTouchLog.isEmpty else {
+      return
+    }
+    let now = CACurrentMediaTime()
+    var changed = false
+    for record in slowTouchLog {
+      guard let touch = record.touch, touches.contains(touch) else {
+        continue
+      }
+      record.touch = nil
+      record.endTimestamp = now
+      let endedAfterMs: Double = (now - record.entryTimestamp) * 1000.0
+      record.fields["endPhase"] = cancelled ? "cancelled" : "ended"
+      record.fields["endedAfterMs"] = endedAfterMs
+      record.fields["endedWithin50ms"] = endedAfterMs <= 50.0
+      record.fields["heldMs"] = (touch.timestamp - record.touchTimestamp) * 1000.0
+      record.fields["endDeliveryMs"] = (now - touch.timestamp) * 1000.0
+      changed = true
+    }
+    if changed {
+      scheduleSlowTouchReport()
+    }
+  }
+
+  // Reports the log 0.25 s later (at most one pending report): by then the display-link tick that
+  // ends a main-thread stall overlapping the touch has been logged.
+  private static func scheduleSlowTouchReport() {
+    guard !slowTouchReportScheduled else {
+      return
+    }
+    slowTouchReportScheduled = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+      JucePadView.slowTouchReportScheduled = false
+      JucePadView.publishSlowTouchLog()
+    }
+  }
+
+  private static func publishSlowTouchLog() {
+    for record in slowTouchLog {
+      if !record.deliveryGapMeasured {
+        record.fields["deliveryGapMs"] = ExpoJuceBridge.longestMainThreadGapMs(from: record.touchTimestamp,
+                                                                              to: record.entryTimestamp)
+        record.deliveryGapMeasured = true
+      }
+      if !record.lifetimeGapMeasured && record.endTimestamp > 0 {
+        record.fields["lifetimeGapMs"] = ExpoJuceBridge.longestMainThreadGapMs(from: record.touchTimestamp,
+                                                                              to: record.endTimestamp)
+        record.lifetimeGapMeasured = true
+      }
+    }
+    let entries: [[String: Any]] = slowTouchLog.map { $0.fields }
+    ExpoJuceBridge.reportSlowTouchLog(entries)
+  }
+
+  private static func phaseName(_ phase: UITouch.Phase) -> String {
+    switch phase {
+    case .began:
+      return "began"
+    case .moved:
+      return "moved"
+    case .stationary:
+      return "stationary"
+    case .ended:
+      return "ended"
+    case .cancelled:
+      return "cancelled"
+    default:
+      return "other(\(phase.rawValue))"
+    }
+  }
+
+  private static func stateName(_ state: UIGestureRecognizer.State) -> String {
+    switch state {
+    case .possible:
+      return "possible"
+    case .began:
+      return "began"
+    case .changed:
+      return "changed"
+    case .ended:
+      return "ended"
+    case .cancelled:
+      return "cancelled"
+    case .failed:
+      return "failed"
+    @unknown default:
+      return "unknown(\(state.rawValue))"
+    }
+  }
+
   // MARK: - Notes
 
-  private func endTouches(_ touches: Set<UITouch>) {
+  private func endTouches(_ touches: Set<UITouch>, cancelled: Bool) {
     activeTouches.subtract(touches)
     if activeTouches.isEmpty {
       stopNote()
@@ -306,6 +542,8 @@ class JucePadView: ExpoView {
       touchPathNeedsRefresh = false
       reportTouchPath()
     }
+    // After the note-off: diagnostics only.
+    JucePadView.noteSlowTouchEnds(touches, cancelled: cancelled)
   }
 
   private func releaseAllTouches() {
@@ -367,5 +605,31 @@ class JucePadView: ExpoView {
       "note": noteNumber,
     ]
     onNoteOff(payload)
+  }
+}
+
+// Slow-touch probe: when the app last became active and last resigned active (CACurrentMediaTime;
+// 0 = not seen since the first pad was created). Notifications arrive on the main thread.
+private final class AppActivityClock: NSObject {
+  static let shared = AppActivityClock()
+
+  private(set) var didBecomeActiveAt: CFTimeInterval = 0
+  private(set) var willResignActiveAt: CFTimeInterval = 0
+
+  private override init() {
+    super.init()
+    let center = NotificationCenter.default
+    center.addObserver(self, selector: #selector(appDidBecomeActive),
+                       name: UIApplication.didBecomeActiveNotification, object: nil)
+    center.addObserver(self, selector: #selector(appWillResignActive),
+                       name: UIApplication.willResignActiveNotification, object: nil)
+  }
+
+  @objc private func appDidBecomeActive() {
+    didBecomeActiveAt = CACurrentMediaTime()
+  }
+
+  @objc private func appWillResignActive() {
+    willResignActiveAt = CACurrentMediaTime()
   }
 }

@@ -243,6 +243,78 @@ off, on the same build, and compare `touchDeliveryMs` p50 / p95 and `displayHz`.
   (`ios/LatencyStats.h` `StallLog`, harness case `stlog`; the rate math is `ios/DisplayRate.h`,
   case `rate`).
 
+### Slow-touch probe (iOS, after 0.10.0-rc.1)
+
+A capture on an iPhone 16 Pro (iOS 26.6.2, 120 Hz) had 2 of 28 pad touches with a
+`touchDeliveryMs` of 5306 ms and 6331 ms, while the p50 was 12.6 ms, queue → render 0.63 ms and
+the longest main-thread stall 170 ms. The touch's recognizers (`lastTouch`) were only React
+Native's touch handlers, neither of which delays touches. The legs cannot say why a touch arrived
+5 s late, so `JucePadView` now records every touch delivered more than 100 ms late in detail.
+Candidates:
+
+- **(a) held by a recognizer**: a recognizer with `delaysTouchesBegan` kept the touch until it
+  failed (at a move or the lift), and UIKit then delivered `touchesBegan` late;
+- **(b) app activity**: the touch was delivered after the app came back from the lock screen,
+  the background, Control Center or a system alert;
+- **(c) the timestamp**: `UITouch.timestamp` is not the touch-down time for this touch (a touch
+  re-delivered, or a timestamp left over from an earlier use of the object);
+- **(d) multi-touch**: a second finger while others are held (a chord), or a drums / sampler pad
+  retriggering on every touch;
+- **(e) a main-thread block** the stall probe should have seen.
+
+`touchLatency.slowTouches` counts touches (each finger, not each note) since launch:
+`{ touches, over100ms, over1s }`, so the base rate is `over100ms / touches`.
+`touchLatency.slowTouchLog` keeps the last 8 slow touches of all pads, oldest first. Times are
+`CACurrentMediaTime()` seconds (the clock of `clockSec` and of `mainThreadStallLog`'s `atSec`):
+
+| Field | Meaning |
+|---|---|
+| `deliveryMs`, `touchTimestamp`, `entryTimestamp` | The delivery, `UITouch.timestamp` read at `touchesBegan` entry, and that entry |
+| `eventTimestamp`, `eventDeliveryMs` | `UIEvent.timestamp` of the delivering event and entry − it (−1 without an event) |
+| `phase` | `UITouch.phase` at entry: `began`, `moved`, `stationary`, `ended`, `cancelled` |
+| `tapCount`, `majorRadius`, `edgeDistance` | As UIKit reports them; `edgeDistance` in points to the nearest window edge |
+| `touchesInCall`, `heldBefore`, `alreadyHeld`, `eventTouches` | Touches in this call; touches the pad already held; touches of this call it already held; every touch of the event on any view |
+| `mode`, `startedNote` | The pad's mode and whether this call started a note / hit |
+| `recognizers` | `UITouch.gestureRecognizers` at entry (at most 12): `class`, `state`, `delaysTouchesBegan` |
+| `appState`, `sinceDidBecomeActiveSec`, `sinceWillResignActiveSec`, `activityChangedDuringDelivery` | `applicationState` at entry; seconds since the last didBecomeActive / willResignActive (−1: none seen since the first pad was created); whether either fell inside the delivery |
+| `endPhase`, `endedAfterMs`, `endedWithin50ms` | After the fact: `ended` / `cancelled` once a pad handled the touch's end (`''` while still down, or if no pad saw the end), the time from `touchesBegan` entry to that, and whether it was within 50 ms |
+| `heldMs`, `endDeliveryMs` | After the fact: `UITouch.timestamp` at the end − `touchTimestamp`, and the end's own delivery |
+| `deliveryGapMs` | About 0.25 s later: the longest main-thread stall (display-link gap over 50 ms, `mainThreadStallLog`) overlapping `touchTimestamp` … `entryTimestamp`; 0: none; −1: the stall probe was not running (or not measured yet) |
+| `lifetimeGapMs` | The same over `touchTimestamp` … the end; −1 until the end is seen |
+
+**Reading it against the hypotheses.** Take each slow entry on its own:
+
+- **(a)** `endedWithin50ms: true` (began and end delivered together at the lift) or `phase`
+  `moved` / `ended` at entry, `heldMs` close to `deliveryMs`, `appState` `active`,
+  `deliveryGapMs` 0. A recognizer in `recognizers` with `delaysTouchesBegan` in state `failed`
+  names the culprit; the list may also be empty or only React Native's handlers, because a
+  failed recognizer can already be detached when the touch is delivered, so check `touchPath` for
+  the delaying recognizers on the way up. `eventDeliveryMs` small next to a large `deliveryMs`
+  means the delivering event was the lift or the move, not the touch-down.
+- **(b)** `appState` not `active`, `activityChangedDuringDelivery: true`, or
+  `sinceDidBecomeActiveSec` below `deliveryMs / 1000`. `deliveryGapMs` reads 0 or −1 here: the
+  stall probe's display link pauses while the app is inactive and does not count the gap across a
+  pause, so a missing gap does not argue against (b).
+- **(c)** `alreadyHeld` above 0, or `phase` `stationary` (a touch the pad was given again), or
+  `phase` `began` with `endedWithin50ms: false` and a long `endedAfterMs` (the finger really
+  stayed down after the late delivery) while (a), (b), (d) and (e) are all clear: the stamp is
+  older than the touch-down it describes. Compare `touchTimestamp` with the other entries: two
+  slow entries with the same `touchTimestamp` are one timestamp seen twice.
+- **(d)** `heldBefore` above 0, `eventTouches` above `touchesInCall` (other fingers down
+  elsewhere) or `touchesInCall` above 1, especially on a `drums` / `sampler` pad. A chord held
+  about 5 s shows as `eventTouches` ≥ 2 with `heldMs` near 5000 on the other entries.
+- **(e)** `deliveryGapMs` close to `deliveryMs` (a stall covering most of the delivery) with
+  `appState` `active`. `deliveryGapMs` 0 with the probe running (not −1) rules (e) out: a
+  blocked main thread delays the display link too, so a block cannot hide from the stall log
+  while the app is active. `lifetimeGapMs` shows a block later in the touch's life.
+
+The probe runs on the main thread after the note has been queued (and after the note-off for an
+end): the per-call count is a loop over the touches and one call with integers into the engine
+(atomics, no allocation); only slow touches build a record, and the log reaches the engine at most
+once every 0.25 s. Nothing runs on the audio thread. The overlap search is
+`StallLog::longestOverlapMs` (`ios/LatencyStats.h`, harness case `stlog`). Android has no pad
+view and reports neither field.
+
 ## 6. Slow-motion measurement procedure
 
 Measures finger contact → sound, the only figure that includes the digitizer and the speaker.
