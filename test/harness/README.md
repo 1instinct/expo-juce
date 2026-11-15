@@ -265,6 +265,18 @@ Exit code non-zero on any failure.
   a sampler pad hit adds the same stereo output (within float rounding) with arp events splitting
   the synth's render and synth ramps running as on an idle synth, from the first sample of its
   block; finite output, 0 allocations).
+- Touch velocity (0.10.0-rc.3, `ios/TouchVelocity.h`): `tv` (the accelerometer ring newest first,
+  filtered, capped and wrapped past 256; a torn read, the writer lapping the slot being copied
+  through the `TOUCH_VELOCITY_READ_HOOK` seam the CMake file defines, discarded with nothing mixed;
+  a concurrent writer of 400k samples with every sample read whole and consecutive; the baseline
+  `[t−150, t−30] ms` and impact `[t−20 ms, now]` windows and their edges, gravity in any
+  direction removed, samples after `now` ignored; 100 ms staleness, no samples, empty windows
+  invalid; `impactLate` pending until its window closes, then the peak in `[t, t+50] ms`; measured
+  rate; force alone when valid; blend weights, an invalid impact or radius dropping its term,
+  weight 0, no usable term = 0.5; curves soft ≥ normal ≥ hard with shared ends; min / max, bounds
+  ordered and clamped; calibration sanitised; velocity monotonic in radius, impact and force; the
+  strongest of several touches; the 16-entry log), `tvd` (`src/touchVelocity.ts` has the same
+  defaults as `TouchVelocity.h`).
 - Sanitizers: configure a separate build directory with `-DHARNESS_SANITIZE=address` (or `thread`,
   `undefined`). That build leaves out the malloc interposer, so the allocation checks pass
   trivially there; it is for memory errors and races (e.g. `./harness sm sml sms smq`). On kernels

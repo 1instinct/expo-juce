@@ -23,7 +23,99 @@ export type SetupOptions = {
 /** Payload of `JucePadView` `onNoteOn`. */
 export type PadNoteOnEvent = {
   note: number;
+  /** The velocity the note or hit played at: estimated (with `touch`) or the fixed `velocity` prop. */
   velocity: number;
+  /** The touch-down's signals, only when its velocity was estimated (`touchVelocity`, iOS, 0.10.0-rc.3+). */
+  touch?: TouchSignals;
+};
+
+// ── Touch velocity (iOS, 0.10.0-rc.3+) ──────────────────────────────
+
+/** How strength maps to velocity: `min + (max − min) · strength^γ`, γ 0.6 / 1.0 / 1.6. */
+export type TouchVelocityCurve = 'soft' | 'normal' | 'hard';
+
+/**
+ * Where each signal's soft and hard ends lie, and how much each counts. Radius in points
+ * (`UITouch.majorRadius`), impact in g (peak deviation of the acceleration from its pre-touch
+ * baseline), weights 0–1 (relative; 0 leaves a signal out).
+ */
+export type TouchVelocityCalibration = {
+  radiusSoft: number;
+  radiusHard: number;
+  impactSoft: number;
+  impactHard: number;
+  radiusWeight: number;
+  impactWeight: number;
+};
+
+export type TouchVelocityConfig = {
+  /** Off: every pad plays its fixed `velocity`. */
+  enabled: boolean;
+  /** Default `'normal'`. */
+  curve?: TouchVelocityCurve;
+  /** Velocity at strength 0 (default 20; 1–127). */
+  minVelocity?: number;
+  /** Velocity at strength 1 (default 127; 1–127). */
+  maxVelocity?: number;
+  /** null / omitted: the uncalibrated defaults (`TOUCH_VELOCITY_DEFAULTS.calibration`). */
+  calibration?: TouchVelocityCalibration | null;
+};
+
+/** What a touch-down told the estimator (`onNoteOn` `touch`, diagnostics). */
+export type TouchSignals = {
+  /** `UITouch.majorRadius` (pt) of the strongest new touch. */
+  radius: number;
+  radiusTolerance: number;
+  /** `UITouch.force` / `maximumPossibleForce`; maxForce 0 = no force sensing (force unused). */
+  force: number;
+  maxForce: number;
+  /** Device impact (g); null when the accelerometer had no fresh samples (off, stale or unavailable). */
+  impact: number | null;
+  /** Age of the newest accelerometer sample at the touch handler (ms); null with no sample at all. */
+  accelAgeMs: number | null;
+  /** 0–1, before the curve. */
+  strength: number;
+};
+
+/** One estimate in `getDiagnostics().touchVelocity`. */
+export type TouchVelocityEstimate = TouchSignals & {
+  velocity: number;
+  /** Force alone set the strength. */
+  forceUsed: boolean;
+  /** Peak impact in the 50 ms after the touch (what waiting would have seen); null until known or when unavailable. */
+  impactLate: number | null;
+  /** UITouch.timestamp (s, the `clockSec` clock). */
+  atSec: number;
+};
+
+/** `getDiagnostics().touchVelocity` (iOS, 0.10.0-rc.3+). */
+export type TouchVelocityDiagnostics = {
+  supported: boolean;
+  enabled: boolean;
+  curve: TouchVelocityCurve;
+  min: number;
+  max: number;
+  /** The calibration as set (sanitised); null = defaults. */
+  calibration: TouchVelocityCalibration | null;
+  accel: {
+    running: boolean;
+    /** The device has an accelerometer (known once it was first started). */
+    available: boolean;
+    requestedHz: number;
+    /** Samples per second over the last second. */
+    measuredHz: number;
+    /** Samples received since launch. */
+    samples: number;
+  };
+  /** The screen reports 3D Touch, or a touch carried force. */
+  forceCapable: boolean;
+  /** Pads with `touchVelocity` in a window. */
+  pads: number;
+  /** CACurrentMediaTime() when the diagnostics were read (s). */
+  clockSec: number;
+  last: TouchVelocityEstimate | null;
+  /** The last 16 estimates, oldest first. */
+  recent: TouchVelocityEstimate[];
 };
 
 /** Payload of `JucePadView` `onNoteOff`. */
@@ -52,6 +144,13 @@ export type JucePadViewProps = {
   mode?: PadMode;
   /** MIDI velocity 0-127 (default 100). */
   velocity?: number;
+  /**
+   * Estimate each touch-down's velocity from how hard it lands (contact size, device impact,
+   * force where the hardware has it) instead of playing `velocity`. Takes effect only while
+   * `setTouchVelocity({ enabled: true })` is set; `onNoteOn` then carries `touch`. Default false.
+   * iOS, 0.10.0-rc.3+ (older binaries, Android and web ignore it and play `velocity`).
+   */
+  touchVelocity?: boolean;
   /** When false, touches pass through and no note is played (default true). */
   enabled?: boolean;
   /**
@@ -501,6 +600,8 @@ export type AudioDiagnostics = {
   deviceOpens?: DeviceOpenRecord[];
   /** Touch → sound, per leg, over the last 64 notes / drum hits started by a native pad (`JucePadView`). */
   touchLatency?: TouchLatencyDiagnostics;
+  /** Touch velocity estimator: settings, accelerometer and the last estimates (iOS, 0.10.0-rc.3+). */
+  touchVelocity?: TouchVelocityDiagnostics;
   /** Gesture recognizers and scroll views between the most recently attached pad and its window (at most 30). */
   touchPath?: TouchPathEntry[];
   /** The last pad touch (at most one report every 0.5 s): its delivery time, position and recognizers. */

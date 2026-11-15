@@ -27,6 +27,9 @@ jobs:
       # No lint step yet: .eslintrc.js is CommonJS in a "type": "module" package and
       # `prepare` regenerates it, so `npm run lint` can't load its config.
       - run: npm ci
+      # Pure TS helpers, run on the build/ output prepare just wrote.
+      - name: Touch velocity calibration tests
+        run: node test/touch-velocity.test.mjs
       - name: Check the package contents
         run: |
           npm pack --dry-run --json --ignore-scripts | sed -n '/^\[/,$p' > pack.json  # prepare still logs to stdout

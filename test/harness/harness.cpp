@@ -26,6 +26,7 @@
 #include "SequencePlayer.h"
 #include "BackgroundPolicy.h"
 #include "SynthParamSmoother.h"
+#include "TouchVelocity.h"
 
 #include <atomic>
 #include <chrono>
@@ -98,6 +99,14 @@ void harnessBackingTrackAcquireHook() {
     ++gAcquireHookCalls;
     hook();
     tCountAllocs = counting;
+}
+
+// touchvel::AccelRing::readSince() test seam (CMake defines TOUCH_VELOCITY_READ_HOOK as this name).
+// Runs on every slot the reader copies, between the copy and the re-check of the slot's sequence
+// number: a test pushes there to overwrite the slot being read (a torn read).
+static std::function<void()> gTouchVelocityReadHook;
+void harnessTouchVelocityReadHook() {
+    if (gTouchVelocityReadHook) gTouchVelocityReadHook();
 }
 
 // NoteEventQueue::drainNoteOns() test seam (CMake defines NOTE_EVENT_QUEUE_DRAIN_HOOK as this
@@ -6026,6 +6035,363 @@ static bool runBackgroundPolicy() {
     return pass;
 }
 
+// Touch velocity estimator (ios/TouchVelocity.h): the accelerometer ring (order, wrap, torn reads,
+// a concurrent writer), the impact windows, staleness, impactLate, the force path, the blend
+// weights, curves, min / max, clamping and monotonicity.
+static bool runTouchVelocity() {
+    int failed = 0;
+    std::string detail;
+    auto check = [&](bool ok, const std::string& what) { if (!ok) { ++failed; detail += " [" + what + "]"; } };
+    auto near = [](double a, double b, double eps = 1e-9) { return std::fabs(a - b) <= eps; };
+    using namespace touchvel;
+    const double inf = std::numeric_limits<double>::infinity();
+    static AccelSample buf[AccelRing::kSize];
+
+    // ── Ring: order, filter, cap, wrap, non-finite ──
+    {
+        static AccelRing ring;
+        check(ring.readSince(-inf, buf, AccelRing::kSize) == 0 && ring.pushed() == 0, "empty ring");
+        for (int i = 0; i < 10; ++i) ring.push(i * 0.01, i, -i, 2.0 * i);
+        int n = ring.readSince(-inf, buf, AccelRing::kSize);
+        bool order = n == 10;
+        for (int i = 0; i < n && order; ++i) order = buf[i].x == 9 - i && buf[i].y == -(9 - i) && buf[i].z == 2.0 * (9 - i);
+        check(order, "newest first, fields intact");
+        check(ring.readSince(0.05 - 1e-9, buf, AccelRing::kSize) == 5 && buf[4].x == 5, "fromT filter");
+        check(ring.readSince(-inf, buf, 3) == 3 && buf[2].x == 7, "cap");
+        ring.push(NAN, 0, 0, 0);
+        ring.push(1.0, inf, 0, 0);
+        check(ring.pushed() == 10, "non-finite dropped");
+        for (int i = 10; i < 300; ++i) ring.push(i * 0.01, i, -i, 2.0 * i);
+        n = ring.readSince(-inf, buf, AccelRing::kSize);
+        bool wrap = n == AccelRing::kSize && ring.pushed() == 300;
+        for (int i = 0; i < n && wrap; ++i) wrap = buf[i].x == 299 - i && near(buf[i].t, (299 - i) * 0.01);
+        check(wrap, "wrap: the newest 256, in order (" + std::to_string(n) + ")");
+    }
+    // ── Ring: torn reads (the writer laps the reader while it copies a slot) ──
+    {
+        static AccelRing ring;
+        for (int i = 0; i < 300; ++i) ring.push(i, i, i, i);
+        int reads = 0;
+        int lapAt = 1; // overwrite the slot of the lapAt-th read
+        gTouchVelocityReadHook = [&]() {
+            if (++reads != lapAt) return;
+            // Slot of index 300 - lapAt is rewritten by index 300 - lapAt + 256.
+            for (int i = 300; i <= 300 - lapAt + AccelRing::kSize; ++i) ring.push(1e6 + i, -1, -1, -1);
+        };
+        int n = ring.readSince(-inf, buf, AccelRing::kSize);
+        check(n == 0, "torn newest slot discarded (" + std::to_string(n) + ")");
+        // A second ring: the third slot is torn, the two newer ones are kept intact.
+        static AccelRing ring2;
+        for (int i = 0; i < 300; ++i) ring2.push(i, i, i, i);
+        reads = 0;
+        lapAt = 3;
+        gTouchVelocityReadHook = [&]() {
+            if (++reads != lapAt) return;
+            for (int i = 300; i <= 300 - lapAt + AccelRing::kSize; ++i) ring2.push(1e6 + i, -1, -1, -1);
+        };
+        n = ring2.readSince(-inf, buf, AccelRing::kSize);
+        check(n == 2 && buf[0].x == 299 && buf[1].x == 298 && buf[0].t == 299 && buf[1].t == 298,
+              "torn third slot: two kept, nothing mixed (" + std::to_string(n) + ")");
+        gTouchVelocityReadHook = nullptr;
+    }
+    // ── Ring: a real concurrent writer; every sample read is whole and consecutive ──
+    uint64_t stressReads = 0, stressSamples = 0, stressBad = 0;
+    {
+        static AccelRing ring;
+        std::atomic<bool> done{false};
+        const int total = 400000;
+        std::thread writer([&]() {
+            for (int i = 1; i <= total; ++i) ring.push(i, i, -i, 0.5 * i);
+            done.store(true);
+        });
+        while (!done.load() || stressReads < 10) {
+            const int n = ring.readSince(-inf, buf, AccelRing::kSize);
+            ++stressReads;
+            stressSamples += (uint64_t)n;
+            for (int i = 0; i < n; ++i) {
+                const bool whole = buf[i].x == buf[i].t && buf[i].y == -buf[i].t && buf[i].z == 0.5 * buf[i].t;
+                const bool consecutive = i == 0 || buf[i].t == buf[i - 1].t - 1.0;
+                if (!whole || !consecutive) ++stressBad;
+            }
+        }
+        writer.join();
+        check(stressBad == 0, "concurrent: torn or out-of-order samples " + std::to_string(stressBad));
+        check(ring.pushed() == (uint64_t)total, "concurrent: count");
+    }
+
+    // ── Impact windows ──
+    // 100 Hz at rest (0, 0, −1 g) at t − 195 ms … t + 15 ms (5 ms off the window edges); now = t + 17 ms.
+    const double t = 100.0;
+    const double now = t + 0.017;
+    std::vector<AccelSample> s;
+    auto add = [&](double dt, double x, double y, double z) { s.push_back({t + dt, x, y, z}); };
+    auto grid = [&]() {
+        s.clear();
+        for (int k = -20; k <= 1; ++k) add(k * 0.01 + 0.005, 0, 0, -1);
+    };
+    {
+        grid();
+        Impact r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.valid && near(r.peak, 0.0) && r.baselineCount == 12 && r.windowCount == 4,
+              "at rest: valid, 0 g, baseline 12 (t-145..t-35), window 4 (t-15..t+15)");
+        check(near(r.ageSec, 0.002, 1e-9), "age");
+        add(0.008, 0.3, 0.0, -1.0);
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.valid && near(r.peak, 0.3, 1e-12), "spike after the touch");
+        grid();
+        add(-0.020, 0.0, 0.2, -1.0);  // window start: counted
+        add(-0.025, 5.0, 5.0, 5.0);   // between baseline and window: ignored by both
+        add(-0.155, 5.0, 5.0, 5.0);   // before the baseline: ignored
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.valid && near(r.peak, 0.2, 1e-12) && r.baselineCount == 12 && r.windowCount == 5,
+              "window edges (" + std::to_string(r.peak) + ")");
+        grid();
+        add(-0.150, 0.14, 0.0, -1.0); // baseline edges included: mean x = 0.14 / 14
+        add(-0.030, 0.0, 0.0, -1.0);
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.baselineCount == 14 && near(r.peak, 0.01, 1e-12), "baseline edges, mean removed");
+        // Gravity in any direction is removed: a tilted phone at rest has no impact.
+        s.clear();
+        for (int k = -20; k <= 1; ++k) add(k * 0.01 + 0.005, 0.6, -0.8, 0.0);
+        r = computeImpact(s.data(), (int)s.size(), t, now);
+        check(r.valid && near(r.peak, 0.0, 1e-12), "tilted at rest");
+        // A sample newer than now is not used.
+        grid();
+        add(0.016, 9.0, 0.0, 0.0);
+        r = computeImpact(s.data(), (int)s.size(), t, t + 0.0155);
+        check(r.valid && near(r.peak, 0.0) && r.ageSec == 0.0, "samples after now ignored");
+    }
+    // ── Staleness and empty windows ──
+    {
+        grid();
+        const double newest = t + 0.015;
+        check(computeImpact(s.data(), (int)s.size(), t, newest + 0.099).valid, "99 ms old: valid");
+        Impact r = computeImpact(s.data(), (int)s.size(), t, newest + 0.101);
+        check(!r.valid && r.hasSamples && near(r.ageSec, 0.101, 1e-9), "101 ms old: invalid, age reported");
+        r = computeImpact(nullptr, 0, t, t);
+        check(!r.valid && !r.hasSamples, "no samples: invalid");
+        s.clear();
+        for (int k = -2; k <= 1; ++k) add(k * 0.01 + 0.005, 0, 0, -1);
+        check(!computeImpact(s.data(), (int)s.size(), t, now).valid, "no baseline: invalid");
+        s.clear();
+        for (int k = -20; k <= -3; ++k) add(k * 0.01 + 0.005, 0, 0, -1);
+        r = computeImpact(s.data(), (int)s.size(), t, t - 0.022);
+        check(!r.valid && r.windowCount == 0 && r.baselineCount == 12, "empty impact window: invalid");
+    }
+    // ── impactLate: pending until its window closes; the peak in [t, t + 50 ms] ──
+    {
+        grid();
+        check(computeImpactLate(s.data(), (int)s.size(), t).pending, "late: pending");
+        for (int k = 2; k <= 7; ++k) add(k * 0.01 + 0.005, 0, 0, -1);
+        add(0.03, 0.4, 0.0, -1.0);
+        add(0.055, 3.0, 0.0, -1.0); // after the window
+        add(-0.01, 0.9, 0.0, -1.0); // before the touch
+        Impact late = computeImpactLate(s.data(), (int)s.size(), t);
+        check(!late.pending && late.valid && near(late.peak, 0.4, 1e-12), "late: peak in [t, t+50 ms]");
+        check(!computeImpactLate(nullptr, 0, t).valid, "late: no samples");
+    }
+    // ── Measured rate ──
+    {
+        grid();
+        check(near(measuredHz(s.data(), (int)s.size(), now), 100.0, 1e-6), "measured 100 Hz");
+        check(measuredHz(s.data(), 1, t) == 0.0 && measuredHz(s.data(), (int)s.size(), t + 5.0) == 0.0, "measured 0");
+    }
+
+    // ── Strength: force path, blend weights ──
+    const Calibration cal;            // 20→34 pt, 0.02→0.25 g, 0.4 / 0.6
+    Impact valid; valid.valid = true;
+    Impact none;
+    auto touch = [](double radius, double force = 0.0, double maxForce = 0.0) {
+        TouchInput in;
+        in.radius = radius;
+        in.radiusTolerance = 2.0;
+        in.force = force;
+        in.maxForce = maxForce;
+        return in;
+    };
+    {
+        valid.peak = 0.25;
+        check(near(strengthOf(touch(10, 3.0, 6.0), valid, cal), 0.5), "force alone (radius/impact ignored)");
+        check(near(strengthOf(touch(50, 9.0, 6.0), none, cal), 1.0), "force clamped to 1");
+        check(near(strengthOf(touch(27, 0.0, 6.0), valid, cal), 0.0), "force 0 is valid");
+        check(near(strengthOf(touch(27, NAN, 6.0), none, cal), 0.5), "non-finite force: blend");
+        check(near(strengthOf(touch(27), valid, cal), (0.4 * 0.5 + 0.6 * 1.0) / 1.0), "blend radius 0.5 + impact 1");
+        valid.peak = std::sqrt(0.02 * 0.25);
+        check(near(strengthOf(touch(34), valid, cal), 0.4 * 1.0 + 0.6 * 0.5, 1e-12), "impact on a log scale");
+        check(near(strengthOf(touch(27), none, cal), 0.5), "invalid impact: radius alone");
+        Calibration impactOnly = cal; impactOnly.radiusWeight = 0.0;
+        valid.peak = 0.25;
+        check(near(strengthOf(touch(20), valid, impactOnly), 1.0), "radius weight 0: impact alone");
+        check(near(strengthOf(touch(34), none, impactOnly), 0.5), "nothing usable: 0.5");
+        Calibration radiusOnly = cal; radiusOnly.impactWeight = 0.0;
+        check(near(strengthOf(touch(34), valid, radiusOnly), 1.0), "impact weight 0: radius alone");
+        check(near(strengthOf(touch(NAN), valid, cal), 1.0), "invalid radius: impact alone");
+        Calibration skew = cal; skew.radiusWeight = 1.0; skew.impactWeight = 0.25;
+        valid.peak = 0.02;
+        check(near(strengthOf(touch(34), valid, skew), 1.0 / 1.25), "weights are relative");
+    }
+    // ── Curves, min / max, clamping ──
+    {
+        Settings normal;
+        Settings soft; soft.curve = Curve::Soft;
+        Settings hard; hard.curve = Curve::Hard;
+        check(velocityFor(0.0, normal) == 20 && velocityFor(1.0, normal) == 127, "normal ends 20 / 127");
+        check(velocityFor(0.5, normal) == (int)std::lround(20 + 107 * 0.5), "normal linear");
+        check(velocityFor(0.25, soft) == (int)std::lround(20 + 107 * std::pow(0.25, 0.6)), "soft gamma 0.6");
+        check(velocityFor(0.25, hard) == (int)std::lround(20 + 107 * std::pow(0.25, 1.6)), "hard gamma 1.6");
+        bool ordered = true;
+        for (int i = 1; i < 20; ++i) {
+            const double st = i / 20.0;
+            ordered = ordered && velocityFor(st, soft) >= velocityFor(st, normal) && velocityFor(st, normal) >= velocityFor(st, hard);
+        }
+        check(ordered, "soft >= normal >= hard");
+        check(velocityFor(0.0, soft) == 20 && velocityFor(1.0, hard) == 127, "curves share the ends");
+        check(velocityFor(2.0, normal) == 127 && velocityFor(-1.0, normal) == 20 && velocityFor(NAN, normal) == 20,
+              "strength clamped");
+        Settings range; range.minVelocity = 1; range.maxVelocity = 64;
+        check(velocityFor(0.0, range) == 1 && velocityFor(1.0, range) == 64, "min 1 / max 64");
+        Settings flat; flat.minVelocity = 90; flat.maxVelocity = 90;
+        check(velocityFor(0.0, flat) == 90 && velocityFor(1.0, flat) == 90, "min == max");
+        Settings swapped; swapped.minVelocity = 100; swapped.maxVelocity = 30;
+        orderVelocityBounds(swapped);
+        check(swapped.minVelocity == 30 && swapped.maxVelocity == 100, "bounds swapped into order");
+        Settings wild; wild.minVelocity = -5; wild.maxVelocity = 500;
+        orderVelocityBounds(wild);
+        check(wild.minVelocity == 1 && wild.maxVelocity == 127, "bounds clamped to 1-127");
+        check(sanitizeVelocity(NAN, 20) == 20 && sanitizeVelocity(0, 20) == 1 && sanitizeVelocity(300, 20) == 127
+                  && sanitizeVelocity(63.6, 20) == 64, "sanitizeVelocity");
+        check(curveGamma(Curve::Soft) == 0.6 && curveGamma(Curve::Normal) == 1.0 && curveGamma(Curve::Hard) == 1.6,
+              "gammas");
+        Calibration in;
+        in.radiusSoft = NAN; in.radiusHard = 1000.0; in.impactSoft = 0.0; in.impactHard = INFINITY;
+        in.radiusWeight = 3.0; in.impactWeight = -1.0;
+        Calibration c = sanitizeCalibration(in);
+        check(c.radiusSoft == 20.0 && c.radiusHard == kRadiusMax && c.impactSoft == kImpactMin && c.impactHard == 0.25
+                  && c.radiusWeight == 1.0 && c.impactWeight == 0.0, "sanitizeCalibration clamps / defaults");
+        Calibration inverted; inverted.radiusSoft = 30.0; inverted.radiusHard = 30.0; inverted.impactSoft = 0.3;
+        inverted.impactHard = 0.1;
+        c = sanitizeCalibration(inverted);
+        check(c.radiusWeight == 0.0 && c.impactWeight == 0.0, "hard not above soft: weight 0");
+        check(normLinear(5, 10, 10) == 0.0 && normLog(0.5, 0.0, 1.0) == 0.0 && normLog(-1, 0.01, 1) == 0.0,
+              "degenerate norms are 0");
+    }
+    // ── Monotonic in each signal ──
+    {
+        Settings st;
+        bool mono = true;
+        int prev = 0;
+        valid.peak = 0.05;
+        for (double r = 5.0; r <= 60.0; r += 0.5) {
+            const int v = velocityFor(strengthOf(touch(r), valid, st.calibration), st);
+            mono = mono && v >= prev;
+            prev = v;
+        }
+        check(mono && prev == velocityFor(strengthOf(touch(34), valid, st.calibration), st), "monotonic in radius");
+        mono = true;
+        prev = 0;
+        for (double g = 0.001; g <= 2.0; g *= 1.1) {
+            valid.peak = g;
+            const int v = velocityFor(strengthOf(touch(25), valid, st.calibration), st);
+            mono = mono && v >= prev;
+            prev = v;
+        }
+        check(mono, "monotonic in impact");
+        mono = true;
+        prev = 0;
+        for (double f = 0.0; f <= 7.0; f += 0.1) {
+            const int v = velocityFor(strengthOf(touch(25, f, 6.67), none, st.calibration), st);
+            mono = mono && v >= prev;
+            prev = v;
+        }
+        check(mono && prev == 127, "monotonic in force");
+    }
+    // ── Strongest of several touches ──
+    {
+        Settings st;
+        const TouchInput touches[3] = {touch(22), touch(31), touch(25)};
+        Estimate e = estimate(touches, 3, none, st);
+        check(e.touch.radius == 31 && e.velocity == velocityFor(strengthOf(touch(31), none, st.calibration), st)
+                  && !e.forceUsed, "strongest touch");
+        TouchInput tie[2] = {touch(30), touch(30)};
+        tie[1].radiusTolerance = 9.0;
+        e = estimate(tie, 2, none, st);
+        check(e.touch.radius == 30 && e.touch.radiusTolerance == 2.0, "tie: first");
+        e = estimate(nullptr, 0, none, st);
+        check(e.velocity == velocityFor(0.5, st), "no touches: middle strength");
+        const TouchInput forced[2] = {touch(40), touch(10, 1.0, 2.0)};
+        e = estimate(forced, 2, none, st);
+        check(e.forceUsed == false && e.touch.radius == 40, "force touch weaker than a big radius loses");
+    }
+    // ── Recent log ──
+    {
+        static RecentLog log;
+        check(log.size() == 0, "log empty");
+        for (int i = 0; i < 20; ++i) {
+            Record r;
+            r.touchT = i;
+            log.push(r);
+        }
+        check(log.size() == 16 && log.total() == 20 && log.at(0).touchT == 4 && log.at(15).touchT == 19, "log keeps 16");
+    }
+
+    const bool pass = failed == 0;
+    std::printf("tv    touch velocity: ring wrap / torn reads / concurrent (%llu reads, %llu samples), windows,"
+                " stale, late, force, blend, curves, bounds, monotonic  %-4s %d failed checks%s\n",
+                (unsigned long long)stressReads, (unsigned long long)stressSamples, pass ? "PASS" : "FAIL", failed,
+                detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
+// src/touchVelocity.ts lists the same defaults as touchvel::Settings / Calibration.
+static bool runTouchVelocityDefaultsMatchJs() {
+    const juce::File file(juce::String(HARNESS_JS_SRC) + "/touchVelocity.ts");
+    const juce::String body = file.loadFileAsString()
+                                  .fromFirstOccurrenceOf("export const TOUCH_VELOCITY_DEFAULTS", false, false)
+                                  .fromFirstOccurrenceOf("= {", false, false)
+                                  .upToFirstOccurrenceOf("};", false, false);
+    juce::StringArray lines;
+    lines.addLines(body);
+    auto value = [&](const char* key, bool& found) {
+        for (const juce::String& line : lines) {
+            const juce::String l = line.trim();
+            if (l.upToFirstOccurrenceOf(":", false, false).trim() == key) {
+                found = true;
+                return l.fromFirstOccurrenceOf(":", false, false).trim().trimCharactersAtEnd(",").trim();
+            }
+        }
+        found = false;
+        return juce::String();
+    };
+    int mismatches = 0;
+    std::string detail;
+    auto num = [&](const char* key, double want) {
+        bool found = false;
+        const juce::String v = value(key, found);
+        if (!found || std::fabs(v.getDoubleValue() - want) > 1e-9) { ++mismatches; detail += std::string(" ") + key; }
+    };
+    const touchvel::Settings s;
+    const touchvel::Calibration& c = s.calibration;
+    num("minVelocity", s.minVelocity);
+    num("maxVelocity", s.maxVelocity);
+    num("radiusSoft", c.radiusSoft);
+    num("radiusHard", c.radiusHard);
+    num("impactSoft", c.impactSoft);
+    num("impactHard", c.impactHard);
+    num("radiusWeight", c.radiusWeight);
+    num("impactWeight", c.impactWeight);
+    bool found = false;
+    if (value("curve", found) != "'normal'" || !found || s.curve != touchvel::Curve::Normal) {
+        ++mismatches;
+        detail += " curve";
+    }
+    const bool pass = mismatches == 0 && body.isNotEmpty();
+    std::printf("tvd   touch velocity defaults: src/touchVelocity.ts == TouchVelocity.h  %-4s%s\n",
+                pass ? "PASS" : "FAIL", detail.c_str());
+    std::fflush(stdout);
+    return pass;
+}
+
 // Only the cases named on the command line run (none: every case).
 static std::vector<std::string> gOnlyCases;
 static bool want(const char* id) {
@@ -6148,6 +6514,8 @@ int main(int argc, char** argv) {
     if (want("seqv")) unexpected += runSequenceVoices() ? 0 : 1;
     if (want("seqsm")) unexpected += runSequenceSampler() ? 0 : 1;
     if (want("bg")) unexpected += runBackgroundPolicy() ? 0 : 1;
+    if (want("tv")) unexpected += runTouchVelocity() ? 0 : 1;
+    if (want("tvd")) unexpected += runTouchVelocityDefaultsMatchJs() ? 0 : 1;
     if (want("psm")) unexpected += runSynthSmoothing() ? 0 : 1;
     if (want("psmv")) unexpected += runSynthSmoothingVoices() ? 0 : 1;
     std::printf("\npeak/zero/1st-sound are over the 'note held' window; synth# = PolySynth::processBlock calls\n"

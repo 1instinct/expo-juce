@@ -528,6 +528,45 @@ other's touches. Empty, odd-length or fewer than 3 points: the whole view.
 <JucePadView note={62} hitPolygon={[0.5, 0, 1, 0.5, 0.5, 1, 0, 0.5]} style={{ width: 96, height: 96 }} />
 ```
 
+### Touch velocity (0.10.0-rc.3+, iOS)
+
+Pads with `touchVelocity` play each note or hit at a velocity estimated from how hard the touch
+landed, instead of their fixed `velocity`. The estimate is made in the touch handler right before
+the engine call from what is known at that moment, so it adds no latency:
+
+- **force** (`UITouch.force`), alone, on hardware that reports it (3D Touch, Apple Pencil);
+- otherwise a weighted blend of the **contact radius** (`UITouch.majorRadius`) and the **device
+  impact** (the accelerometer's peak deviation from its short pre-touch baseline, at 100 Hz).
+  Without fresh accelerometer samples (simulator, off) the radius carries the note alone.
+
+```tsx
+import { JucePadView, hasTouchVelocity, setTouchVelocity, calibrateTouchVelocity } from 'expo-juce';
+
+if (hasTouchVelocity()) {
+  setTouchVelocity({ enabled: true, curve: 'normal', minVelocity: 20, maxVelocity: 127, calibration: null });
+}
+
+<JucePadView note={60} velocity={100} touchVelocity onNoteOn={(e) => console.log(e.velocity, e.touch)} />
+```
+
+`setTouchVelocity(config)` replaces the whole configuration (omitted fields take their defaults,
+numbers are clamped natively): `curve` `'soft' | 'normal' | 'hard'` (γ 0.6 / 1.0 / 1.6 in
+`min + (max − min) · strength^γ`), `minVelocity` (default 20) and `maxVelocity` (default 127),
+`calibration`. Disabled, every pad plays its fixed `velocity`. The accelerometer runs only while
+touch velocity is enabled and a pad with `touchVelocity` is in a window, and stops in the
+background; it needs no Info.plist entry. `onNoteOn` carries `touch` (`TouchSignals`: `radius`,
+`radiusTolerance`, `force`, `maxForce`, `impact` (g or null), `accelAgeMs`, `strength`) whenever
+the velocity was estimated.
+
+**Calibration:** collect the `touch` of a few soft taps and a few hard ones, then
+`calibrateTouchVelocity(soft, hard)` (pure TS) returns a calibration to pass to
+`setTouchVelocity`: each signal's soft and hard medians become its ends, and a signal whose hard
+median is less than 15 % above its soft one gets weight 0. It returns null when neither signal
+separates. `TOUCH_VELOCITY_DEFAULTS` holds the uncalibrated defaults. Android, web and older
+binaries: `hasTouchVelocity()` and `setTouchVelocity` return false and pads play `velocity`.
+
+Details (windows, blend, diagnostics `touchVelocity`): [docs/touch-velocity.md](docs/touch-velocity.md).
+
 ### MIDI byte input (0.9.0-rc.2+, iOS)
 
 For MIDI that arrives in the app's own native code, such as a Bluetooth LE notification callback
@@ -858,6 +897,7 @@ its own translation unit (`ios/JuceModule_*.mm`); `ios/JuceConfig.h` holds the m
 - [docs/latency.md](docs/latency.md) — latency budget, signal path, changes, panel fields, slow-motion measurement
 - [docs/drums.md](docs/drums.md) — drum voices: models, parameters, realtime rules
 - [docs/sampler.md](docs/sampler.md) — sampler: voices, loading and hand-off, realtime rules
+- [docs/touch-velocity.md](docs/touch-velocity.md) — touch velocity: signals, estimator, calibration, diagnostics
 - [CHANGELOG.md](CHANGELOG.md)
 - [test/harness/README.md](test/harness/README.md) — the offline engine harness
 

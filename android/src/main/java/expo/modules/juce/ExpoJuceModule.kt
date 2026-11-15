@@ -219,6 +219,11 @@ class ExpoJuceModule : Module() {
 
     // No display-rate hint on Android: setDisplayRateHint does nothing and returns false.
     Function("setDisplayRateHint") { _: Double -> false }
+
+    // No touch velocity on Android: pads play their fixed velocity.
+    Function("hasTouchVelocity") { false }
+
+    Function("setTouchVelocity") { _: Map<String, Any?> -> false }
   }
 
   // Runs block on the main thread: now if this is it, else posted.

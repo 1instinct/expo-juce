@@ -490,6 +490,19 @@ public class ExpoJuceModule: Module {
       return true
     }
 
+    // ── Touch velocity (0.10.0-rc.3) ───────────────────────────────
+    // Pads with touchVelocity estimate each touch-down's velocity (ExpoJuceTouchVelocity).
+
+    Function("hasTouchVelocity") { () -> Bool in
+      return true
+    }
+
+    // config: { enabled, curve?, minVelocity?, maxVelocity?, calibration? }; validated and clamped
+    // natively (omitted or invalid fields take their defaults).
+    Function("setTouchVelocity") { (config: [String: Any]) -> Bool in
+      return ExpoJuceTouchVelocity.setConfig(config)
+    }
+
     // Native touch pad (see JucePadView.swift). The module's only view, so it is the default
     // view: requireNativeViewManager('ExpoJuce').
     View(JucePadView.self) {
@@ -507,6 +520,11 @@ public class ExpoJuceModule: Module {
 
       Prop("velocity") { (view: JucePadView, velocity: Int?) in
         view.velocity = velocity ?? 100
+      }
+
+      // Estimate the velocity from each touch-down (when setTouchVelocity enabled it); else `velocity`.
+      Prop("touchVelocity") { (view: JucePadView, enabled: Bool?) in
+        view.touchVelocity = enabled ?? false
       }
 
       Prop("enabled") { (view: JucePadView, enabled: Bool?) in
