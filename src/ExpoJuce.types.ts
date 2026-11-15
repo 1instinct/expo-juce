@@ -872,7 +872,7 @@ export type SlowTouchEntry = {
   startedNote: boolean;
   /** `UITouch.gestureRecognizers` at entry (at most 12). */
   recognizers: SlowTouchRecognizer[];
-  /** `UIApplication.applicationState` at entry: 'active', 'inactive' or 'background'. */
+  /** `UIApplication.applicationState` at entry: 'active', 'inactive', 'background' (or 'unknown'). */
   appState: string;
   /** Seconds from the last didBecomeActive / willResignActive to entry; -1 if none seen since the first pad was created. */
   sinceDidBecomeActiveSec: number;
@@ -890,18 +890,18 @@ export type SlowTouchEntry = {
   /** After the fact: the end's own delivery, handled − `UITouch.timestamp` at the end (ms). */
   endDeliveryMs: number;
   /**
-   * After the fact (about 0.25 s later): the longest main-thread stall (display-link gap over 50 ms)
+   * After the fact (0.2–0.5 s after entry): the longest main-thread stall (display-link gap over 50 ms)
    * overlapping `touchTimestamp` … `entryTimestamp` (ms); 0 if none; -1 if the stall probe was not running.
    */
   deliveryGapMs: number;
-  /** As `deliveryGapMs`, over `touchTimestamp` … the end being handled; -1 until the end is seen. */
+  /** As `deliveryGapMs`, over `touchTimestamp` … the end being handled; -1 until the end is seen (and for 0.2–0.5 s after it). */
   lifetimeGapMs: number;
 };
 
 /** A recognizer the slow touch was delivered to. */
 export type SlowTouchRecognizer = {
   class: string;
-  /** 'possible', 'began', 'changed', 'ended', 'cancelled' or 'failed'. */
+  /** 'possible', 'began', 'changed', 'ended', 'cancelled', 'failed' (or 'unknown(n)'). */
   state: string;
   delaysTouchesBegan: boolean;
 };

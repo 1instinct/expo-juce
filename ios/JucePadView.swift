@@ -447,7 +447,8 @@ class JucePadView: ExpoView {
     let now = CACurrentMediaTime()
     var changed = false
     for record in slowTouchLog {
-      guard let touch = record.touch, touches.contains(touch) else {
+      // (The timestamp check skips a touch object UIKit might reuse for a later touch.)
+      guard let touch = record.touch, touches.contains(touch), touch.timestamp >= record.touchTimestamp else {
         continue
       }
       record.touch = nil
@@ -465,8 +466,9 @@ class JucePadView: ExpoView {
     }
   }
 
-  // Reports the log 0.25 s later (at most one pending report): by then the display-link tick that
-  // ends a main-thread stall overlapping the touch has been logged.
+  // Reports the log 0.25 s later (at most one pending report), measuring the gaps whose window
+  // ended gapSettleSec ago or more: by then the display-link tick that ends a main-thread stall
+  // overlapping the touch has been logged. Gaps not yet settled schedule another report.
   private static func scheduleSlowTouchReport() {
     guard !slowTouchReportScheduled else {
       return
@@ -478,21 +480,38 @@ class JucePadView: ExpoView {
     }
   }
 
+  // A gap is measured only once its window ended at least gapSettleSec ago (a touch that arrived
+  // while a report was already scheduled waits for the next one).
+  private static let gapSettleSec: Double = 0.2
+
   private static func publishSlowTouchLog() {
+    let now = CACurrentMediaTime()
+    var waiting = false
     for record in slowTouchLog {
       if !record.deliveryGapMeasured {
-        record.fields["deliveryGapMs"] = ExpoJuceBridge.longestMainThreadGapMs(from: record.touchTimestamp,
-                                                                              to: record.entryTimestamp)
-        record.deliveryGapMeasured = true
+        if now - record.entryTimestamp >= gapSettleSec {
+          record.fields["deliveryGapMs"] = ExpoJuceBridge.longestMainThreadGapMs(from: record.touchTimestamp,
+                                                                                to: record.entryTimestamp)
+          record.deliveryGapMeasured = true
+        } else {
+          waiting = true
+        }
       }
       if !record.lifetimeGapMeasured && record.endTimestamp > 0 {
-        record.fields["lifetimeGapMs"] = ExpoJuceBridge.longestMainThreadGapMs(from: record.touchTimestamp,
-                                                                              to: record.endTimestamp)
-        record.lifetimeGapMeasured = true
+        if now - record.endTimestamp >= gapSettleSec {
+          record.fields["lifetimeGapMs"] = ExpoJuceBridge.longestMainThreadGapMs(from: record.touchTimestamp,
+                                                                                to: record.endTimestamp)
+          record.lifetimeGapMeasured = true
+        } else {
+          waiting = true
+        }
       }
     }
     let entries: [[String: Any]] = slowTouchLog.map { $0.fields }
     ExpoJuceBridge.reportSlowTouchLog(entries)
+    if waiting {
+      scheduleSlowTouchReport()
+    }
   }
 
   private static func phaseName(_ phase: UITouch.Phase) -> String {
