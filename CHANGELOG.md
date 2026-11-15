@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.10.0-rc.2
+
+### Added (iOS)
+
+- **Sampler events in the loop sequence.** `setSequence` takes two more event kinds:
+  `'samplerHit'` (`note` = slot 0–15, released after `length` beats; a gated slot stops there,
+  a one-shot plays on) and `'samplerKey'` (`note` 0–127, on and then off after `length`). They
+  play on the audio thread at their exact sample against the transport, like notes and drum hits,
+  so a sampler part keeps time with the screen locked. The sampler is rendered in segments split
+  at them; no lock or allocation on the audio thread.
+- Holds: live sampler voices (pads, `samplerHit` / `samplerNoteOn` from JS or MIDI) and the
+  sequence's never release each other. `samplerRelease(slot)` / `samplerNoteOff(note)` release
+  only live voices; the sequence's release ends only the voices its own start played (overlapping
+  hits on one slot each end on their own). A live pad on a slot the sequence holds is a second voice.
+- Stopping: transport stop, a jump, a loop-length change, mute, `clearSequence` and `allNotesOff`
+  end every sampler voice the sequence started (gated ones over their release, one-shots over 5
+  ms) and leave live ones. A new sequence releases the gated holds whose event is gone; one-shots
+  play on. The interruption cut and the keepAlive-off silence end the sequence's voices too.
+- `onSequenceNotes` reports `kind: 'samplerHit' | 'samplerKey'` with each start and its release.
+- `hasSequenceSampler()` (true on binaries that play the sampler kinds), `SEQUENCE_EVENT_KINDS`,
+  `validateSequence(sequence)`, `lastSequenceError()` (`{ index, message }` for the last
+  `setSequence` that returned false), and the types `SequenceEventKind` and `SequenceError`.
+  Diagnostics `sequence.rejectedEvent` / `rejectReason`.
+
+### Changed
+
+- `setSequence` refuses the whole sequence (returns `false`, nothing changes) for an unknown
+  kind (before, JS sent it as a synth note), a `samplerHit` slot that is not an integer 0–15, a
+  `samplerKey` that is not an integer 0–127, or sampler events on a binary without them.
+  `lastSequenceError()` names the event. Other invalid events are still skipped (a synth note or
+  drum voice out of range, `length <= 0`, a start outside the loop). A missing `kind` is still
+  `'note'`.
+- Natively (`ExpoJuceAudioEngine setSequenceData`), kinds other than 0–3 refuse the push instead
+  of being skipped.
+- The sampler's level / mute ramp now always takes 256 samples, carried across blocks (it took the
+  first 256 samples of each block, or the whole block when shorter), so a block split at sequence
+  events ramps as a whole one.
+
+### Fixed (iOS)
+
+- `allNotesOff`, the sampler silence and the interruption cut were not applied when nothing had
+  been queued since the previous one (their marks are queue sequence numbers and did not move): a
+  second `allNotesOff` with only the loop sequence playing left its notes sounding and the
+  arpeggiator's latched list in place. Each mark now takes a sequence number of its own.
+
+### Tests
+
+- Harness case `seqsm` (`seqsm_offsets`, `_release`, `_stop`, `_live`, `_mute`, `_smoothing`,
+  `_rt`, `_validate`, `_only`), in `test/harness/seq_sampler_cases.inc`.
+
 ## 0.10.0-rc.1
 
 ### Fixed (iOS)

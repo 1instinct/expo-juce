@@ -5,8 +5,9 @@
 // (test/harness, cases "seq", "seqv", "seqs").
 //
 // A sequence is a loop of `loopBeats` beats holding up to kMaxEvents events: a synth note (note
-// 0–127, velocity 1–127, start and length in beats) or a drum hit (voice 0–8; one-shot, no
-// length). While the transport plays, every event fires once per loop pass at the transport beat
+// 0–127, velocity 1–127, start and length in beats), a drum hit (voice 0–8; one-shot, no
+// length), a sampler pad hit (slot 0–15, released after its length) or a sampler key note (note
+// 0–127, on and then off after its length; 0.10.0-rc.2). While the transport plays, every event fires once per loop pass at the transport beat
 // pass × loopBeats + start, on the exact sample of the block that beat falls in (the first sample
 // at or after it), and a note's release follows at start + length. Beat positions come from the
 // transport, block by block, so tempo changes need nothing special.
@@ -25,7 +26,14 @@
 // is published while notes sound, a sounding note whose event (same start, note and kind) is still
 // in the new sequence keeps sounding with the new event's length; the others are released. Notes
 // of the same pitch are counted: the release of a note goes out only when its last sounding
-// instance ends. A firing window carries from block to block ((previous end, this end]), so an
+// instance ends. Sampler events are not counted: each start carries a tag of its own (Output::tag)
+// and its release names that tag, so it ends exactly the voices that start played. Whenever
+// everything is released (stop, seek, loop length, mute, clear, allNotesOff) after the player has
+// started a sampler event, a SamplerStop output goes out at offset 0 (after that block's releases,
+// before any start): the synth then ends
+// every sampler voice the sequence started, one-shots included (see PolySynthProcessor). A new
+// sequence only releases (a one-shot whose event is gone plays on, as a drum hit does). A firing
+// window carries from block to block ((previous end, this end]), so an
 // event fires exactly once per pass even across tempo changes and chunked blocks.
 //
 // Bounded work per block: at most kMaxBlockStarts starts and kMaxPassesPerBlock loop passes (a
@@ -44,11 +52,20 @@
 namespace seqplay {
 
 enum class EventKind : uint8_t {
-    Note = 0, // a synth note: on at start, off at start + length
-    Drum = 1, // a drum hit (note = voice 0–8): one-shot
+    Note = 0,       // a synth note: on at start, off at start + length
+    Drum = 1,       // a drum hit (note = voice 0–8): one-shot
+    SamplerHit = 2, // a sampler pad hit (note = slot 0–15): released at start + length
+    SamplerKey = 3, // a sampler key note (note 0–127): on at start, off at start + length
+    // Output only, never in a sequence: end every sampler voice the sequence started (offset 0).
+    SamplerStop = 4,
 };
 
 constexpr int kMaxDrumVoice = 8;
+constexpr int kMaxSamplerSlot = 15;
+
+inline bool isSamplerKind(EventKind k) { return k == EventKind::SamplerHit || k == EventKind::SamplerKey; }
+// Kinds with a length: the player holds them from their start to start + length.
+inline bool isHeldKind(EventKind k) { return k == EventKind::Note || isSamplerKind(k); }
 
 struct Event {
     double start = 0.0;  // beats inside the loop, 0 <= start < loopBeats
@@ -66,15 +83,45 @@ constexpr int kMaxEvents = 8192;
 // thousands of passes.
 constexpr double kMinLoopBeats = 1.0 / 64.0;
 
+// Why SequenceStore::set refused a whole sequence because of one event (0.10.0-rc.2): a kind the
+// player does not know, a sampler pad hit's slot outside 0–15 or a sampler key note outside 0–127.
+// Other invalid fields (a start outside the loop, a length <= 0, a synth note or drum voice out of
+// range) only skip that event (sanitizeEvent), as before.
+enum class Reject : uint8_t { None = 0, Kind = 1, SamplerSlot = 2, SamplerKeyNote = 3 };
+
+inline Reject rejectReason(const Event& e) {
+    switch (e.kind) {
+        case EventKind::Note:
+        case EventKind::Drum:
+            return Reject::None;
+        case EventKind::SamplerHit:
+            return e.note > kMaxSamplerSlot ? Reject::SamplerSlot : Reject::None;
+        case EventKind::SamplerKey:
+            return e.note > 127 ? Reject::SamplerKeyNote : Reject::None;
+        default:
+            return Reject::Kind;
+    }
+}
+
+inline const char* rejectText(Reject r) {
+    switch (r) {
+        case Reject::Kind: return "unknown kind";
+        case Reject::SamplerSlot: return "samplerHit slot is not an integer 0-15";
+        case Reject::SamplerKeyNote: return "samplerKey note is not an integer 0-127";
+        default: return "";
+    }
+}
+
 // Checks and clamps one event against loopBeats. False: the event can never play (start outside
-// the loop, non-finite numbers, a note without a positive length, a drum voice outside 0–8).
+// the loop, non-finite numbers, a note or sampler event without a positive length, a drum voice
+// outside 0–8, a sampler slot outside 0–15, an unknown kind).
 inline bool sanitizeEvent(Event& e, double loopBeats) {
     if (!std::isfinite(e.start) || e.start < 0.0 || !(e.start < loopBeats)) return false;
     if (e.kind == EventKind::Drum) {
         if (e.note > kMaxDrumVoice) return false;
         e.length = 0.0;
     } else {
-        if (e.kind != EventKind::Note || e.note > 127) return false;
+        if (!isHeldKind(e.kind) || rejectReason(e) != Reject::None || e.note > 127) return false;
         if (!std::isfinite(e.length) || !(e.length > 0.0)) return false;
     }
     e.velocity = (uint8_t)std::clamp((int)e.velocity, 1, 127);
@@ -96,9 +143,11 @@ struct Sequence {
 
 // What setSequence reports.
 struct SetResult {
-    bool ok = false;  // false: too many events, a bad loop length, or the writer timed out
+    bool ok = false;  // false: too many events, a bad loop length, a rejected event, or the writer timed out
     int accepted = 0; // events published
     int dropped = 0;  // invalid events skipped (sanitizeEvent): they can never play
+    int rejectedIndex = -1; // the first event that refused the whole sequence (rejectReason), -1 = none
+    Reject reason = Reject::None;
 };
 
 // The process-lifetime store the engine keeps (heap-allocated, about 640 KB: two slots of
@@ -113,13 +162,36 @@ public:
     SequenceStore& operator=(const SequenceStore&) = delete;
 
     // Copies `count` events (any order), keeps those sanitizeEvent accepts, sorts them by start and
-    // publishes. With events, loopBeats non-finite or under kMinLoopBeats, or more than kMaxEvents
-    // events: nothing changes, ok = false. count 0 publishes an empty sequence (stops what it plays).
+    // publishes. With events, loopBeats non-finite or under kMinLoopBeats, more than kMaxEvents
+    // events, or an event rejectReason refuses (its index in rejectedIndex): nothing changes, ok =
+    // false. count 0 publishes an empty sequence (stops what it plays). Every call sets what
+    // lastRejectedEvent / lastReject report (one atomic: concurrent calls never mix theirs).
     SetResult set(const Event* in, int count, double loopBeats, double fromBeat = -std::numeric_limits<double>::infinity(),
                   double endBeat = std::numeric_limits<double>::infinity()) {
+        const SetResult r = publish(in, count, loopBeats, fromBeat, endBeat);
+        lastRejectPacked.store(r.rejectedIndex >= 0 ? (r.rejectedIndex << 4) | (int)r.reason : -1, std::memory_order_relaxed);
+        return r;
+    }
+
+    // An empty sequence (stops everything the sequence plays).
+    bool clear() { return set(nullptr, 0, 0.0).ok; }
+
+    void setMuted(bool on) { mutedFlag.store(on, std::memory_order_release); }
+    bool muted() const { return mutedFlag.load(std::memory_order_acquire); }
+
+private:
+    SetResult publish(const Event* in, int count, double loopBeats, double fromBeat, double endBeat) {
         SetResult r;
         if (count < 0 || count > kMaxEvents || (count > 0 && in == nullptr)) return r;
         if (count > 0 && !(std::isfinite(loopBeats) && loopBeats >= kMinLoopBeats)) return r;
+        for (int i = 0; i < count; ++i) {
+            const Reject why = rejectReason(in[i]);
+            if (why != Reject::None) {
+                r.rejectedIndex = i;
+                r.reason = why;
+                return r;
+            }
+        }
         if (!(loopBeats > 0.0) || !std::isfinite(loopBeats)) loopBeats = 0.0;
         if (std::isnan(fromBeat)) fromBeat = -std::numeric_limits<double>::infinity();
         if (std::isnan(endBeat)) endBeat = std::numeric_limits<double>::infinity();
@@ -151,11 +223,7 @@ public:
         return r;
     }
 
-    // An empty sequence (stops everything the sequence plays).
-    bool clear() { return set(nullptr, 0, 0.0).ok; }
-
-    void setMuted(bool on) { mutedFlag.store(on, std::memory_order_release); }
-    bool muted() const { return mutedFlag.load(std::memory_order_acquire); }
+public:
 
     // ── Audio thread ──
 
@@ -171,12 +239,12 @@ public:
     void release() { reading.store(-1, std::memory_order_seq_cst); }
 
     // ── Counters (written by the audio thread or a writer, read anywhere; relaxed) ──
-    std::atomic<uint64_t> notesFired{0};  // note-ons and drum hits the player started
+    std::atomic<uint64_t> notesFired{0};  // note-ons, drum hits and sampler events the player started
     std::atomic<uint64_t> lateFires{0};   // fired more than one sample after their beat
     // Firings lost since launch (cumulative): a start over a block's kMaxBlockStarts, a note over
     // kMaxActive sounding, or passes over kMaxPassesPerBlock. Never a release.
     std::atomic<uint64_t> dropped{0};
-    std::atomic<int> activeNotes{0};      // synth notes the player has sounding
+    std::atomic<int> activeNotes{0};      // synth notes and sampler events the player holds
     std::atomic<bool> firing{false};      // the last block played the sequence (transport on, not muted, events)
     std::atomic<uint64_t> writerTimeouts{0};
 
@@ -185,6 +253,16 @@ public:
     int lastInvalidCount() const { return lastInvalid.load(std::memory_order_relaxed); }
     double loopBeats() const { return publishedLoopBeats.load(std::memory_order_relaxed); }
     uint64_t version() const { return versionCount.load(std::memory_order_relaxed); }
+    // The event the last set() refused the whole sequence for, and why; -1 / None when the last
+    // set() published or failed for another reason (loop length, too many events, writer timeout).
+    int lastRejectedEvent() const {
+        const int p = lastRejectPacked.load(std::memory_order_relaxed);
+        return p < 0 ? -1 : p >> 4;
+    }
+    Reject lastReject() const {
+        const int p = lastRejectPacked.load(std::memory_order_relaxed);
+        return p < 0 ? Reject::None : (Reject)(p & 15);
+    }
 
 private:
     bool waitUntilNotReading(int slot) {
@@ -205,6 +283,7 @@ private:
     std::atomic<int> publishedCount{0};
     std::atomic<int> lastInvalid{0};
     std::atomic<double> publishedLoopBeats{0.0};
+    std::atomic<int> lastRejectPacked{-1}; // (index << 4) | Reject, or -1
     std::mutex writerLock;
 };
 
@@ -217,6 +296,9 @@ struct Output {
     EventKind kind = EventKind::Note;
     bool on = false;
     double atBeat = 0.0; // the transport beat it belongs to (a release on a stop / jump: the block start)
+    // Sampler events: the start's tag (never 0); its release carries the same tag, and the synth
+    // releases only the voices started with it. 0 for notes, drums and SamplerStop.
+    uint32_t tag = 0;
 };
 
 // Notes the player fired, for the app's JS side (onSequenceNotes): one producer (the audio
@@ -230,6 +312,7 @@ public:
     std::atomic<uint64_t> lost{0}; // entries dropped on a full ring
 
     void push(const Output& o) {
+        if (o.kind == EventKind::SamplerStop) return; // internal: not a note of the loop
         if (!listening.load(std::memory_order_relaxed)) return;
         const int wp = writePos.load(std::memory_order_relaxed);
         const int next = (wp + 1) % kCapacity;
@@ -261,12 +344,13 @@ private:
 // The audio-thread half: one per synth (a rebuild starts a new one with nothing sounding).
 class SequencePlayer {
 public:
-    static constexpr int kMaxActive = 256;       // synth notes sounding at once
-    static constexpr int kMaxBlockStarts = 512;  // note-ons and drum hits in one block
+    static constexpr int kMaxActive = 256;       // synth notes and sampler events held at once
+    static constexpr int kMaxBlockStarts = 512;  // note-ons, drum hits and sampler events in one block
     static constexpr int kMaxPassesPerBlock = 1024;
-    // Room for every output one block can make: its starts, and a release for each note that
-    // sounded at the block start or started in it. So a release is never dropped.
-    static constexpr int kMaxOutputs = kMaxBlockStarts + kMaxActive + kMaxBlockStarts;
+    // Room for every output one block can make: its starts, a release for each note or sampler
+    // event held at the block start or started in it, and one SamplerStop. So a release is never
+    // dropped.
+    static constexpr int kMaxOutputs = kMaxBlockStarts + kMaxActive + kMaxBlockStarts + 1;
     // Tolerance, in samples, for a beat that lands on a sample boundary up to rounding.
     static constexpr double kEpsSamples = 1.0e-6;
 
@@ -339,9 +423,11 @@ private:
     struct Active {
         double onBeat; // absolute beat of its start
         double end;    // absolute beat of its release
-        double start;  // its event's start in the loop (identity across a new sequence)
+        double start;  // its event's start in the loop (identity across a new sequence, with kind and note)
         int minOffset; // started in this block at minOffset - 1: not released before minOffset
+        uint32_t tag;  // sampler events: the start's tag; 0 for notes
         uint8_t note;
+        EventKind kind;
     };
     struct Start { double t; const Event* event; };
 
@@ -385,32 +471,43 @@ private:
 
     bool stillSounding(uint8_t note) const {
         for (int i = 0; i < activeCount; ++i)
-            if (active[i].note == note) return true;
+            if (active[i].kind == EventKind::Note && active[i].note == note) return true;
         return false;
     }
 
-    // Ends active[i] (swap-remove) and releases its note unless another instance still sounds.
+    // Ends active[i] (swap-remove) and releases it: a synth note unless another instance of its
+    // pitch still sounds, a sampler event always (by its tag).
     void endActive(int i, int offset, double atBeat) {
-        const uint8_t note = active[i].note;
+        const Active a = active[i];
         active[i] = active[--activeCount];
-        if (!stillSounding(note)) {
+        if (a.kind == EventKind::Note && stillSounding(a.note)) return;
+        Output o;
+        o.offset = offset;
+        o.note = a.note;
+        o.kind = a.kind;
+        o.on = false;
+        o.atBeat = atBeat;
+        o.tag = a.tag;
+        emitRelease(o);
+    }
+
+    void releaseAll(double atBeat) {
+        while (activeCount > 0) endActive(activeCount - 1, 0, atBeat);
+        if (samplerStarted) {
+            // One-shots the sequence started (released or not) and anything else it left on the sampler.
+            samplerStarted = false;
             Output o;
-            o.offset = offset;
-            o.note = note;
-            o.kind = EventKind::Note;
+            o.offset = 0;
+            o.kind = EventKind::SamplerStop;
             o.on = false;
             o.atBeat = atBeat;
             emitRelease(o);
         }
     }
 
-    void releaseAll(double atBeat) {
-        while (activeCount > 0) endActive(activeCount - 1, 0, atBeat);
-    }
-
     void reconcile(const Sequence* seq, double b0) {
         for (int i = 0; i < activeCount;) {
-            const Event* match = seq != nullptr ? findNote(*seq, active[i].start, active[i].note) : nullptr;
+            const Event* match = seq != nullptr ? findEvent(*seq, active[i].start, active[i].kind, active[i].note) : nullptr;
             if (match != nullptr) {
                 active[i].end = active[i].onBeat + match->length;
                 ++i;
@@ -420,13 +517,13 @@ private:
         }
     }
 
-    // The synth-note event at `start` playing `note`, if any (events are sorted by start).
-    static const Event* findNote(const Sequence& seq, double start, uint8_t note) {
+    // The event of `kind` at `start` playing `note`, if any (events are sorted by start).
+    static const Event* findEvent(const Sequence& seq, double start, EventKind kind, uint8_t note) {
         const Event* first = seq.events;
         const Event* last = seq.events + seq.count;
         const Event* it = std::lower_bound(first, last, start, [](const Event& e, double s) { return e.start < s; });
         for (; it != last && it->start == start; ++it)
-            if (it->kind == EventKind::Note && it->note == note) return it;
+            if (it->kind == kind && it->note == note) return it;
         return nullptr;
     }
 
@@ -515,10 +612,15 @@ private:
             if (store) store->dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        if (isSamplerKind(e.kind)) {
+            if (++tagCounter == 0) ++tagCounter; // 0 = no tag
+            o.tag = tagCounter;
+        }
         if (!emitStart(o)) return;
         if (store) store->notesFired.fetch_add(1, std::memory_order_relaxed);
+        if (isSamplerKind(e.kind)) samplerStarted = true;
         // Its release can come later in this block (after its start) or in a later block.
-        active[activeCount++] = { t, t + e.length, e.start, offset + 1, e.note };
+        active[activeCount++] = { t, t + e.length, e.start, offset + 1, o.tag, e.note, e.kind };
     }
 
     SequenceStore* store = nullptr;
@@ -533,8 +635,10 @@ private:
     double lastLoopBeats = 0.0;
     double lastBps = 0.0;
     uint64_t lastVersion = 0;
+    uint32_t tagCounter = 0;
     bool wasFiring = false;
     bool releaseAllRequested = false;
+    bool samplerStarted = false; // a sampler event started since the last SamplerStop
 };
 
 } // namespace seqplay

@@ -50,6 +50,8 @@ import {
   SamplerState,
   SamplerLoadResult,
   SequenceEvent,
+  SequenceEventKind,
+  SequenceError,
   SequenceOptions,
   SequenceNote,
   SequenceNotesBatch,
@@ -694,37 +696,105 @@ export function addBeatListener(listener: (event: BeatEventPayload) => void): Su
 // Jumps (setTransportPosition), stop, a new loop length and allNotesOff release what it holds; a
 // new sequence keeps the notes that are still in it. Older binaries, Android and web lack it:
 // hasSequencePlayer() is false and the setters return false (play the loop from JS there).
+//
+// Sampler events (0.10.0-rc.2, hasSequenceSampler()): 'samplerHit' (slot 0–15, released after its
+// length) and 'samplerKey' (key 0–127, on and then off after its length) play the sampler at their
+// exact sample like notes and drum hits. A live pad, samplerHit / samplerRelease from JS or MIDI and
+// the sequence never release each other's voices (a live pad and the sequence on one slot sound
+// as two voices); stop, a jump, a new loop length, mute, clearSequence and allNotesOff end every
+// sampler voice the sequence started, one-shots included. See docs/sampler.md.
 
 export const SEQUENCE_MAX_EVENTS = 8192;
 const SEQUENCE_STRIDE = 6;
+const SEQUENCE_KIND_CODES: Record<SequenceEventKind, number> = { note: 0, drum: 1, samplerHit: 2, samplerKey: 3 };
+/** The sequence event kinds this JS knows (the binary may not play all: see hasSequenceSampler). */
+export const SEQUENCE_EVENT_KINDS: readonly SequenceEventKind[] = ['note', 'drum', 'samplerHit', 'samplerKey'];
 
 export function hasSequencePlayer(): boolean {
   return typeof ExpoJuceModule?.hasSequencePlayer === 'function' && ExpoJuceModule.hasSequencePlayer() === true;
 }
 
 /**
- * Replaces the loop (atomically: the audio thread never sees half of it). False (nothing changes)
- * without the native player, over SEQUENCE_MAX_EVENTS events or with a loop under 1/64 beat; invalid
- * events (note out of range, length <= 0, start outside the loop) are skipped.
+ * True when the native sequence player plays 'samplerHit' and 'samplerKey' events (0.10.0-rc.2+
+ * binaries, iOS). Elsewhere setSequence refuses a sequence holding them (lastSequenceError says so).
+ */
+export function hasSequenceSampler(): boolean {
+  return (
+    hasSequencePlayer() &&
+    typeof ExpoJuceModule?.hasSequenceSampler === 'function' &&
+    ExpoJuceModule.hasSequenceSampler() === true
+  );
+}
+
+/**
+ * Checks what refuses a whole sequence: an unknown kind (a missing kind is 'note', as before), a
+ * samplerHit slot that is not an integer 0–15, a samplerKey that is not an integer 0–127. Other
+ * invalid fields (start outside the loop, length <= 0, a synth note or drum voice out of range)
+ * do not refuse it: setSequence skips those events, as it always has. Null when nothing refuses it.
+ */
+export function validateSequence(sequence: SequenceOptions): SequenceError | null {
+  const events = sequence.events ?? [];
+  if (events.length > SEQUENCE_MAX_EVENTS)
+    return { index: -1, message: `${events.length} events, over SEQUENCE_MAX_EVENTS (${SEQUENCE_MAX_EVENTS})` };
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    const kind = e.kind === undefined ? 'note' : e.kind;
+    if (!Object.prototype.hasOwnProperty.call(SEQUENCE_KIND_CODES, kind))
+      return { index: i, message: `events[${i}]: unknown kind ${JSON.stringify(e.kind)}` };
+    if (kind === 'samplerHit' && !(Number.isInteger(e.note) && e.note >= 0 && e.note <= 15))
+      return { index: i, message: `events[${i}]: samplerHit slot ${e.note} is not an integer 0-15` };
+    if (kind === 'samplerKey' && !(Number.isInteger(e.note) && e.note >= 0 && e.note <= 127))
+      return { index: i, message: `events[${i}]: samplerKey note ${e.note} is not an integer 0-127` };
+  }
+  return null;
+}
+
+let lastSequenceErrorValue: SequenceError | null = null;
+
+/** Why the last setSequence returned false (null after one that returned true). */
+export function lastSequenceError(): SequenceError | null {
+  return lastSequenceErrorValue;
+}
+
+function refuseSequence(index: number, message: string): false {
+  lastSequenceErrorValue = { index, message };
+  return false;
+}
+
+/**
+ * Replaces the loop (atomically: the audio thread never sees half of it). False (nothing changes,
+ * lastSequenceError() says why) without the native player, over SEQUENCE_MAX_EVENTS events, with a
+ * loop under 1/64 beat, with an event validateSequence refuses (unknown kind, sampler slot or key
+ * out of range), or with sampler events on a binary without hasSequenceSampler(). Other invalid
+ * events (note or drum voice out of range, length <= 0, start outside the loop) are skipped.
  */
 export function setSequence(sequence: SequenceOptions): boolean {
-  if (typeof ExpoJuceModule?.setSequence !== 'function') return false;
+  if (typeof ExpoJuceModule?.setSequence !== 'function') return refuseSequence(-1, 'no native sequence player');
+  const invalid = validateSequence(sequence);
+  if (invalid) return refuseSequence(invalid.index, invalid.message);
   const events = sequence.events ?? [];
-  if (events.length > SEQUENCE_MAX_EVENTS) return false;
   const data = new Array<number>(events.length * SEQUENCE_STRIDE);
+  let samplerAt = -1;
   for (let i = 0; i < events.length; i++) {
     const e = events[i];
     const o = i * SEQUENCE_STRIDE;
+    const code = SEQUENCE_KIND_CODES[e.kind === undefined ? 'note' : e.kind];
+    if (code >= 2 && samplerAt < 0) samplerAt = i;
     data[o] = e.start;
     data[o + 1] = e.length;
     data[o + 2] = e.note;
     data[o + 3] = e.velocity;
-    data[o + 4] = e.kind === 'drum' ? 1 : 0;
+    data[o + 4] = code;
     data[o + 5] = typeof e.skipBefore === 'number' ? e.skipBefore : NaN;
   }
+  // An older binary would skip the sampler events in silence: refuse instead.
+  if (samplerAt >= 0 && !hasSequenceSampler())
+    return refuseSequence(samplerAt, `events[${samplerAt}]: this binary's sequence player has no sampler events`);
   const fromBeat = typeof sequence.fromBeat === 'number' ? sequence.fromBeat : -Infinity;
   const endBeat = typeof sequence.endBeat === 'number' ? sequence.endBeat : Infinity;
-  if (ExpoJuceModule.setSequence(data, sequence.loopBeats, fromBeat, endBeat) !== true) return false;
+  if (ExpoJuceModule.setSequence(data, sequence.loopBeats, fromBeat, endBeat) !== true)
+    return refuseSequence(-1, 'refused by the native player (a loop under 1/64 beat with events, or a busy writer)');
+  lastSequenceErrorValue = null;
   if (sequence.muted !== undefined) setSequenceMuted(sequence.muted);
   return true;
 }
@@ -866,6 +936,8 @@ export {
   SamplerState,
   SamplerLoadResult,
   SequenceEvent,
+  SequenceEventKind,
+  SequenceError,
   SequenceOptions,
   SequenceNote,
   SequenceNotesBatch,

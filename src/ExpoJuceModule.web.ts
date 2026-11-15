@@ -95,6 +95,10 @@ export default {
   hasSampler(): boolean {
     return false;
   },
+  // No sequence player on web (setSequence returns false), so no sampler events in it either.
+  hasSequenceSampler(): boolean {
+    return false;
+  },
   async loadSamplerSlot(_slot: number, _uri: string, _params: NativeSamplerSlotParams | null): Promise<SamplerLoadResult> {
     const error = new Error('the sampler is not supported on web');
     (error as Error & { code?: string }).code = 'ERR_UNSUPPORTED';

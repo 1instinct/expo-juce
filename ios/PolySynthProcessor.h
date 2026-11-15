@@ -160,10 +160,12 @@ public:
     // store while the transport plays, at sample offsets inside the block. Its synth notes start
     // voices of their own (VoiceSource::Sequence: a player release never stops them, their release
     // never stops a player's note); with the arpeggiator enabled they feed the arpeggiator instead,
-    // as player notes do. Its drum hits trigger the drum part at their offsets. The engine attaches
-    // its process-lifetime store and note log (no store: the player plays nothing). Its events never
-    // reach the sampler (a sequence has note and drum events only; pads in sampler mode hit the
-    // sampler directly), and stopping it leaves sampler voices alone.
+    // as player notes do. Its drum hits trigger the drum part at their offsets. Its sampler pad hits
+    // and key notes (0.10.0-rc.2) start sampler voices tagged as the sequence's at their offsets
+    // (never through the arpeggiator); their releases end only those voices, and stopping the
+    // sequence ends every sampler voice it started, one-shots included, leaving live (pad, JS,
+    // MIDI) sampler voices alone (applySamplerSequenceOutput). The engine attaches its
+    // process-lifetime store and note log (no store: the player plays nothing).
     void setSequenceStore(seqplay::SequenceStore* s) { sequencer.setStore(s); }
     void setSequenceNoteLog(seqplay::NoteLog* log) { sequenceLog = log; }
     const seqplay::SequencePlayer& sequence() const { return sequencer; }
@@ -190,6 +192,7 @@ private:
     void renderVoices(float* mono, int numSamples, Waveform wf);
     void applyArpEvent(const ArpEvent& event);
     void applySequenceOutput(const seqplay::Output& out);
+    void applySamplerSequenceOutput(const seqplay::Output& out);
     SynthParamTargets loadTargets() const;
 
     Voice voices[MAX_VOICES];

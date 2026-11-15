@@ -552,23 +552,48 @@ export type AudioDiagnostics = {
 
 // ── Loop sequence (0.9.0-rc.5, iOS) ──────────────────────────────
 
+/**
+ * What a sequence event plays:
+ * - 'note': a synth note (through the arpeggiator when it is on), on at `start`, off after `length`;
+ * - 'drum': a drum voice hit (one-shot);
+ * - 'samplerHit' (0.10.0-rc.2): a sampler pad hit on slot `note` (0–15), released after
+ *   `length` (a gated slot stops there, a one-shot slot plays on);
+ * - 'samplerKey' (0.10.0-rc.2): a sampler key note `note` (0–127) on every slot whose key zone
+ *   holds it, on at `start`, off after `length`.
+ */
+export type SequenceEventKind = 'note' | 'drum' | 'samplerHit' | 'samplerKey';
+
 /** One event of the loop the native sequence player plays (setSequence). */
 export type SequenceEvent = {
-  /** 'note': a synth note (through the arpeggiator when it is on); 'drum': a drum voice hit. */
-  kind: 'note' | 'drum';
-  /** MIDI note 0–127, or the drum voice 0–8. */
+  /** Required here; an event without one (JS from before the kinds) plays as 'note'. */
+  kind: SequenceEventKind;
+  /** MIDI note 0–127, the drum voice 0–8, the sampler slot 0–15 (samplerHit) or key 0–127 (samplerKey). */
   note: number;
   /** 1–127. */
   velocity: number;
   /** Beats from the loop start, 0 <= start < loopBeats. */
   start: number;
-  /** Beats (> 0). Ignored for drums (a hit). */
+  /**
+   * Beats (> 0). Ignored for drums (a hit). For samplerHit: beats until the slot is released (a
+   * one-shot slot plays on, but still needs a length > 0); for samplerKey: beats until key off. A
+   * note or sampler event with length <= 0 is skipped (diagnostics `sequence.invalidEvents`).
+   */
   length: number;
   /**
    * Absolute transport beat before which this event does not fire (it fires from its next
    * occurrence at or after it). For an event the app already played itself.
    */
   skipBefore?: number;
+};
+
+/**
+ * Why setSequence refused a sequence (lastSequenceError / validateSequence). `index` is the event
+ * that caused it (for a binary without sampler events: the first sampler event), or -1 when it is
+ * not about one event (no native player, too many events, refused by the native player).
+ */
+export type SequenceError = {
+  index: number;
+  message: string;
 };
 
 export type SequenceOptions = {
@@ -586,9 +611,13 @@ export type SequenceOptions = {
 
 /** One note the sequence player started or released (in an onSequenceNotes batch). */
 export type SequenceNote = {
+  /** The event's note: MIDI note, drum voice, sampler slot (samplerHit) or sampler key (samplerKey). */
   note: number;
-  kind: 'note' | 'drum';
-  /** True for the start; drums only report starts. */
+  kind: SequenceEventKind;
+  /**
+   * True for the start; drums only report starts. Sampler events report each start's own release
+   * (two overlapping hits on one slot give on, on, off, off), synth notes one off per pitch.
+   */
   on: boolean;
   /** The transport beat it fired at. */
   atBeat: number;
@@ -607,7 +636,7 @@ export type SequenceDiagnostics = {
   /** The player fires notes now (transport playing, events set, not muted). */
   playing: boolean;
   muted: boolean;
-  /** Notes the player holds now. */
+  /** Synth notes and sampler events the player holds now. */
   activeNotes: number;
   notesFired: number;
   /** Notes fired more than a block late (a block that started past the note). */
@@ -619,6 +648,13 @@ export type SequenceDiagnostics = {
   dropped: number;
   /** Invalid events the last accepted setSequence skipped (bad note, length or start). */
   invalidEvents: number;
+  /**
+   * The event that made the last refused setSequence refuse the whole sequence (unknown kind,
+   * sampler slot or key out of range), -1 after one that was taken. 0.10.0-rc.2.
+   */
+  rejectedEvent?: number;
+  /** Why (empty when none). 0.10.0-rc.2. */
+  rejectReason?: string;
   version: number;
   /** onSequenceNotes batches are built (a listener is set). */
   listening: boolean;

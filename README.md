@@ -61,9 +61,9 @@ Synth parameter smoothing: cutoff, resonance, detune, master level and sustain r
 One `FxChainProcessor` node between the synth and the output with nine effects in a fixed order: drive → crush → eq → chorus → phaser → echo → reverb → pump → compressor, then an always-on safety limiter (-0.3 dBFS). Each effect is enabled / bypassed independently (`setEffectEnabled`, `setEffectParam`, `getEffectsState`, see [Effects](#effects-060)); echo sync and pump follow the transport tempo and beat. Also in 0.6.0: an `AuxProcessor` node summed into the output after the effects, with a sample-accurate metronome (5 click styles, bar accent) and a backing track (off-thread decode + resample, gapless MP3 loop regions, lock-free swap, follows transport play / stop / seek; see [Metronome and backing track](#metronome-and-backing-track-060)); `getAnalysis()` (output peak / rms, 128-point scope, last note, transport) for HUDs; a `hitPolygon` touch shape on `JucePadView`. Later: reorderable / per-node effects via modular routing (sub-project 5).
 
 ### Sub-project 3: Sample Playback / Drum Machine
-**Status:** Drum machine in progress (0.8.0-rc.0); sampler in progress (0.10.0-rc.1, iOS) — engine + JS API verified in the offline harness, not yet run on a device
+**Status:** Drum machine in progress (0.8.0-rc.0); sampler in progress (0.10.0-rc.2, iOS) — engine + JS API verified in the offline harness, not yet run on a device
 
-0.8.0 adds a synthesized drum part (kick, snare, closed / open hat, clap, low / mid / high tom, rim; nine voices, the mid tom since 0.8.0-rc.2; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). 0.10.0 adds a sampler in the same synth node: 16 slots of decoded audio files on 32 voices, with key zones, loops, choke groups and a sampler mode on `JucePadView` (see [Sampler](#sampler-0100-ios)). Later: multi-sample velocity layers, transport-sequenced playback, Android.
+0.8.0 adds a synthesized drum part (kick, snare, closed / open hat, clap, low / mid / high tom, rim; nine voices, the mid tom since 0.8.0-rc.2; no sample files) inside the synth node, before the effects chain: `drumHit` through the same lock-free queue as `noteOn`, per-voice tune / decay / tone / level, kit level / mute / drive, and a drums mode on `JucePadView` (see [Drums](#drums-080)). 0.10.0 adds a sampler in the same synth node: 16 slots of decoded audio files on 32 voices, with key zones, loops, choke groups and a sampler mode on `JucePadView` (see [Sampler](#sampler-0100-ios)). The loop sequence plays sampler pad hits and key notes natively since 0.10.0-rc.2. Later: multi-sample velocity layers, Android.
 
 ### Sub-project 4: Audio Input Processing
 **Status:** Planned
@@ -413,7 +413,7 @@ if (ExpoJuce.hasSampler()) {
   clamped to 1–127 (`samplerNoteOn` with velocity 0 is a note-off); an out-of-range slot or note
   is ignored; hits are dropped while the engine is not set up. `allNotesOff()` releases the
   sampler too. `samplerRelease(slot)` is per slot, not per caller: it releases every gated sound a
-  hit on the slot started, including another pad's.
+  hit on the slot started, including another pad's (not the loop sequence's: see below).
 - `setSamplerSlot(slot, params)` (`SamplerSlotParams`; omitted and unknown keys unchanged,
   numbers clamped; `false` for a slot outside 0–15) and `setSampler({ level, mute, polyphony })`.
   Defaults: `SAMPLER_SLOT_DEFAULTS`, `SAMPLER_DEFAULTS`; `SAMPLER_SLOT_COUNT` (16) and
@@ -423,10 +423,15 @@ if (ExpoJuce.hasSampler()) {
   `hasSampler()` is `false`, `loadSamplerSlot` rejects with `ERR_UNSUPPORTED`, the other calls do
   nothing or return `false`, and `getSamplerState()` returns the defaults.
 - `JucePadView` `mode="sampler"`: pad `note` is the slot (see [`JucePadView`](#jucepadview-052)).
-- With the [loop sequence](#loop-sequence-and-background-playback-090-rc5-ios): sequence events
-  never reach the sampler (a sequence holds synth notes and drum hits only), and stopping the
-  transport leaves sampler voices alone; play a sampler part from JS (`samplerHit`) for now.
-  With a background policy, sounding sampler voices keep the engine busy (no idle stop while one
+- With the [loop sequence](#loop-sequence-and-background-playback-090-rc5-ios) (0.10.0-rc.2+):
+  `samplerHit` and `samplerKey` events play the sampler at their exact sample, with the screen
+  locked too (`hasSequenceSampler()`). A live pad (or `samplerHit` / `samplerRelease` from JS or
+  MIDI) and the sequence on the same slot are two voices that never release each other:
+  `samplerRelease(slot)` releases every live holder of the slot but not the sequence's voice, and
+  the sequence's release (after the event's `length`) ends only the voice that event started.
+  Stopping the sequence (stop, a jump, a new loop length, mute, `clearSequence`, `allNotesOff`)
+  ends every sampler voice it started, one-shots included, and leaves live voices alone. With a
+  background policy, sounding sampler voices keep the engine busy (no idle stop while one
   plays). Leaving the app with `keepAlive: false` ends every sampler voice, one-shots included,
   over 5 ms; an interruption (a call, Siri) ends them at once, so a one-shot does not resume
   afterwards. Notes, drum hits and sampler events sent while the device is stopped (an
@@ -599,8 +604,12 @@ if (Juce.hasSequencePlayer()) {
     events: [
       { kind: 'note', note: 60, velocity: 100, start: 0, length: 1 },
       { kind: 'drum', note: 0, velocity: 120, start: 0, length: 0.25 },
+      // 0.10.0-rc.2+, when Juce.hasSequenceSampler(): a pad hit on slot 3, released after 1/2 beat,
+      // and a sampler key note 64 for 1 beat.
+      { kind: 'samplerHit', note: 3, velocity: 110, start: 1, length: 0.5 },
+      { kind: 'samplerKey', note: 64, velocity: 90, start: 2, length: 1 },
     ],
-  });
+  }) || console.warn(Juce.lastSequenceError()); // { index, message }
   Juce.startTransport();
 }
 const sub = Juce.addSequenceNotesListener(({ notes }) => {
@@ -612,8 +621,26 @@ const sub = Juce.addSequenceNotesListener(({ notes }) => {
   returns false. `fromBeat` / `endBeat` bound where it fires (a count-in, a single pass);
   `skipBefore` skips an event the app already played. The loop is at least 1/64 beat.
   `setSequenceMuted`, `clearSequence`.
-- Jumps, stop, a new loop length, `allNotesOff` and muting release everything it started. A pad
-  or MIDI input note and a sequence note of the same pitch do not cut each other.
+- Event kinds (`SequenceEventKind`): `'note'` (synth note 0–127), `'drum'` (voice 0–8, a hit),
+  and since 0.10.0-rc.2 `'samplerHit'` (sampler slot 0–15: a pad hit released after `length`
+  beats; a one-shot slot plays on) and `'samplerKey'` (sampler key 0–127: on, then off after
+  `length`). `hasSequenceSampler()` is true when the binary plays the sampler kinds
+  (`SEQUENCE_EVENT_KINDS` lists what this JS knows).
+- What refuses the whole sequence (`false`, nothing changes, `lastSequenceError()` gives
+  `{ index, message }`, e.g. `events[3]: samplerHit slot 16 is not an integer 0-15`): an
+  unknown kind, a `samplerHit` slot that is not an integer 0–15, a `samplerKey` note that is not
+  an integer 0–127, sampler events on a binary without `hasSequenceSampler()`, too many events,
+  a loop under 1/64 beat. `validateSequence(sequence)` runs the kind, slot, key and event-count
+  checks without sending (not the capability or loop-length ones).
+  Other invalid events (a synth note or drum voice out of range, `length <= 0`, a start outside
+  the loop) are skipped, as before (diagnostics `sequence.invalidEvents`).
+- Jumps, stop, a new loop length, `allNotesOff` and muting release everything it started
+  (sampler one-shots included). A pad or MIDI input note and a sequence note of the same pitch do
+  not cut each other; neither do a live sampler pad or key and a sequence sampler event on the
+  same slot or key (see [Sampler](#sampler-0100-ios)).
+- `onSequenceNotes` reports every kind with its `kind`: sampler events report each start's own
+  release (two overlapping hits on one slot: on, on, off, off), synth notes one off per pitch,
+  drums starts only.
 - With the arpeggiator on, sequence notes go through it; latch holds only the player's notes.
 
 Background playback needs the host app's `audio` background mode. Then:

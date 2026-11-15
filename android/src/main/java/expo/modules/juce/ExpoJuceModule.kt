@@ -15,7 +15,7 @@ import expo.modules.kotlin.modules.ModuleDefinition
  * and the synth parameters. Everything else exists with the iOS "not ready" / defaults shape, so
  * callers written for iOS work unchanged: setters return false (nothing applied), getters return
  * the stored defaults, loadBackingTrack and loadSamplerSlot reject with ERR_UNSUPPORTED, hasDrums,
- * hasSampler and hasJucePadView
+ * hasSampler, hasSequenceSampler and hasJucePadView
  * return false (the JS wrapper then falls back to its non-native paths).
  */
 class ExpoJuceModule : Module() {
@@ -166,6 +166,10 @@ class ExpoJuceModule : Module() {
     // ── Sampler (not on Android yet: hasSampler is false) ──────────
 
     Function("hasSampler") { false }
+
+    // No loop sequence player on Android (setSequence is absent, JS returns false), so no sampler
+    // events in it either.
+    Function("hasSequenceSampler") { false }
 
     AsyncFunction("loadSamplerSlot") { _: Double, _: String, _: Map<String, Any?>?, promise: Promise ->
       promise.reject("ERR_UNSUPPORTED", "the sampler is not supported on Android yet", null)

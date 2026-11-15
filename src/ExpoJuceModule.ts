@@ -110,6 +110,8 @@ export type ExpoJuceNativeModule = {
 
   // Loop sequence (0.9.0-rc.5+, iOS): flat data, 6 numbers per event (see setSequence in index.ts)
   hasSequencePlayer?(): boolean;
+  // 0.10.0-rc.2+: kinds 2 (sampler pad hit) and 3 (sampler key note) are played.
+  hasSequenceSampler?(): boolean;
   setSequence?(data: number[], loopBeats: number, fromBeat: number, endBeat: number): boolean;
   setSequenceMuted?(muted: boolean): void;
   setSequenceNotesListening?(listening: boolean): void;

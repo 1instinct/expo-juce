@@ -6015,6 +6015,8 @@ static bool want(const char* id) {
     return false;
 }
 
+#include "seq_sampler_cases.inc"
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) gOnlyCases.emplace_back(argv[i]);
     // App: MessageManager::getInstance() in a static constructor on the main thread, then
@@ -6125,6 +6127,7 @@ int main(int argc, char** argv) {
     if (want("smd")) unexpected += runSamplerDefaultsMatchJs() ? 0 : 1;
     if (want("seq")) unexpected += runSequence() ? 0 : 1;
     if (want("seqv")) unexpected += runSequenceVoices() ? 0 : 1;
+    if (want("seqsm")) unexpected += runSequenceSampler() ? 0 : 1;
     if (want("bg")) unexpected += runBackgroundPolicy() ? 0 : 1;
     if (want("psm")) unexpected += runSynthSmoothing() ? 0 : 1;
     if (want("psmv")) unexpected += runSynthSmoothingVoices() ? 0 : 1;

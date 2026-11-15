@@ -10,7 +10,7 @@ From this directory, in WSL or any Linux shell:
 
 ```sh
 cmake -S . -B build && cmake --build build -j16 && ./build/harness
-./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, seq, seqv, bg, sm, smb, sml, sms, smq, smrt, smd, psm, psmv)
+./build/harness arp arpv sp   # only the cases named (ids: ctl, a … fx, mp, rs, rl, fx, fxb, …, bt, btt, btf, …, an, arp, arpv, sp, dr, drs, drb, drm, drd, lat, stall, stlog, rate, bsel, broute, mip, mim, mih, mic, own, seq, seqv, seqsm, bg, sm, smb, sml, sms, smq, smrt, smd, psm, psmv)
 ```
 
 `./build/host_test` tests the Android host (`android/src/main/cpp/AndroidEngineHost.cpp`, built from the
@@ -220,6 +220,30 @@ Exit code non-zero on any failure.
   drops is printed, not checked); 0
   allocations), `smd` (`src/samplerDefaults.ts` has the same defaults, slot and
   voice counts as `SamplerEngine.h`).
+- Loop sequence sampler events (0.10.0-rc.2, cases in `seq_sampler_cases.inc`): `seqsm`, through
+  `PolySynthProcessor` (1 s of constant 0.5 in a one-shot and a gated slot, 2000 frames in another
+  one-shot) unless noted: `seqsm_offsets` (the player alone: sampler hits and keys mixed with a
+  note and a drum hit, over odd block sizes, three passes, on and across the loop end, each start
+  on its sample and its release at start + length with the start's tag, no counting, one
+  `SamplerStop` on a stop; through the synth, arp off and on, a 1-beat loop in 471-sample blocks:
+  every onset's first sample is 0.5 with 0 before it, a key's release starts on its sample and is
+  0 after the 1 ms release), `seqsm_release` (gated hit and key released after their length, a
+  one-shot playing past it, two overlapping hits on one slot each ending on their own, note log
+  kinds and beats), `seqsm_stop` (stop, jump, loop-length change, clear and allNotesOff with a
+  gated hold and a one-shot: 0 after the 5 ms fade, no voice; a swap releases the gated hold and
+  lets the one-shot play, a stop then ends it; a swap keeping the event ends it at its new length),
+  `seqsm_live` (arp off and on: a live pad and the sequence on one gated slot, keys on one note,
+  each release leaving the other source's voice, the sequence's stop leaving live pads and
+  one-shots), `seqsm_mute` (mute ends the sequence's voices, not a live one, starts nothing; unmute
+  plays the next pass), `seqsm_smoothing` (a cutoff ramp with sequence notes, with and without
+  sampler events: the same smoothed cutoff after every block, and with − without == sampler
+  alone), `seqsm_rt` (arp off and on: the interruption in the engine's order, cut + a full ring
+  discarded: the first block back exactly 0, nothing busy, a restart plays from its first sample;
+  a cut and a silence with the transport playing end the sequence's voices and the next pass
+  plays; the keepAlive-off background stop), `seqsm_validate` (the store refuses a whole sequence
+  for slot 16, key 255 or an unknown kind and keeps the previous one; other invalid events only
+  skipped), `seqsm_only` (a sampler-only loop: firing, holding, busy for the background policy,
+  the note log's kinds / notes / beats, no `SamplerStop` in it); 0 allocations.
 - Synth parameter smoothing (`ios/SynthParamSmoother.h`): `psm` (`SynthParamSmoother` turns a
   cutoff step into a strictly increasing constant-ratio ramp of exactly 40 ms × sr samples that
   ends on the target, over chunk sizes 64 / 37 / 1; ten steps at 28 Hz make one strictly

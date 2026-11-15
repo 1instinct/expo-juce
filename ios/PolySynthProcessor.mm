@@ -211,12 +211,24 @@ void PolySynthProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
     if (drumPos < numSamples) drumMachine.render(monoBuffer + drumPos, numSamples - drumPos);
 
-    if (buffer.getNumChannels() > 1) {
-        buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
-        // The sampler is stereo: added after the mono parts are copied to both channels. With
-        // nothing sounding it does not touch the buffer.
-        samplerEngine.render(buffer.getWritePointer(0), buffer.getWritePointer(1), numSamples);
+    // The sampler is stereo: added after the mono parts are copied to both channels, split at the
+    // sequence's sampler events so each starts (or releases) on its own sample. With nothing
+    // sounding it does not touch the buffer.
+    const bool stereo = buffer.getNumChannels() > 1;
+    if (stereo) buffer.copyFrom(1, 0, buffer, 0, 0, numSamples);
+    float* samplerL = stereo ? buffer.getWritePointer(0) : nullptr;
+    float* samplerR = stereo ? buffer.getWritePointer(1) : nullptr;
+    int samplerPos = 0;
+    for (int j = 0; j < seqOutputCount; ++j) {
+        const seqplay::Output& out = seqOutputs[j];
+        if (!seqplay::isSamplerKind(out.kind) && out.kind != seqplay::EventKind::SamplerStop) continue;
+        const int at = std::clamp(out.offset, samplerPos, numSamples);
+        if (stereo && at > samplerPos) samplerEngine.render(samplerL + samplerPos, samplerR + samplerPos, at - samplerPos);
+        samplerPos = at;
+        applySamplerSequenceOutput(out);
     }
+    if (stereo && samplerPos < numSamples)
+        samplerEngine.render(samplerL + samplerPos, samplerR + samplerPos, numSamples - samplerPos);
 
     if (analysis != nullptr)
         analysis->publishArp(arpeggiator.currentStep(), arpeggiator.patternLength(), arpeggiator.lastNote(),
@@ -286,6 +298,30 @@ void PolySynthProcessor::applySequenceOutput(const seqplay::Output& out) {
     for (int v = 0; v < MAX_VOICES; v++) {
         if (voices[v].isHeld() && voices[v].source == VoiceSource::Sequence && voices[v].getNoteNumber() == out.note)
             voices[v].stopNote();
+    }
+}
+
+// Audio thread: the loop sequence's sampler events (0.10.0-rc.2). A start plays the slot (pad hit)
+// or the key's zones with the player's tag; its release ends only the voices of that tag, so a live
+// pad or key on the same slot / note is never released by the sequence, nor the sequence's voice
+// by a live release (SamplerEngine skips the other source). SamplerStop (the player released
+// everything: stop, seek, loop length, mute, clear, allNotesOff) ends every voice the sequence
+// started, one-shots included.
+void PolySynthProcessor::applySamplerSequenceOutput(const seqplay::Output& out) {
+    switch (out.kind) {
+        case seqplay::EventKind::SamplerHit:
+            if (out.on) samplerEngine.sequenceHit(out.note, out.velocity, out.tag);
+            else samplerEngine.sequenceRelease(out.tag);
+            break;
+        case seqplay::EventKind::SamplerKey:
+            if (out.on) samplerEngine.sequenceNoteOn(out.note, out.velocity, out.tag);
+            else samplerEngine.sequenceRelease(out.tag);
+            break;
+        case seqplay::EventKind::SamplerStop:
+            samplerEngine.sequenceStop();
+            break;
+        default:
+            break;
     }
 }
 

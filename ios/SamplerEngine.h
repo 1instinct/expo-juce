@@ -21,6 +21,14 @@
 // voice released earliest, else the oldest. A stolen voice, and a voice whose slot changes buffer,
 // stop reading their buffer at once and fade their last output out over kDeclickSamples.
 //
+// Sources (0.10.0-rc.2): a voice is started either live (hit / noteOn: pads, JS, MIDI, through the
+// note queue) or by the loop sequence (sequenceHit / sequenceNoteOn, with the player's tag). The
+// two never release each other: release / noteOff / releaseHeld skip sequence voices, and
+// sequenceRelease(tag) / sequenceStop() touch sequence voices only, so a live pad and the sequence
+// on the same slot sound as two voices, each ended by its own source. They share everything else:
+// polyphony and stealing, choke groups, level / mute, a slot's buffer change, and the engine's
+// silence / cut marks (silenceUpTo / cutUpTo end sequence voices too).
+//
 // Parameters live in a SamplerParamStore: any thread writes it, the audio thread copies a slot's
 // parameters when it starts a voice and at the start of each block (a write in progress keeps
 // the previous copy; the audio thread never waits). Nothing here allocates, locks or blocks on
@@ -250,6 +258,7 @@ struct SamplerVoiceInfo {
     int slot = -1;
     int note = -1; // the key for a note-on, the slot's root note for a hit
     bool releasing = false;
+    bool fromSequence = false; // started by the loop sequence (sequenceHit / sequenceNoteOn)
 };
 
 class SamplerEngine {
@@ -299,6 +308,7 @@ public:
     void reset() {
         for (Voice& v : voices) v = Voice{};
         levelGain = -1.0f; // the first block jumps to its target
+        levelRampLeft = 0;
     }
     double sampleRate() const { return sr; }
 
@@ -337,7 +347,7 @@ public:
         if (slot < 0 || slot >= kSamplerSlots) { diag.ignored.fetch_add(1, std::memory_order_relaxed); return; }
         store->trySnapshot(slot, slots[slot].params);
         const uint32_t event = ++eventCounter;
-        if (startVoice(slot, slots[slot].params.rootNote, velocity, false, seq, event))
+        if (startVoice(slot, slots[slot].params.rootNote, velocity, false, seq, event, 0))
             diag.hits.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -349,20 +359,69 @@ public:
         for (int slot = 0; slot < kSamplerSlots; ++slot) {
             store->trySnapshot(slot, slots[slot].params);
             const SamplerSlotParams& p = slots[slot].params;
-            if (note >= p.lowNote && note <= p.highNote) startVoice(slot, note, velocity, true, seq, event);
+            if (note >= p.lowNote && note <= p.highNote) startVoice(slot, note, velocity, true, seq, event, 0);
         }
     }
 
-    // Releases every gated voice a note-on of `note` started.
+    // Releases every gated voice a live note-on of `note` started (not the sequence's).
     void noteOff(int note) {
         for (Voice& v : voices)
-            if (v.active && v.fromKey && v.note == note) releaseVoice(v);
+            if (v.active && v.seqTag == 0 && v.fromKey && v.note == note) releaseVoice(v);
     }
 
-    // Releases every gated voice a hit on `slot` started.
+    // Releases every gated voice a live hit on `slot` started (not the sequence's).
     void release(int slot) {
         for (Voice& v : voices)
-            if (v.active && !v.fromKey && v.slot == slot) releaseVoice(v);
+            if (v.active && v.seqTag == 0 && !v.fromKey && v.slot == slot) releaseVoice(v);
+    }
+
+    // ── The loop sequence (SequencePlayer.h; audio thread) ──
+    // tag: the player's tag for that start (never 0). The voices take seq 0, so the note queue's
+    // release marks never release them; the engine's silence / cut marks do.
+
+    // A pad hit of the sequence: plays the slot at its root note.
+    void sequenceHit(int slot, int velocity, uint32_t tag) {
+        if (slot < 0 || slot >= kSamplerSlots || tag == 0) { diag.ignored.fetch_add(1, std::memory_order_relaxed); return; }
+        store->trySnapshot(slot, slots[slot].params);
+        const uint32_t event = ++eventCounter;
+        if (startVoice(slot, slots[slot].params.rootNote, velocity, false, 0, event, tag))
+            diag.hits.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // A key note of the sequence: every loaded slot whose zone holds `note`.
+    void sequenceNoteOn(int note, int velocity, uint32_t tag) {
+        if (note < 0 || note > 127 || tag == 0) { diag.ignored.fetch_add(1, std::memory_order_relaxed); return; }
+        diag.noteOns.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t event = ++eventCounter;
+        for (int slot = 0; slot < kSamplerSlots; ++slot) {
+            store->trySnapshot(slot, slots[slot].params);
+            const SamplerSlotParams& p = slots[slot].params;
+            if (note >= p.lowNote && note <= p.highNote) startVoice(slot, note, velocity, true, 0, event, tag);
+        }
+    }
+
+    // The end of that start's length: releases the gated voices it started (one-shots play on).
+    void sequenceRelease(uint32_t tag) {
+        if (tag == 0) return;
+        for (Voice& v : voices)
+            if (v.active && v.seqTag == tag) releaseVoice(v);
+    }
+
+    // The sequence stopped (transport stop, seek, loop length, mute, clear, allNotesOff): every
+    // voice it started ends, gated ones over their release time, one-shots over kSamplerChokeMs.
+    // Live voices are left alone.
+    void sequenceStop() {
+        for (Voice& v : voices) {
+            if (!v.active || v.seqTag == 0) continue;
+            if (v.oneShot) beginRelease(v, kSamplerChokeMs);
+            else releaseVoice(v);
+        }
+    }
+
+    int sequenceVoiceCount() const {
+        int n = 0;
+        for (const Voice& v : voices) n += (v.active && v.seqTag != 0) ? 1 : 0;
+        return n;
     }
 
     // Releases the held gated voices for which isReleased(fromKey, note or slot, seq) is true.
@@ -399,15 +458,25 @@ public:
     }
 
     // Adds the sampler (stereo) into L / R. With nothing sounding the buffers are not touched.
+    // A level or mute change ramps linearly over kChunk samples, carried across calls, so a block
+    // the synth renders in pieces (split at the loop sequence's sampler events) ramps exactly as a
+    // whole one; with nothing sounding, and in the first block after prepare, the level jumps.
     void render(float* L, float* R, int numSamples) {
         const SamplerSettings st = store->settings();
         const float target = st.mute ? 0.0f : st.level;
         bool any = false;
         for (const Voice& v : voices) any = any || v.active || v.tailLeft > 0;
         float blockPeak = 0.0f;
-        if (!any) {
-            levelGain = target;
-        } else {
+        if (!any || levelGain < 0.0f) {
+            levelGain = levelTarget = target;
+            levelRampLeft = 0;
+        }
+        if (target != levelTarget) {
+            levelTarget = target;
+            levelRampLeft = kChunk;
+            levelStep = (target - levelGain) / (float)kChunk;
+        }
+        if (any) {
             for (int done = 0; done < numSamples;) {
                 const int m = std::min(kChunk, numSamples - done);
                 std::fill(scratchL, scratchL + m, 0.0f);
@@ -416,16 +485,14 @@ public:
                     if (v.tailLeft > 0) renderTail(v, m);
                     if (v.active) renderVoice(v, m);
                 }
-                const float g0 = levelGain < 0.0f ? target : levelGain;
-                const float step = (target - g0) / (float)m;
                 for (int i = 0; i < m; ++i) {
-                    const float g = step == 0.0f ? g0 : g0 + step * (float)(i + 1);
+                    if (levelRampLeft > 0) levelGain = --levelRampLeft == 0 ? levelTarget : levelGain + levelStep;
+                    const float g = levelGain;
                     const float l = scratchL[i] * g, r = scratchR[i] * g;
                     L[done + i] += l;
                     R[done + i] += r;
                     blockPeak = std::max(blockPeak, std::max(std::fabs(l), std::fabs(r)));
                 }
-                levelGain = target;
                 done += m;
             }
         }
@@ -442,7 +509,7 @@ public:
     SamplerVoiceInfo voiceInfo(int index) const {
         if (index < 0 || index >= kSamplerVoices) return {};
         const Voice& v = voices[index];
-        return { v.active, v.active ? v.slot : -1, v.active ? v.note : -1, v.active && v.releasing };
+        return { v.active, v.active ? v.slot : -1, v.active ? v.note : -1, v.active && v.releasing, v.active && v.seqTag != 0 };
     }
 
     Diagnostics diag;
@@ -453,6 +520,7 @@ private:
         int slot = -1, note = -1, choke = 0;
         uint64_t seq = 0, order = 0, releaseOrder = 0;
         uint32_t event = 0;
+        uint32_t seqTag = 0; // the loop sequence's tag; 0 = a live voice
         const float* L = nullptr;
         const float* R = nullptr;
         int frames = 0;
@@ -538,7 +606,7 @@ private:
         return best >= 0 ? best : 0;
     }
 
-    bool startVoice(int slot, int note, int velocity, bool fromKey, uint64_t seq, uint32_t event) {
+    bool startVoice(int slot, int note, int velocity, bool fromKey, uint64_t seq, uint32_t event, uint32_t seqTag) {
         if (!isSlotLoaded(slot)) return false;
         const SampleBuffer& b = *slots[slot].buffer;
         const SamplerSlotParams& p = slots[slot].params;
@@ -566,6 +634,7 @@ private:
         v.choke = p.chokeGroup;
         v.seq = seq;
         v.event = event;
+        v.seqTag = seqTag;
         v.order = ++orderCounter;
         v.releaseOrder = 0;
         v.L = b.L;
@@ -674,7 +743,10 @@ private:
     SamplerParamStore* store = &ownStore;
     SamplerBufferSource* source = nullptr;
     double sr = 48000.0;
-    float levelGain = -1.0f;
+    float levelGain = -1.0f;   // the level applied to the last sample (-1: jump to the target)
+    float levelTarget = 0.0f;  // where the ramp goes
+    float levelStep = 0.0f;
+    int levelRampLeft = 0;     // samples left in the ramp
     uint64_t orderCounter = 0;
     uint32_t eventCounter = 0;
     float scratchL[kChunk] = {};
