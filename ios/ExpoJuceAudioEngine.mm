@@ -282,8 +282,9 @@ static void carryXrunsLocked() {
 // sAcceptingNotes). Heap-allocated and never freed, so a call during process exit never finds it
 // destroyed. Events for JS are drained on sMidiInputQueue (serial), at most ~4 ms after the first
 // one of a burst, into one onMidiInput batch; the handler is only touched on that queue.
-// A note-on the sink refuses while the engine is idle-stopped in the background (a Δ8 key through
-// the C entry point, which native BLE code calls directly) wakes the engine.
+// A note-on the sink refuses while the engine is idle-stopped in the background (a hardware
+// controller's key through the C entry point, which an app's native BLE code calls directly)
+// wakes the engine.
 static void wakeEngineForRefusedNote();
 static midiin::NoteQueueSink& sMidiInputSink =
     *new midiin::NoteQueueSink(sNoteQueue, &sAcceptingNotes, wakeEngineForRefusedNote);

@@ -37,7 +37,7 @@ expo-juce/
 │   ├── ExpoJuceView.swift        # Native view
 │   ├── ExpoJuce.podspec          # CocoaPods specification
 │   └── ExpoJuce-Bridging-Header.h
-├── android/                      # Android native (future)
+├── android/                      # Android native (0.9.0+, partial port; see README)
 ├── example/                      # Test app
 └── JUCE/                         # Vendored JUCE modules
 ```
